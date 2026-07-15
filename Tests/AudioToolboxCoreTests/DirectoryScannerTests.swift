@@ -19,6 +19,11 @@ struct DirectoryScannerTests {
     }
 
     @Test
+    func productionEnumeratorSkipsHiddenFilesAtEnumerationLayer() {
+        #expect(DirectoryScanner.enumerationOptions.contains(.skipsHiddenFiles))
+    }
+
+    @Test
     func scannerRecursesAndIgnoresHiddenUnsupportedTemporaryAndSymlinkEntries() async throws {
         let directory = try TemporaryDirectory()
         let externalDirectory = try TemporaryDirectory()
@@ -184,31 +189,41 @@ struct DirectoryScannerTests {
     }
 
     @Test
-    func traversalResourceFailureEmitsFailedAndSkipsDescendants() async throws {
+    func traversalFailureForFileDoesNotPruneFollowingDirectory() async throws {
         let directory = try TemporaryDirectory()
         defer { directory.remove() }
-        let childURL = try directory.createFile("album/track.mp3", contents: "track")
-        let albumURL = childURL.deletingLastPathComponent()
+        let brokenURL = try directory.createFile("broken.mp3", contents: "broken")
+        let trackURL = try directory.createFile("album/track.mp3", contents: "track")
+        let albumURL = trackURL.deletingLastPathComponent()
 
         let enumerator = FakeDirectoryEnumerator(
-            urls: [albumURL, childURL],
+            urls: [brokenURL, albumURL, trackURL],
             discardRemainingOnSkip: true
         )
         let service = FakeMetadataService()
         let scanner = DirectoryScanner(
             metadataService: service,
             makeEnumerator: { _, _, _ in enumerator },
-            readResourceValues: { _, _ in throw FakeScannerError.traversalUnavailable }
+            readResourceValues: { url, keys in
+                if url == brokenURL && keys.contains(.isRegularFileKey) {
+                    throw FakeScannerError.traversalUnavailable
+                }
+                return try url.resourceValues(forKeys: keys)
+            }
         )
 
         let events = await collect(scanner.scan(root: directory.url))
 
         #expect(events.contains { event in
             guard case let .failed(url, _) = event else { return false }
-            return url == albumURL
+            return url == brokenURL
         })
-        #expect(enumerator.skipCount == 1)
-        #expect(await service.readCount() == 0)
+        #expect(events.contains { event in
+            guard case let .loaded(track) = event else { return false }
+            return track.url == trackURL
+        })
+        #expect(enumerator.skipCount == 0)
+        #expect(await service.readFileNames() == ["track.mp3"])
         #expect(events.filter(isFinished).count == 1)
         #expect(events.last == .finished)
     }

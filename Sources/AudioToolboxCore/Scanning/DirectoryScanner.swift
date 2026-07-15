@@ -30,6 +30,8 @@ typealias ResourceValuesReader = @Sendable (
 ) throws -> URLResourceValues
 
 public struct DirectoryScanner: DirectoryScanning {
+    static let enumerationOptions: FileManager.DirectoryEnumerationOptions = [.skipsHiddenFiles]
+
     private static let traversalKeys: Set<URLResourceKey> = [
         .isRegularFileKey,
         .isDirectoryKey,
@@ -55,7 +57,7 @@ public struct DirectoryScanner: DirectoryScanning {
                 FileManager.default.enumerator(
                     at: root,
                     includingPropertiesForKeys: keys,
-                    options: [],
+                    options: DirectoryScanner.enumerationOptions,
                     errorHandler: errorHandler
                 )
             },
@@ -121,7 +123,6 @@ public struct DirectoryScanner: DirectoryScanning {
                 traversalValues = try readResourceValues(url, Self.traversalKeys)
             } catch {
                 continuation.yield(.failed(url, String(describing: error)))
-                enumerator.skipDescendants()
                 continue
             }
 
