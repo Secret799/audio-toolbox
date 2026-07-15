@@ -25,10 +25,9 @@ public struct MainWindowView: View {
         }
         .navigationTitle("Audio Toolbox")
         .toolbar { toolbarContent }
-        .sheet(isPresented: batchPlaceholderPresented) {
-            BatchEditorPlaceholder(selectedCount: viewModel.selectedCount) {
-                viewModel.closeBatchEditor()
-            }
+        .sheet(isPresented: batchSheetPresented) {
+            batchSheetContent
+                .interactiveDismissDisabled(viewModel.isBatchExecutionActive)
         }
     }
 
@@ -121,7 +120,9 @@ public struct MainWindowView: View {
                 systemImage: viewModel.scanFailureCount > 0
                     ? "exclamationmark.folder.fill"
                     : "waveform.badge.magnifyingglass",
-                title: "没有可显示的音频文件",
+                title: viewModel.scanFailureCount > 0
+                    ? "音频文件读取失败"
+                    : "没有可显示的音频文件",
                 message: viewModel.emptyDirectoryMessage
                     ?? "所选目录中没有支持的音频文件。"
             )
@@ -231,12 +232,35 @@ public struct MainWindowView: View {
         }
     }
 
-    private var batchPlaceholderPresented: Binding<Bool> {
+    @ViewBuilder
+    private var batchSheetContent: some View {
+        switch viewModel.batchState {
+        case .closed:
+            EmptyView()
+        case .editing:
+            BatchEditSheet(viewModel: viewModel)
+        case let .running(progress):
+            BatchProgressSheet(
+                viewModel: viewModel,
+                progress: progress,
+                isStopping: false
+            )
+        case let .stopping(progress):
+            BatchProgressSheet(
+                viewModel: viewModel,
+                progress: progress,
+                isStopping: true
+            )
+        case let .completed(summary):
+            ResultSheet(summary: summary) {
+                viewModel.closeBatchEditor()
+            }
+        }
+    }
+
+    private var batchSheetPresented: Binding<Bool> {
         Binding(
-            get: {
-                if case .editing = viewModel.batchState { return true }
-                return false
-            },
+            get: { viewModel.isBatchSheetPresented },
             set: { isPresented in
                 if !isPresented {
                     viewModel.closeBatchEditor()
@@ -298,12 +322,7 @@ public struct MainWindowView: View {
     }
 
     private var isBatchRunning: Bool {
-        switch viewModel.batchState {
-        case .running, .stopping:
-            true
-        case .closed, .editing, .completed:
-            false
-        }
+        viewModel.isBatchExecutionActive
     }
 
     private func chooseDirectory() {
@@ -453,29 +472,5 @@ private struct CurrentGroupSelectionToggle: NSViewRepresentable {
         @objc func selectionChanged(_ sender: NSButton) {
             parent.onChange(parent.state != .all)
         }
-    }
-}
-
-private struct BatchEditorPlaceholder: View {
-    let selectedCount: Int
-    let onClose: () -> Void
-
-    var body: some View {
-        VStack(spacing: 18) {
-            Image(systemName: "square.and.pencil")
-                .font(.system(size: 36))
-                .foregroundStyle(.secondary)
-            Text("批量编辑")
-                .font(.title2.weight(.semibold))
-            Text("已选择 \(selectedCount) 个文件。完整的两步编辑流程将在下一任务实现。")
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
-                .frame(maxWidth: 360)
-            Button("关闭", action: onClose)
-                .keyboardShortcut(.cancelAction)
-        }
-        .padding(32)
-        .frame(width: 440, height: 260)
-        .accessibilityElement(children: .contain)
     }
 }

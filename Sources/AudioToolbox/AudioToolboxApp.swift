@@ -25,7 +25,7 @@ struct AudioToolboxApp: App {
         WindowGroup {
             MainWindowView(viewModel: libraryViewModel)
                 .task {
-                    await libraryViewModel.restoreLastDirectory()
+                    await libraryViewModel.restoreLastDirectoryIfNeeded()
                 }
         }
         .defaultSize(width: 1180, height: 760)

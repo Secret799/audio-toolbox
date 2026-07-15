@@ -97,6 +97,33 @@ struct LibraryViewModelTests {
         #expect(viewModel.scanState == .loaded(failures: []))
     }
 
+    @Test("restore latch 只允许多窗口触发一次恢复")
+    @MainActor
+    func restoreLastDirectoryIfNeededRunsOnce() async throws {
+        let scanner = ScriptedScanner(scripts: [[.loaded(Self.firstTrack), .finished]])
+        let defaults = makeDefaults()
+        let store = SecurityScopedDirectoryStore(
+            defaults: defaults,
+            resolver: IdentityBookmarkResolver()
+        )
+        try store.save(url: firstRoot)
+        let viewModel = LibraryViewModel(
+            scanner: scanner,
+            batchEditor: FakeBatchEditor(summary: BatchEditSummary(results: [])),
+            bookmarkStore: store,
+            makeAccessLease: {
+                SecurityScopedAccessLease(url: $0, accessor: NoopAccessor())
+            }
+        )
+
+        async let first: Void = viewModel.restoreLastDirectoryIfNeeded()
+        async let second: Void = viewModel.restoreLastDirectoryIfNeeded()
+        _ = await (first, second)
+
+        #expect(scanner.scanCount == 1)
+        #expect(viewModel.scanState == .loaded(failures: []))
+    }
+
     @Test("扫描事件增量更新曲目、分组和进度")
     @MainActor
     func scanEventsUpdateLibraryIncrementally() async {
@@ -187,6 +214,23 @@ struct LibraryViewModelTests {
         #expect(viewModel.currentGroup == nil)
         #expect(viewModel.filteredTracks.isEmpty)
         #expect(viewModel.emptyDirectoryMessage == "library-one 中没有支持的音频文件")
+    }
+
+    @Test("空目录会区分无支持文件和全部读取失败")
+    @MainActor
+    func emptyDirectoryDistinguishesReadFailures() async {
+        let failedURL = firstRoot.appendingPathComponent("broken.mp3")
+        let failure = LibraryScanFailure(url: failedURL, message: "标签损坏")
+        let scanner = ScriptedScanner(scripts: [[
+            .failed(failedURL, "标签损坏"),
+            .finished,
+        ]])
+        let viewModel = makeViewModel(scanner: scanner)
+
+        await viewModel.loadDirectory(firstRoot)
+
+        #expect(viewModel.scanState == .empty(failures: [failure]))
+        #expect(viewModel.emptyDirectoryMessage == "library-one 中没有成功载入的音频文件（1 个文件读取失败）")
     }
 
     @Test("bookmark 保存错误独立于旧扫描并在成功重试时清除")
@@ -374,6 +418,85 @@ struct LibraryViewModelTests {
         #expect(viewModel.filteredTracks.isEmpty)
     }
 
+    @Test("搜索后全选仍选择当前完整分组")
+    @MainActor
+    func selectingGroupAfterSearchSelectsEntireGroup() async {
+        let scanner = ScriptedScanner(scripts: [[
+            .loaded(Self.firstTrack),
+            .loaded(Self.sameArtistTrack),
+            .loaded(Self.secondTrack),
+            .finished,
+        ]])
+        let viewModel = makeViewModel(scanner: scanner)
+        await viewModel.loadDirectory(firstRoot)
+        viewModel.selectedGroupID = "artist:Artist One"
+        viewModel.searchText = "first title"
+
+        #expect(viewModel.filteredTracks.map(\.id) == [Self.firstTrack.id])
+
+        viewModel.setCurrentGroupSelected(true)
+
+        #expect(viewModel.selectedTrackIDs == [Self.firstTrack.id, Self.sameArtistTrack.id])
+        #expect(viewModel.currentGroupSelectionState == .all)
+    }
+
+    @Test("批量表单校验空 patch、首尾空格和无备份确认")
+    @MainActor
+    func batchFormValidatesPatchAndAcknowledgement() async {
+        let scanner = ScriptedScanner(scripts: [[.loaded(Self.firstTrack), .finished]])
+        let viewModel = makeViewModel(scanner: scanner)
+        await viewModel.loadDirectory(firstRoot)
+        viewModel.toggleSelection(Self.firstTrack.id)
+        viewModel.openBatchEditor()
+
+        #expect(!viewModel.canAdvanceBatchEdit)
+        #expect(!viewModel.canExecuteBatchEdit)
+
+        viewModel.batchArtist = "   "
+        viewModel.batchAlbum = "\n"
+        #expect(viewModel.validatedBatchPatch == nil)
+        #expect(!viewModel.canAdvanceBatchEdit)
+
+        viewModel.batchArtist = "  Edited Artist  "
+        #expect(viewModel.validatedBatchPatch == MetadataPatch(artist: "Edited Artist", album: nil))
+        #expect(viewModel.canAdvanceBatchEdit)
+        #expect(!viewModel.canExecuteBatchEdit)
+
+        viewModel.batchAcknowledgedNoBackup = true
+        #expect(viewModel.canExecuteBatchEdit)
+
+        viewModel.batchAlbum = "  Edited Album  "
+        #expect(!viewModel.batchAcknowledgedNoBackup)
+        #expect(viewModel.validatedBatchPatch == MetadataPatch(artist: "Edited Artist", album: "Edited Album"))
+    }
+
+    @Test("未确认不能执行，执行中禁止重复提交")
+    @MainActor
+    func batchExecutionRequiresAcknowledgementAndRejectsDuplicateRun() async {
+        let scanner = ScriptedScanner(scripts: [[.loaded(Self.firstTrack), .finished]])
+        let editor = SuspendedBatchEditor()
+        let viewModel = makeViewModel(scanner: scanner, batchEditor: editor)
+        await viewModel.loadDirectory(firstRoot)
+        viewModel.toggleSelection(Self.firstTrack.id)
+        viewModel.openBatchEditor()
+        viewModel.batchArtist = "  Edited Artist  "
+
+        await viewModel.runBatchEdit()
+        #expect(await editor.requests.count == 0)
+        #expect(viewModel.batchState == .editing)
+
+        viewModel.batchAcknowledgedNoBackup = true
+        let firstRun = Task { await viewModel.runBatchEdit() }
+        await editor.waitUntilRunning()
+        await viewModel.runBatchEdit()
+
+        #expect(await editor.requests.count == 1)
+        #expect(await editor.requests.first?.patch == MetadataPatch(artist: "Edited Artist", album: nil))
+
+        await editor.complete()
+        await firstRun.value
+    }
+
     @Test("扫描失败会保留可展示的文件和原因")
     @MainActor
     func scanFailureIsPresented() async {
@@ -417,18 +540,54 @@ struct LibraryViewModelTests {
 
         viewModel.openBatchEditor()
         #expect(viewModel.batchState == .editing)
+        #expect(viewModel.isBatchSheetPresented)
         viewModel.closeBatchEditor()
         #expect(viewModel.batchState == .closed)
+        #expect(!viewModel.isBatchSheetPresented)
         viewModel.openBatchEditor()
         #expect(viewModel.batchState == .editing)
 
-        await viewModel.runBatchEdit(patch: MetadataPatch(artist: "Edited Artist", album: nil))
+        viewModel.batchArtist = "Edited Artist"
+        viewModel.batchAcknowledgedNoBackup = true
+        await viewModel.runBatchEdit()
 
         #expect(await editor.requests.count == 1)
         #expect(viewModel.batchState == .completed(summary))
+        #expect(viewModel.isBatchSheetPresented)
+        #expect(!viewModel.isBatchExecutionActive)
+        #expect(viewModel.batchResultCounts == BatchResultCounts(succeeded: 1, failed: 0, notProcessed: 0))
         #expect(viewModel.tracks == [Self.editedFirstTrack])
         #expect(viewModel.selectedTrackIDs == [Self.firstTrack.id])
         #expect(scanner.scanCount == 2)
+    }
+
+    @Test("批量结果计数区分成功、失败和未处理")
+    @MainActor
+    func batchResultCountsAllStatuses() async {
+        let scanner = ScriptedScanner(scripts: [
+            [.loaded(Self.firstTrack), .finished],
+            [.loaded(Self.firstTrack), .finished],
+        ])
+        let summary = BatchEditSummary(results: [
+            BatchFileResult(url: Self.firstTrack.url, status: .succeeded, message: nil),
+            BatchFileResult(url: Self.sameArtistTrack.url, status: .failed, message: "写入失败"),
+            BatchFileResult(url: Self.secondTrack.url, status: .notProcessed, message: "已停止"),
+        ])
+        let editor = FakeBatchEditor(summary: summary)
+        let viewModel = makeViewModel(scanner: scanner, batchEditor: editor)
+        await viewModel.loadDirectory(firstRoot)
+        viewModel.toggleSelection(Self.firstTrack.id)
+        viewModel.openBatchEditor()
+        viewModel.batchAlbum = "Edited Album"
+        viewModel.batchAcknowledgedNoBackup = true
+
+        await viewModel.runBatchEdit()
+
+        #expect(viewModel.batchResultCounts == BatchResultCounts(
+            succeeded: 1,
+            failed: 1,
+            notProcessed: 1
+        ))
     }
 
     @Test("批量完成后的刷新结束前拒绝重新打开编辑器")
@@ -449,10 +608,11 @@ struct LibraryViewModelTests {
         await waitUntil { viewModel.scanState == .loaded(failures: []) }
         viewModel.toggleSelection(Self.firstTrack.id)
 
+        viewModel.openBatchEditor()
+        viewModel.batchArtist = "Edited"
+        viewModel.batchAcknowledgedNoBackup = true
         let batch = Task {
-            await viewModel.runBatchEdit(
-                patch: MetadataPatch(artist: "Edited", album: nil)
-            )
+            await viewModel.runBatchEdit()
         }
         await scanner.waitForScanCount(2)
         #expect(viewModel.batchState == .completed(summary))
@@ -475,18 +635,28 @@ struct LibraryViewModelTests {
         await waitUntil { viewModel.scanState == .loaded(failures: []) }
         viewModel.toggleSelection(Self.firstTrack.id)
         viewModel.openBatchEditor()
+        viewModel.batchArtist = "Stopped"
+        viewModel.batchAcknowledgedNoBackup = true
         let run = Task {
-            await viewModel.runBatchEdit(patch: MetadataPatch(artist: "Stopped", album: nil))
+            await viewModel.runBatchEdit()
         }
 
         await editor.waitUntilRunning()
         await viewModel.stopBatchEdit()
+        viewModel.closeBatchEditor()
+        await viewModel.stopBatchEdit()
 
         #expect(await editor.stopRequestCount == 1)
         #expect(viewModel.batchState == .stopping(BatchProgress(completed: 0, total: 1, currentURL: nil)))
+        #expect(viewModel.isBatchSheetPresented)
+        #expect(viewModel.isBatchExecutionActive)
 
         await editor.complete()
         await run.value
+        #expect(viewModel.isBatchSheetPresented)
+        viewModel.closeBatchEditor()
+        #expect(viewModel.batchState == .closed)
+        #expect(!viewModel.isBatchSheetPresented)
     }
 
     @Test("恢复 bookmark 抛错时进入失败状态")
@@ -772,6 +942,7 @@ private actor FakeBatchEditor: BatchEditing {
 
 private actor SuspendedBatchEditor: BatchEditing {
     private var runningContinuations: [CheckedContinuation<Void, Never>] = []
+    private(set) var requests: [BatchEditRequest] = []
     private var completionContinuation: CheckedContinuation<Void, Never>?
     private(set) var stopRequestCount = 0
 
@@ -779,6 +950,7 @@ private actor SuspendedBatchEditor: BatchEditing {
         _ request: BatchEditRequest,
         onProgress: @escaping @Sendable (BatchProgress) -> Void
     ) async -> BatchEditSummary {
+        requests.append(request)
         onProgress(BatchProgress(completed: 0, total: request.files.count, currentURL: nil))
         let waiters = runningContinuations
         runningContinuations.removeAll()

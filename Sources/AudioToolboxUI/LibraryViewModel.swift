@@ -35,6 +35,24 @@ public enum BatchSheetState: Equatable, Sendable {
     case completed(BatchEditSummary)
 }
 
+public struct BatchResultCounts: Equatable, Sendable {
+    public let succeeded: Int
+    public let failed: Int
+    public let notProcessed: Int
+
+    public init(succeeded: Int, failed: Int, notProcessed: Int) {
+        self.succeeded = succeeded
+        self.failed = failed
+        self.notProcessed = notProcessed
+    }
+
+    public static let zero = BatchResultCounts(
+        succeeded: 0,
+        failed: 0,
+        notProcessed: 0
+    )
+}
+
 @MainActor
 public final class LibraryViewModel: ObservableObject {
     public typealias AccessLeaseFactory = @MainActor (URL) -> SecurityScopedAccessLease
@@ -54,13 +72,69 @@ public final class LibraryViewModel: ObservableObject {
     @Published public private(set) var directoryOperationError: String?
     @Published public var searchText = ""
     @Published public private(set) var batchState: BatchSheetState = .closed
+    @Published public var batchArtist = "" {
+        didSet {
+            if batchArtist != oldValue {
+                batchAcknowledgedNoBackup = false
+            }
+        }
+    }
+    @Published public var batchAlbum = "" {
+        didSet {
+            if batchAlbum != oldValue {
+                batchAcknowledgedNoBackup = false
+            }
+        }
+    }
+    @Published public var batchAcknowledgedNoBackup = false
 
     public var selectedCount: Int {
         selectedTrackIDs.count
     }
 
     public var canOpenBatchEditor: Bool {
-        !selectedTrackIDs.isEmpty && !isBatchActive
+        guard case .closed = batchState else { return false }
+        return !selectedTrackIDs.isEmpty && !isBatchActive
+    }
+
+    public var isBatchSheetPresented: Bool {
+        if case .closed = batchState { return false }
+        return true
+    }
+
+    public var isBatchExecutionActive: Bool {
+        switch batchState {
+        case .running, .stopping:
+            true
+        case .closed, .editing, .completed:
+            false
+        }
+    }
+
+    public var batchEditTracks: [AudioTrack] {
+        tracks.filter { selectedTrackIDs.contains($0.id) }
+    }
+
+    public var validatedBatchPatch: MetadataPatch? {
+        MetadataPatch.validated(artist: batchArtist, album: batchAlbum)
+    }
+
+    public var canAdvanceBatchEdit: Bool {
+        guard case .editing = batchState else { return false }
+        return validatedBatchPatch != nil
+    }
+
+    public var canExecuteBatchEdit: Bool {
+        canAdvanceBatchEdit && batchAcknowledgedNoBackup
+    }
+
+    public var batchResultCounts: BatchResultCounts {
+        guard case let .completed(summary) = batchState else { return .zero }
+        return BatchResultCounts(
+            succeeded: summary.succeededCount,
+            failed: summary.failedCount,
+            notProcessed: summary.notProcessedCount
+        )
     }
 
     public var currentGroup: AudioGroup? {
@@ -81,7 +155,13 @@ public final class LibraryViewModel: ObservableObject {
     }
 
     public var emptyDirectoryMessage: String? {
-        guard case .empty = scanState, let currentDirectoryURL else { return nil }
+        guard case let .empty(failures) = scanState,
+              let currentDirectoryURL else {
+            return nil
+        }
+        if !failures.isEmpty {
+            return "\(currentDirectoryURL.lastPathComponent) 中没有成功载入的音频文件（\(failures.count) 个文件读取失败）"
+        }
         return "\(currentDirectoryURL.lastPathComponent) 中没有支持的音频文件"
     }
 
@@ -138,6 +218,7 @@ public final class LibraryViewModel: ObservableObject {
     private var batchProgressTask: Task<Void, Never>?
     private var scanGeneration: UInt64 = 0
     private var batchGeneration: UInt64 = 0
+    private var hasAttemptedDirectoryRestore = false
     private var isRefreshingAfterBatch = false
     private var discoveredCount = 0
     private var scanFailureValues: [LibraryScanFailure] = []
@@ -184,6 +265,12 @@ public final class LibraryViewModel: ObservableObject {
             return
         }
         await Self.waitForScanTask(task)
+    }
+
+    public func restoreLastDirectoryIfNeeded() async {
+        guard !hasAttemptedDirectoryRestore, !isBatchActive else { return }
+        hasAttemptedDirectoryRestore = true
+        await restoreLastDirectory()
     }
 
     public func restoreLastDirectory() async {
@@ -236,19 +323,29 @@ public final class LibraryViewModel: ObservableObject {
     }
 
     public func openBatchEditor() {
+        guard case .closed = batchState else { return }
         guard !selectedTrackIDs.isEmpty, !isBatchActive else { return }
+        resetBatchDraft()
         batchState = .editing
     }
 
     public func closeBatchEditor() {
-        guard case .editing = batchState else { return }
-        batchState = .closed
+        switch batchState {
+        case .editing, .completed:
+            batchState = .closed
+            resetBatchDraft()
+        case .closed, .running, .stopping:
+            return
+        }
     }
 
-    public func runBatchEdit(patch: MetadataPatch) async {
-        guard !isBatchActive else { return }
+    public func runBatchEdit() async {
+        guard canExecuteBatchEdit,
+              let patch = validatedBatchPatch else {
+            return
+        }
 
-        let selectedTracks = tracks.filter { selectedTrackIDs.contains($0.id) }
+        let selectedTracks = batchEditTracks
         guard !selectedTracks.isEmpty else { return }
 
         batchGeneration &+= 1
@@ -314,14 +411,20 @@ public final class LibraryViewModel: ObservableObject {
     public func stopBatchEdit() async {
         let progress: BatchProgress
         switch batchState {
-        case let .running(value), let .stopping(value):
+        case let .running(value):
             progress = value
-        case .closed, .editing, .completed:
+        case .closed, .editing, .stopping, .completed:
             return
         }
 
         batchState = .stopping(progress)
         await batchEditor.requestStop()
+    }
+
+    private func resetBatchDraft() {
+        batchArtist = ""
+        batchAlbum = ""
+        batchAcknowledgedNoBackup = false
     }
 
     private var isBatchActive: Bool {
