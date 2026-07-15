@@ -46,6 +46,7 @@ public struct AudioTrack: Identifiable, Equatable, Sendable {
     public let format: AudioFormat
     public var metadata: AudioMetadata
     public let fileSize: Int64
+    public let modificationDate: Date
     public let isWritable: Bool
     public let issue: AudioFileIssue?
 }

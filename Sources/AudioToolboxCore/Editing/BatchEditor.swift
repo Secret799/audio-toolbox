@@ -3,7 +3,7 @@ import Foundation
 /// A progress snapshot for one batch, emitted in input order.
 ///
 /// A run first emits `completed == 0` with `currentURL == nil`. It then emits
-/// one snapshot after every input URL receives a result, including URLs marked
+/// one snapshot after every input target receives a result, including URLs marked
 /// `notProcessed` after a stop request. `currentURL` is the URL just completed.
 public struct BatchProgress: Equatable, Sendable {
     public let completed: Int
@@ -19,7 +19,7 @@ public struct BatchProgress: Equatable, Sendable {
 
 public protocol BatchEditing: Sendable {
     /// Runs one batch. An overlapping run on the same editor is rejected with
-    /// one failed result per requested file instead of sharing stop state.
+    /// one failed result per requested target instead of sharing stop state.
     func run(
         _ request: BatchEditRequest,
         onProgress: @escaping @Sendable (BatchProgress) -> Void
@@ -57,7 +57,7 @@ public actor BatchEditor: BatchEditing {
             isRunning = false
         }
 
-        let total = request.files.count
+        let total = request.targets.count
         var results: [BatchFileResult] = []
         results.reserveCapacity(total)
 
@@ -66,9 +66,11 @@ public actor BatchEditor: BatchEditing {
             to: onProgress
         )
 
-        for (index, url) in request.files.enumerated() {
+        for (index, target) in request.targets.enumerated() {
+            let url = target.url
             if stopRequested {
-                for remainingURL in request.files[index...] {
+                for remainingTarget in request.targets[index...] {
+                    let remainingURL = remainingTarget.url
                     results.append(
                         BatchFileResult(
                             url: remainingURL,
@@ -86,7 +88,7 @@ public actor BatchEditor: BatchEditing {
                 break
             }
 
-            let result = await writer.apply(to: url, patch: request.patch)
+            let result = await writer.apply(to: target, patch: request.patch)
             results.append(result)
             await reportCompletion(
                 of: url,
@@ -108,7 +110,7 @@ public actor BatchEditor: BatchEditing {
         for request: BatchEditRequest,
         onProgress: @escaping @Sendable (BatchProgress) -> Void
     ) async -> BatchEditSummary {
-        let total = request.files.count
+        let total = request.targets.count
         var results: [BatchFileResult] = []
         results.reserveCapacity(total)
 
@@ -117,7 +119,8 @@ public actor BatchEditor: BatchEditing {
             to: onProgress
         )
 
-        for url in request.files {
+        for target in request.targets {
+            let url = target.url
             results.append(
                 BatchFileResult(
                     url: url,

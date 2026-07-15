@@ -90,6 +90,7 @@ enum SafeMetadataFileSystemOperation: Sendable {
     case digest
     case coordinate
     case swap
+    case sync
     case unlink
     case close
 }
@@ -154,6 +155,7 @@ final class SafeMetadataWorkspace: @unchecked Sendable {
     let fileName: String
     let parentDirectoryFD: Int32
     let directoryFD: Int32
+    let parentDirectoryIdentity: SafeMetadataFileIdentity
     let directoryIdentity: SafeMetadataFileIdentity
 
     private let closeLock = NSLock()
@@ -167,6 +169,7 @@ final class SafeMetadataWorkspace: @unchecked Sendable {
         fileName: String,
         parentDirectoryFD: Int32,
         directoryFD: Int32,
+        parentDirectoryIdentity: SafeMetadataFileIdentity,
         directoryIdentity: SafeMetadataFileIdentity
     ) {
         self.parentDirectoryURL = parentDirectoryURL
@@ -176,6 +179,7 @@ final class SafeMetadataWorkspace: @unchecked Sendable {
         self.fileName = fileName
         self.parentDirectoryFD = parentDirectoryFD
         self.directoryFD = directoryFD
+        self.parentDirectoryIdentity = parentDirectoryIdentity
         self.directoryIdentity = directoryIdentity
     }
 
@@ -225,6 +229,13 @@ struct SafeMetadataFileOperations: @unchecked Sendable {
         (URL, URL) throws -> Void
     ) throws -> Void
     let swap: (URL, URL) throws -> Void
+    let syncWorkspaceFile: (
+        SafeMetadataWorkspace,
+        SafeMetadataFileIdentity
+    ) throws -> Void
+    let syncWorkspaceDirectory: (SafeMetadataWorkspace) throws -> Void
+    let syncURLFile: (URL, SafeMetadataFileIdentity) throws -> Void
+    let syncParentDirectory: (SafeMetadataWorkspace) throws -> Void
     let removeWorkspaceFileIfOwned: (
         SafeMetadataWorkspace,
         SafeMetadataFileIdentity
@@ -248,6 +259,10 @@ struct SafeMetadataFileOperations: @unchecked Sendable {
             },
             coordinateReplacing: coordinateReplacing,
             swap: swap,
+            syncWorkspaceFile: syncWorkspaceFile,
+            syncWorkspaceDirectory: syncWorkspaceDirectory,
+            syncURLFile: syncURLFile,
+            syncParentDirectory: syncParentDirectory,
             removeWorkspaceFileIfOwned: { workspace, expectedIdentity in
                 removeWorkspaceFileIfOwnedForTesting(
                     workspace,
@@ -274,6 +289,10 @@ struct SafeMetadataFileOperations: @unchecked Sendable {
         isWritable: ((URL) -> Bool)? = nil,
         coordinateReplacing: ((URL, URL, (URL, URL) throws -> Void) throws -> Void)? = nil,
         swap: ((URL, URL) throws -> Void)? = nil,
+        syncWorkspaceFile: ((SafeMetadataWorkspace, SafeMetadataFileIdentity) throws -> Void)? = nil,
+        syncWorkspaceDirectory: ((SafeMetadataWorkspace) throws -> Void)? = nil,
+        syncURLFile: ((URL, SafeMetadataFileIdentity) throws -> Void)? = nil,
+        syncParentDirectory: ((SafeMetadataWorkspace) throws -> Void)? = nil,
         removeWorkspaceFileIfOwned: ((SafeMetadataWorkspace, SafeMetadataFileIdentity) -> SafeMetadataConditionalRemoval)? = nil,
         removeWorkspaceDirectoryIfOwned: ((SafeMetadataWorkspace) -> SafeMetadataConditionalRemoval)? = nil
     ) -> Self {
@@ -287,6 +306,10 @@ struct SafeMetadataFileOperations: @unchecked Sendable {
             isWritable: isWritable ?? self.isWritable,
             coordinateReplacing: coordinateReplacing ?? self.coordinateReplacing,
             swap: swap ?? self.swap,
+            syncWorkspaceFile: syncWorkspaceFile ?? self.syncWorkspaceFile,
+            syncWorkspaceDirectory: syncWorkspaceDirectory ?? self.syncWorkspaceDirectory,
+            syncURLFile: syncURLFile ?? self.syncURLFile,
+            syncParentDirectory: syncParentDirectory ?? self.syncParentDirectory,
             removeWorkspaceFileIfOwned: removeWorkspaceFileIfOwned ?? self.removeWorkspaceFileIfOwned,
             removeWorkspaceDirectoryIfOwned: removeWorkspaceDirectoryIfOwned ?? self.removeWorkspaceDirectoryIfOwned
         )
@@ -302,6 +325,13 @@ struct SafeMetadataFileOperations: @unchecked Sendable {
         }
         guard parentFD >= 0 else {
             throw SafeMetadataFileSystemError(operation: .mkdir, code: errno)
+        }
+        let parentState: SafeMetadataFileNodeState
+        do {
+            parentState = try stateForDescriptor(parentFD, operation: .mkdir)
+        } catch {
+            Darwin.close(parentFD)
+            throw error
         }
 
         let directoryName = ".audio-toolbox-\(identifier).work"
@@ -368,6 +398,7 @@ struct SafeMetadataFileOperations: @unchecked Sendable {
             fileName: fileName,
             parentDirectoryFD: parentFD,
             directoryFD: directoryFD,
+            parentDirectoryIdentity: parentState.identity,
             directoryIdentity: directoryState.identity
         )
     }
@@ -573,6 +604,88 @@ struct SafeMetadataFileOperations: @unchecked Sendable {
         }
         guard result == 0 else {
             throw SafeMetadataFileSystemError(operation: .swap, code: errno)
+        }
+    }
+
+    private static func syncWorkspaceFile(
+        workspace: SafeMetadataWorkspace,
+        expectedIdentity: SafeMetadataFileIdentity
+    ) throws {
+        try validateWorkspacePath(
+            workspace: workspace,
+            expectedFileIdentity: expectedIdentity
+        )
+        let descriptor = workspace.fileName.withCString { fileName in
+            openat(
+                workspace.directoryFD,
+                fileName,
+                O_RDONLY | O_NOFOLLOW | O_CLOEXEC
+            )
+        }
+        guard descriptor >= 0 else {
+            throw SafeMetadataFileSystemError(operation: .sync, code: errno)
+        }
+        defer { Darwin.close(descriptor) }
+        guard try stateForDescriptor(descriptor, operation: .sync).identity == expectedIdentity else {
+            throw SafeMetadataFileSystemError(operation: .sync, code: ESTALE)
+        }
+        try fullSync(descriptor)
+        guard try stateForDescriptor(descriptor, operation: .sync).identity == expectedIdentity else {
+            throw SafeMetadataFileSystemError(operation: .sync, code: ESTALE)
+        }
+    }
+
+    private static func syncWorkspaceDirectory(
+        workspace: SafeMetadataWorkspace
+    ) throws {
+        guard try stateForDescriptor(
+            workspace.directoryFD,
+            operation: .sync
+        ).identity == workspace.directoryIdentity else {
+            throw SafeMetadataFileSystemError(operation: .sync, code: ESTALE)
+        }
+        try fullSync(workspace.directoryFD)
+    }
+
+    private static func syncURLFile(
+        url: URL,
+        expectedIdentity: SafeMetadataFileIdentity
+    ) throws {
+        guard try nodeState(url: url).identity == expectedIdentity else {
+            throw SafeMetadataFileSystemError(operation: .sync, code: ESTALE)
+        }
+        let descriptor = url.path.withCString { path in
+            open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+        }
+        guard descriptor >= 0 else {
+            throw SafeMetadataFileSystemError(operation: .sync, code: errno)
+        }
+        defer { Darwin.close(descriptor) }
+        guard try stateForDescriptor(descriptor, operation: .sync).identity == expectedIdentity else {
+            throw SafeMetadataFileSystemError(operation: .sync, code: ESTALE)
+        }
+        try fullSync(descriptor)
+        guard try nodeState(url: url).identity == expectedIdentity else {
+            throw SafeMetadataFileSystemError(operation: .sync, code: ESTALE)
+        }
+    }
+
+    private static func syncParentDirectory(
+        workspace: SafeMetadataWorkspace
+    ) throws {
+        guard try stateForDescriptor(
+            workspace.parentDirectoryFD,
+            operation: .sync
+        ).identity == workspace.parentDirectoryIdentity else {
+            throw SafeMetadataFileSystemError(operation: .sync, code: ESTALE)
+        }
+        try fullSync(workspace.parentDirectoryFD)
+    }
+
+    private static func fullSync(_ descriptor: Int32) throws {
+        let code = ATSFFullSyncFD(descriptor)
+        guard code == 0 else {
+            throw SafeMetadataFileSystemError(operation: .sync, code: code)
         }
     }
 

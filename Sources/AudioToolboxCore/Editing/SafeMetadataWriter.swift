@@ -1,11 +1,12 @@
 import Foundation
 
 public protocol SafeMetadataWriting: Sendable {
-    func apply(to url: URL, patch: MetadataPatch) async -> BatchFileResult
+    func apply(to target: BatchEditTarget, patch: MetadataPatch) async -> BatchFileResult
 }
 
 public actor SafeMetadataWriter: SafeMetadataWriting {
     private static let maximumWorkspaceNameAttempts = 16
+    private static let changedFileMessage = "文件已变化，请重新扫描确认"
 
     private let metadataService: any MetadataService
     private let fileOperations: SafeMetadataFileOperations
@@ -34,26 +35,44 @@ public actor SafeMetadataWriter: SafeMetadataWriting {
         self.temporaryIdentifierProvider = temporaryIdentifierProvider
     }
 
-    public func apply(to url: URL, patch: MetadataPatch) async -> BatchFileResult {
+    public func apply(to target: BatchEditTarget, patch: MetadataPatch) async -> BatchFileResult {
         let cancellationFlag: SafeMetadataCancellationFlag
         do {
             cancellationFlag = try SafeMetadataCancellationFlag()
         } catch {
-            return result(for: url, status: .failed, message: "无法初始化安全写入状态")
+            return result(for: target.url, status: .failed, message: "无法初始化安全写入状态")
         }
 
         return await withTaskCancellationHandler {
-            await applyInternal(to: url, patch: patch, cancellationFlag: cancellationFlag)
+            await applyInternal(to: target, patch: patch, cancellationFlag: cancellationFlag)
         } onCancel: {
             cancellationFlag.cancel()
         }
     }
 
+    func apply(to url: URL, patch: MetadataPatch) async -> BatchFileResult {
+        do {
+            let fingerprint = try StableFileIdentityResolver.fingerprint(for: url)
+            return await apply(
+                to: BatchEditTarget(
+                    url: url,
+                    fileIdentity: fingerprint.fileIdentity,
+                    fileSize: fingerprint.fileSize,
+                    modificationDate: fingerprint.modificationDate
+                ),
+                patch: patch
+            )
+        } catch {
+            return result(for: url, status: .failed, message: "无法完成文件安全检查")
+        }
+    }
+
     private func applyInternal(
-        to url: URL,
+        to target: BatchEditTarget,
         patch: MetadataPatch,
         cancellationFlag: SafeMetadataCancellationFlag
     ) async -> BatchFileResult {
+        let url = target.url
         guard !cancellationFlag.isCancelled else {
             return result(for: url, status: .notProcessed, message: "操作已取消")
         }
@@ -79,6 +98,27 @@ public actor SafeMetadataWriter: SafeMetadataWriting {
                 for: url,
                 status: .failed,
                 message: initialFailureMessage(error)
+            )
+        }
+
+        do {
+            let fingerprint = try await Self.runBlocking {
+                try StableFileIdentityResolver.fingerprint(for: url)
+            }
+            guard target.matches(fingerprint) else {
+                return result(
+                    for: url,
+                    status: .failed,
+                    message: Self.changedFileMessage
+                )
+            }
+        } catch is CancellationError {
+            return result(for: url, status: .notProcessed, message: "操作已取消")
+        } catch {
+            return result(
+                for: url,
+                status: .failed,
+                message: Self.changedFileMessage
             )
         }
 
@@ -306,6 +346,7 @@ public actor SafeMetadataWriter: SafeMetadataWriting {
         do {
             commitResult = try await Self.runBlocking {
                 try Self.executeCommit(
+                    target: target,
                     originalURL: url,
                     initialSnapshot: initialSnapshot,
                     editedExpected: editedExpected,
@@ -355,7 +396,7 @@ public actor SafeMetadataWriter: SafeMetadataWriting {
                 ownedWork.workspace,
                 expectedFileIdentity: editedExpected.nodeState.identity
             )
-            var message = "提交后检测到并发修改，已安全回滚"
+            var message = "提交后检测到并发修改或耐久同步失败，已安全回滚"
             if coordinatorTailWarning {
                 message += "；文件协调收尾异常"
             }
@@ -615,6 +656,7 @@ public actor SafeMetadataWriter: SafeMetadataWriting {
     }
 
     private nonisolated static func executeCommit(
+        target: BatchEditTarget,
         originalURL: URL,
         initialSnapshot: SafeMetadataFileSnapshot,
         editedExpected: SafeMetadataFileSnapshot,
@@ -631,12 +673,26 @@ public actor SafeMetadataWriter: SafeMetadataWriting {
                 originalURL,
                 ownedWork.workspace.fileURL
             ) { coordinatedOriginal, coordinatedWork in
+                let coordinatedFingerprint: StableFileFingerprint
+                do {
+                    coordinatedFingerprint = try StableFileIdentityResolver.fingerprint(
+                        for: coordinatedOriginal
+                    )
+                } catch {
+                    observed = .preSwapFailed(Self.changedFileMessage)
+                    return
+                }
+                guard target.matches(coordinatedFingerprint) else {
+                    observed = .preSwapFailed(Self.changedFileMessage)
+                    return
+                }
+
                 let commitOriginal = try operations.snapshotURL(
                     coordinatedOriginal,
                     cancellationFlag
                 )
                 guard commitOriginal == initialSnapshot else {
-                    observed = .preSwapFailed("原文件在编辑期间发生变化，已取消替换")
+                    observed = .preSwapFailed(Self.changedFileMessage)
                     return
                 }
 
@@ -662,6 +718,17 @@ public actor SafeMetadataWriter: SafeMetadataWriting {
                 }
 
                 do {
+                    try operations.syncWorkspaceFile(
+                        ownedWork.workspace,
+                        editedExpected.nodeState.identity
+                    )
+                    try operations.syncWorkspaceDirectory(ownedWork.workspace)
+                } catch {
+                    observed = .preSwapFailed("提交前耐久同步失败，未执行替换")
+                    return
+                }
+
+                do {
                     try operations.swap(coordinatedOriginal, coordinatedWork)
                 } catch {
                     observed = Self.inspectAfterSwapError(
@@ -675,11 +742,32 @@ public actor SafeMetadataWriter: SafeMetadataWriting {
                     )
                     if case .notStarted = observed {
                         observed = .preSwapFailed(swapFailureMessage(error))
+                    } else {
+                        observed = Self.finalizeDurabilityIfCommitted(
+                            observed,
+                            originalURL: coordinatedOriginal,
+                            workURL: coordinatedWork,
+                            commitOriginal: commitOriginal,
+                            editedExpected: editedExpected,
+                            ownedWork: ownedWork,
+                            operations: operations,
+                            uncancellableFlag: uncancellableFlag
+                        )
                     }
                     return
                 }
 
                 observed = Self.resolvePostSwapState(
+                    originalURL: coordinatedOriginal,
+                    workURL: coordinatedWork,
+                    commitOriginal: commitOriginal,
+                    editedExpected: editedExpected,
+                    ownedWork: ownedWork,
+                    operations: operations,
+                    uncancellableFlag: uncancellableFlag
+                )
+                observed = Self.finalizeDurabilityIfCommitted(
+                    observed,
                     originalURL: coordinatedOriginal,
                     workURL: coordinatedWork,
                     commitOriginal: commitOriginal,
@@ -736,6 +824,83 @@ public actor SafeMetadataWriter: SafeMetadataWriting {
             return .committed(cleanupIdentity: recoveryAfter.nodeState.identity)
         }
 
+        return rollbackAndSynchronize(
+            originalURL: originalURL,
+            workURL: workURL,
+            expectedOriginal: recoveryAfter,
+            expectedWork: editedExpected,
+            ownedWork: ownedWork,
+            operations: operations,
+            uncancellableFlag: uncancellableFlag,
+            failureMessage: "检测到提交状态异常且自动回滚未能耐久确认"
+        )
+    }
+
+    private nonisolated static func finalizeDurabilityIfCommitted(
+        _ observed: ObservedCommitState,
+        originalURL: URL,
+        workURL: URL,
+        commitOriginal: SafeMetadataFileSnapshot,
+        editedExpected: SafeMetadataFileSnapshot,
+        ownedWork: OwnedWorkFile,
+        operations: SafeMetadataFileOperations,
+        uncancellableFlag: SafeMetadataCancellationFlag
+    ) -> ObservedCommitState {
+        guard case .committed = observed else { return observed }
+        do {
+            try operations.syncURLFile(
+                originalURL,
+                editedExpected.nodeState.identity
+            )
+            try operations.syncParentDirectory(ownedWork.workspace)
+
+            let durableOriginal = try operations.snapshotURL(
+                originalURL,
+                uncancellableFlag
+            )
+            let durableRecovery = try operations.snapshotWorkspace(
+                ownedWork.workspace,
+                uncancellableFlag
+            )
+            guard durableOriginal.matchesAfterRename(editedExpected),
+                  durableRecovery.matchesAfterRename(commitOriginal)
+            else {
+                return rollbackAndSynchronize(
+                    originalURL: originalURL,
+                    workURL: workURL,
+                    expectedOriginal: commitOriginal,
+                    expectedWork: editedExpected,
+                    ownedWork: ownedWork,
+                    operations: operations,
+                    uncancellableFlag: uncancellableFlag,
+                    failureMessage: "耐久同步后文件状态发生变化且自动回滚未能耐久确认"
+                )
+            }
+            return observed
+        } catch {
+            return rollbackAndSynchronize(
+                originalURL: originalURL,
+                workURL: workURL,
+                expectedOriginal: commitOriginal,
+                expectedWork: editedExpected,
+                ownedWork: ownedWork,
+                operations: operations,
+                uncancellableFlag: uncancellableFlag,
+                failureMessage: "提交后耐久同步失败且自动回滚未能耐久确认"
+            )
+        }
+    }
+
+    private nonisolated static func rollbackAndSynchronize(
+        originalURL: URL,
+        workURL: URL,
+        expectedOriginal: SafeMetadataFileSnapshot,
+        expectedWork: SafeMetadataFileSnapshot,
+        ownedWork: OwnedWorkFile,
+        operations: SafeMetadataFileOperations,
+        uncancellableFlag: SafeMetadataCancellationFlag,
+        failureMessage: String
+    ) -> ObservedCommitState {
         do {
             try operations.swap(originalURL, workURL)
             let restoredOriginal = try operations.snapshotURL(
@@ -746,14 +911,39 @@ public actor SafeMetadataWriter: SafeMetadataWriting {
                 ownedWork.workspace,
                 uncancellableFlag
             )
-            guard restoredOriginal.matchesAfterRename(recoveryAfter),
-                  restoredWork.matchesAfterRename(editedExpected)
+            guard restoredOriginal.matchesAfterRename(expectedOriginal),
+                  restoredWork.matchesAfterRename(expectedWork)
             else {
-                return .uncertain("回滚后文件状态无法验证")
+                return .uncertain(failureMessage)
+            }
+
+            try operations.syncURLFile(
+                originalURL,
+                restoredOriginal.nodeState.identity
+            )
+            try operations.syncWorkspaceFile(
+                ownedWork.workspace,
+                restoredWork.nodeState.identity
+            )
+            try operations.syncWorkspaceDirectory(ownedWork.workspace)
+            try operations.syncParentDirectory(ownedWork.workspace)
+
+            let durableOriginal = try operations.snapshotURL(
+                originalURL,
+                uncancellableFlag
+            )
+            let durableWork = try operations.snapshotWorkspace(
+                ownedWork.workspace,
+                uncancellableFlag
+            )
+            guard durableOriginal.matchesAfterRename(expectedOriginal),
+                  durableWork.matchesAfterRename(expectedWork)
+            else {
+                return .uncertain(failureMessage)
             }
             return .rolledBack
         } catch {
-            return .uncertain("检测到提交状态异常且自动回滚失败")
+            return .uncertain(failureMessage)
         }
     }
 

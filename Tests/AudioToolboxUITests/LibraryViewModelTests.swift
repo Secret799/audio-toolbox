@@ -501,7 +501,14 @@ struct LibraryViewModelTests {
         #expect(viewModel.canExecuteBatchEdit)
         await viewModel.runBatchEdit()
 
-        #expect(await editor.requests.first?.files == [Self.firstTrack.url])
+        #expect(await editor.requests.first?.targets == [
+            BatchEditTarget(
+                url: Self.firstTrack.url,
+                fileIdentity: Self.firstTrack.id,
+                fileSize: Self.firstTrack.fileSize,
+                modificationDate: Self.firstTrack.modificationDate
+            )
+        ])
     }
 
     @Test("未确认不能执行，执行中禁止重复提交")
@@ -816,6 +823,7 @@ struct LibraryViewModelTests {
                 duration: 120
             ),
             fileSize: 1_024,
+            modificationDate: Date(timeIntervalSince1970: 1_700_000_000),
             isWritable: true,
             issue: nil
         )
@@ -986,15 +994,15 @@ private actor SuspendedBatchEditor: BatchEditing {
         onProgress: @escaping @Sendable (BatchProgress) -> Void
     ) async -> BatchEditSummary {
         requests.append(request)
-        onProgress(BatchProgress(completed: 0, total: request.files.count, currentURL: nil))
+        onProgress(BatchProgress(completed: 0, total: request.targets.count, currentURL: nil))
         let waiters = runningContinuations
         runningContinuations.removeAll()
         waiters.forEach { $0.resume() }
         await withCheckedContinuation { continuation in
             completionContinuation = continuation
         }
-        return BatchEditSummary(results: request.files.map {
-            BatchFileResult(url: $0, status: .notProcessed, message: "stopped")
+        return BatchEditSummary(results: request.targets.map {
+            BatchFileResult(url: $0.url, status: .notProcessed, message: "stopped")
         })
     }
 

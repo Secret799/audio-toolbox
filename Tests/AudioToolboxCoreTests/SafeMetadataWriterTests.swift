@@ -46,6 +46,250 @@ struct SafeMetadataWriterTests {
     }
 
     @Test
+    func scannedTargetPathReplacementIsRejectedBeforeCopyOrMetadataWrite() async throws {
+        let directory = try TemporaryAudioDirectory()
+        defer { directory.remove() }
+        let original = try directory.createAudioFile()
+        let target = try batchTarget(for: original)
+        let replacement = directory.url.appendingPathComponent("replacement.mp3")
+        let replacementBytes = Data("title=替换文件\nartist=替换作者\nalbum=替换专辑\n".utf8)
+        try replacementBytes.write(to: replacement)
+        try FileManager.default.removeItem(at: original)
+        try FileManager.default.moveItem(at: replacement, to: original)
+        let service = FakeSafeMetadataService()
+        let copyCount = LockedCounter()
+        let live = testFileOperations()
+        let operations = live.overriding(copyIntoWorkspace: { source, workspace, flag in
+            _ = copyCount.incrementAndGet()
+            return try live.copyIntoWorkspace(source, workspace, flag)
+        })
+        let writer = makeTestWriter(metadataService: service, operations: operations)
+
+        let result = await writer.apply(
+            to: target,
+            patch: MetadataPatch(artist: "不应写入", album: nil)
+        )
+
+        #expect(result.status == .failed)
+        #expect(result.message == "文件已变化，请重新扫描确认")
+        #expect(copyCount.value == 0)
+        #expect(await service.recordedWriteURLs().isEmpty)
+        #expect(try Data(contentsOf: original) == replacementBytes)
+    }
+
+    @Test
+    func scannedTargetSameInodeFingerprintChangeIsRejectedBeforeCopyOrMetadataWrite() async throws {
+        let directory = try TemporaryAudioDirectory()
+        defer { directory.remove() }
+        let original = try directory.createAudioFile()
+        let target = try batchTarget(for: original)
+        let changedBytes = Data("title=同 inode 已变化\nartist=原作者\nalbum=原专辑\nextra=changed\n".utf8)
+        try writeInPlace(changedBytes, to: original)
+        let changedFingerprint = try StableFileIdentityResolver.fingerprint(for: original)
+        #expect(changedFingerprint.fileIdentity == target.fileIdentity)
+        #expect(
+            changedFingerprint.fileSize != target.fileSize
+                || changedFingerprint.modificationDate != target.modificationDate
+        )
+        let service = FakeSafeMetadataService()
+        let copyCount = LockedCounter()
+        let live = testFileOperations()
+        let operations = live.overriding(copyIntoWorkspace: { source, workspace, flag in
+            _ = copyCount.incrementAndGet()
+            return try live.copyIntoWorkspace(source, workspace, flag)
+        })
+        let writer = makeTestWriter(metadataService: service, operations: operations)
+
+        let result = await writer.apply(
+            to: target,
+            patch: MetadataPatch(artist: "不应写入", album: nil)
+        )
+
+        #expect(result.status == .failed)
+        #expect(result.message == "文件已变化，请重新扫描确认")
+        #expect(copyCount.value == 0)
+        #expect(await service.recordedWriteURLs().isEmpty)
+        #expect(try Data(contentsOf: original) == changedBytes)
+    }
+
+    @Test
+    func unchangedScannedTargetCommitsSuccessfully() async throws {
+        let directory = try TemporaryAudioDirectory()
+        defer { directory.remove() }
+        let original = try directory.createAudioFile()
+        let target = try batchTarget(for: original)
+        let writer = makeTestWriter(metadataService: FakeSafeMetadataService())
+
+        let result = await writer.apply(
+            to: target,
+            patch: MetadataPatch(artist: "新作者", album: nil)
+        )
+
+        #expect(result.status == .succeeded)
+        #expect(try String(contentsOf: original, encoding: .utf8).contains("artist=新作者"))
+    }
+
+    @Test
+    func durableCommitSyncsWorkAndDirectoriesInRequiredOrder() async throws {
+        let directory = try TemporaryAudioDirectory()
+        defer { directory.remove() }
+        let original = try directory.createAudioFile()
+        let target = try batchTarget(for: original)
+        let calls = LockedStrings()
+        let live = testFileOperations()
+        let operations = live.overriding(
+            swap: { originalURL, workURL in
+                calls.append("swap")
+                try live.swap(originalURL, workURL)
+            },
+            syncWorkspaceFile: { workspace, identity in
+                calls.append("work-file")
+                try live.syncWorkspaceFile(workspace, identity)
+            },
+            syncWorkspaceDirectory: { workspace in
+                calls.append("workspace-dir")
+                try live.syncWorkspaceDirectory(workspace)
+            },
+            syncURLFile: { url, identity in
+                calls.append("original-file")
+                try live.syncURLFile(url, identity)
+            },
+            syncParentDirectory: { workspace in
+                calls.append("parent-dir")
+                try live.syncParentDirectory(workspace)
+            }
+        )
+        let writer = makeTestWriter(metadataService: FakeSafeMetadataService(), operations: operations)
+
+        let result = await writer.apply(
+            to: target,
+            patch: MetadataPatch(artist: "新作者", album: nil)
+        )
+
+        #expect(result.status == .succeeded)
+        #expect(calls.values == [
+            "work-file", "workspace-dir", "swap", "original-file", "parent-dir"
+        ])
+        #expect(try directory.workDirectories().isEmpty)
+    }
+
+    @Test
+    func preSwapSyncFailureDoesNotCommit() async throws {
+        let directory = try TemporaryAudioDirectory()
+        defer { directory.remove() }
+        let original = try directory.createAudioFile()
+        let target = try batchTarget(for: original)
+        let originalBytes = try Data(contentsOf: original)
+        let swapCount = LockedCounter()
+        let live = testFileOperations()
+        let operations = live.overriding(
+            swap: { originalURL, workURL in
+                _ = swapCount.incrementAndGet()
+                try live.swap(originalURL, workURL)
+            },
+            syncWorkspaceFile: { _, _ in
+                throw SafeMetadataFileSystemError(operation: .sync, code: EIO)
+            }
+        )
+        let writer = makeTestWriter(metadataService: FakeSafeMetadataService(), operations: operations)
+
+        let result = await writer.apply(
+            to: target,
+            patch: MetadataPatch(artist: "新作者", album: nil)
+        )
+
+        #expect(result.status == .failed)
+        #expect(result.message?.contains("耐久同步") == true)
+        #expect(swapCount.value == 0)
+        #expect(try Data(contentsOf: original) == originalBytes)
+        #expect(try directory.workDirectories().isEmpty)
+    }
+
+    @Test
+    func postSwapSyncFailureRollsBackAndSyncsRollbackBeforeCleanup() async throws {
+        let directory = try TemporaryAudioDirectory()
+        defer { directory.remove() }
+        let original = try directory.createAudioFile()
+        let target = try batchTarget(for: original)
+        let originalBytes = try Data(contentsOf: original)
+        let calls = LockedStrings()
+        let syncOriginalCount = LockedCounter()
+        let live = testFileOperations()
+        let operations = live.overriding(
+            swap: { originalURL, workURL in
+                calls.append("swap")
+                try live.swap(originalURL, workURL)
+            },
+            syncWorkspaceFile: { workspace, identity in
+                calls.append("work-file")
+                try live.syncWorkspaceFile(workspace, identity)
+            },
+            syncWorkspaceDirectory: { workspace in
+                calls.append("workspace-dir")
+                try live.syncWorkspaceDirectory(workspace)
+            },
+            syncURLFile: { url, identity in
+                calls.append("original-file")
+                if syncOriginalCount.incrementAndGet() == 1 {
+                    throw SafeMetadataFileSystemError(operation: .sync, code: EIO)
+                }
+                try live.syncURLFile(url, identity)
+            },
+            syncParentDirectory: { workspace in
+                calls.append("parent-dir")
+                try live.syncParentDirectory(workspace)
+            }
+        )
+        let writer = makeTestWriter(metadataService: FakeSafeMetadataService(), operations: operations)
+
+        let result = await writer.apply(
+            to: target,
+            patch: MetadataPatch(artist: "新作者", album: nil)
+        )
+
+        #expect(result.status == .failed)
+        #expect(result.message?.contains("已安全回滚") == true)
+        #expect(try Data(contentsOf: original) == originalBytes)
+        #expect(calls.values == [
+            "work-file", "workspace-dir", "swap", "original-file",
+            "swap", "original-file", "work-file", "workspace-dir", "parent-dir"
+        ])
+        #expect(try directory.workDirectories().isEmpty)
+    }
+
+    @Test
+    func postSwapSyncAndRollbackSyncFailureIsUncertainAndPreservesRecovery() async throws {
+        let directory = try TemporaryAudioDirectory()
+        defer { directory.remove() }
+        let original = try directory.createAudioFile()
+        let target = try batchTarget(for: original)
+        let originalBytes = try Data(contentsOf: original)
+        let swapCount = LockedCounter()
+        let live = testFileOperations()
+        let operations = live.overriding(
+            swap: { originalURL, workURL in
+                _ = swapCount.incrementAndGet()
+                try live.swap(originalURL, workURL)
+            },
+            syncURLFile: { _, _ in
+                throw SafeMetadataFileSystemError(operation: .sync, code: EIO)
+            }
+        )
+        let writer = makeTestWriter(metadataService: FakeSafeMetadataService(), operations: operations)
+
+        let result = await writer.apply(
+            to: target,
+            patch: MetadataPatch(artist: "新作者", album: nil)
+        )
+
+        #expect(result.status == .failed)
+        #expect(result.message?.contains("提交状态不确定") == true)
+        #expect(swapCount.value == 2)
+        #expect(try Data(contentsOf: original) == originalBytes)
+        #expect(try directory.firstWorkFile() != nil)
+    }
+
+    @Test
     func privateWorkspaceDirectoryCollisionRetriesWithoutDeletingExistingDirectory() async throws {
         let directory = try TemporaryAudioDirectory()
         defer { directory.remove() }
@@ -181,7 +425,7 @@ struct SafeMetadataWriterTests {
         )
 
         #expect(result.status == .failed)
-        #expect(result.message?.contains("原文件在编辑期间发生变化") == true)
+        #expect(result.message == "文件已变化，请重新扫描确认")
         #expect(try Data(contentsOf: original) == changedBytes)
         #expect(try directory.workDirectories().isEmpty)
     }
@@ -862,7 +1106,7 @@ struct SafeMetadataWriterTests {
     }
 
     @Test
-    func successfulCommitUsesExactlyFourCoordinationDigestsAndTwoAfterGate() async throws {
+    func successfulCommitUsesSixCoordinationDigestsAndFourAfterGate() async throws {
         let directory = try TemporaryAudioDirectory()
         defer { directory.remove() }
         let original = try directory.createAudioFile()
@@ -895,8 +1139,8 @@ struct SafeMetadataWriterTests {
         let result = await writer.apply(to: original, patch: MetadataPatch(artist: "新作者", album: nil))
 
         #expect(result.status == .succeeded)
-        #expect(budget.coordinationDigests == 4)
-        #expect(budget.postGateDigests == 2)
+        #expect(budget.coordinationDigests == 6)
+        #expect(budget.postGateDigests == 4)
     }
 
     @Test
@@ -1375,6 +1619,29 @@ private final class AsyncSignal: @unchecked Sendable {
             }
         }.value
     }
+}
+
+private final class LockedStrings: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storedValues: [String] = []
+
+    var values: [String] {
+        lock.withLock { storedValues }
+    }
+
+    func append(_ value: String) {
+        lock.withLock { storedValues.append(value) }
+    }
+}
+
+private func batchTarget(for url: URL) throws -> BatchEditTarget {
+    let fingerprint = try StableFileIdentityResolver.fingerprint(for: url)
+    return BatchEditTarget(
+        url: url,
+        fileIdentity: fingerprint.fileIdentity,
+        fileSize: fingerprint.fileSize,
+        modificationDate: fingerprint.modificationDate
+    )
 }
 
 private enum FakeWriterError: Error {

@@ -396,7 +396,17 @@ public final class LibraryViewModel: ObservableObject {
         batchProgressTask = progressTask
 
         let summary = await batchEditor.run(
-            BatchEditRequest(files: selectedTracks.map(\.url), patch: patch)
+            BatchEditRequest(
+                targets: selectedTracks.map { track in
+                    BatchEditTarget(
+                        url: track.url,
+                        fileIdentity: track.id,
+                        fileSize: track.fileSize,
+                        modificationDate: track.modificationDate
+                    )
+                },
+                patch: patch
+            )
         ) { progress in
             progressContinuation.yield(progress)
         }

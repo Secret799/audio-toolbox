@@ -167,7 +167,14 @@ struct BatchEditorTests {
 
 private func request(files: [URL]) -> BatchEditRequest {
     BatchEditRequest(
-        files: files,
+        targets: files.enumerated().map { index, url in
+            BatchEditTarget(
+                url: url,
+                fileIdentity: FileIdentity(rawValue: "test-\(index)-\(url.lastPathComponent)"),
+                fileSize: Int64(index + 1),
+                modificationDate: Date(timeIntervalSince1970: Double(1_700_000_000 + index))
+            )
+        },
         patch: MetadataPatch(artist: "新作者", album: "新专辑")
     )
 }
@@ -186,7 +193,8 @@ private actor StubBatchWriter: SafeMetadataWriting {
         self.statuses = statuses
     }
 
-    func apply(to url: URL, patch: MetadataPatch) async -> BatchFileResult {
+    func apply(to target: BatchEditTarget, patch: MetadataPatch) async -> BatchFileResult {
+        let url = target.url
         urls.append(url)
         let status = statuses.removeFirst()
         return BatchFileResult(url: url, status: status, message: nil)
@@ -206,7 +214,8 @@ private actor SuspendedBatchWriter: SafeMetadataWriting {
     private var secondStarted = false
     private var secondFinishContinuation: CheckedContinuation<BatchFileStatus, Never>?
 
-    func apply(to url: URL, patch: MetadataPatch) async -> BatchFileResult {
+    func apply(to target: BatchEditTarget, patch: MetadataPatch) async -> BatchFileResult {
+        let url = target.url
         urls.append(url)
         switch urls.count {
         case 1:
@@ -265,7 +274,8 @@ private actor SuspendedThenImmediateBatchWriter: SafeMetadataWriting {
     private var firstStarted = false
     private var firstFinishContinuation: CheckedContinuation<Void, Never>?
 
-    func apply(to url: URL, patch: MetadataPatch) async -> BatchFileResult {
+    func apply(to target: BatchEditTarget, patch: MetadataPatch) async -> BatchFileResult {
+        let url = target.url
         urls.append(url)
         if urls.count == 1 {
             firstStarted = true

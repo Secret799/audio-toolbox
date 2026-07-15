@@ -41,6 +41,7 @@ public struct DirectoryScanner: DirectoryScanning {
 
     private static let detailKeys: Set<URLResourceKey> = [
         .fileSizeKey,
+        .contentModificationDateKey,
         .fileResourceIdentifierKey,
         .volumeIdentifierKey,
     ]
@@ -141,10 +142,11 @@ public struct DirectoryScanner: DirectoryScanning {
             }
 
             let detailValues = try? readResourceValues(url, Self.detailKeys)
-            let identity = Self.fileIdentity(
+            let identity = StableFileIdentityResolver.fileIdentity(
                 for: url,
                 fileResourceIdentifier: detailValues?.fileResourceIdentifier,
-                volumeIdentifier: detailValues?.volumeIdentifier
+                volumeIdentifier: detailValues?.volumeIdentifier,
+                usePOSIXFallback: detailValues != nil
             )
             guard identities.insert(identity).inserted else { continue }
 
@@ -166,6 +168,7 @@ public struct DirectoryScanner: DirectoryScanning {
                             format: format,
                             metadata: metadata,
                             fileSize: Int64(detailValues?.fileSize ?? 0),
+                            modificationDate: detailValues?.contentModificationDate ?? .distantPast,
                             isWritable: isWritable,
                             issue: nil
                         )
@@ -186,27 +189,11 @@ public struct DirectoryScanner: DirectoryScanning {
         fileResourceIdentifier: Any?,
         volumeIdentifier: Any?
     ) -> FileIdentity {
-        if let volume = archivedIdentifier(volumeIdentifier),
-           let file = archivedIdentifier(fileResourceIdentifier)
-        {
-            return FileIdentity(rawValue: "resource:\(volume):\(file)")
-        }
-
-        let path = url.standardizedFileURL.resolvingSymlinksInPath().path
-        return FileIdentity(rawValue: "path:\(path)")
+        StableFileIdentityResolver.fileIdentity(
+            for: url,
+            fileResourceIdentifier: fileResourceIdentifier,
+            volumeIdentifier: volumeIdentifier
+        )
     }
 
-    private static func archivedIdentifier(_ identifier: Any?) -> String? {
-        guard let identifier = identifier as? any NSSecureCoding else { return nil }
-
-        do {
-            let data = try NSKeyedArchiver.archivedData(
-                withRootObject: identifier,
-                requiringSecureCoding: true
-            )
-            return data.base64EncodedString()
-        } catch {
-            return nil
-        }
-    }
 }

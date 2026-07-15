@@ -32,6 +32,9 @@ void ATSFCancellationFlagSetCallbackDelayForTesting(
 );
 void ATSFCancellationFlagRelease(ATSFCancellationFlag * _Nullable flag);
 
+/// Uses F_FULLFSYNC when supported and falls back to fsync. Returns 0 or errno.
+int32_t ATSFFullSyncFD(int32_t fd);
+
 /// Opens source with O_NOFOLLOW, creates destination with openat(O_EXCL |
 /// O_NOFOLLOW) relative to directory_fd, then copies all data and metadata with
 /// fcopyfile(COPYFILE_ALL). The returned destination fd uses F_DUPFD_CLOEXEC

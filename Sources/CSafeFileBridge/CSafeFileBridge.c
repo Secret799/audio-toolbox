@@ -147,6 +147,29 @@ void ATSFCancellationFlagRelease(ATSFCancellationFlag *flag) {
     free(flag);
 }
 
+int32_t ATSFFullSyncFD(int32_t fd) {
+    if(fd < 0) {
+        return EBADF;
+    }
+
+    if(fcntl(fd, F_FULLFSYNC) == 0) {
+        return 0;
+    }
+
+    int full_sync_error = errno;
+    if(full_sync_error != EINVAL
+        && full_sync_error != ENOTSUP
+        && full_sync_error != ENOTTY) {
+        return full_sync_error;
+    }
+
+    int result;
+    do {
+        result = fsync(fd);
+    } while(result != 0 && errno == EINTR);
+    return result == 0 ? 0 : errno;
+}
+
 ATSFCopyResult ATSFCopyFileToDirectory(
     const char *source_path,
     int32_t directory_fd,

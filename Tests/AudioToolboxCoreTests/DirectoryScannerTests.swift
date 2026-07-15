@@ -66,6 +66,7 @@ struct DirectoryScannerTests {
         #expect(Set(loaded.map { $0.url.lastPathComponent }) == ["song.MP3", "track.FlAc"])
         #expect(loaded.allSatisfy { $0.metadata == .fixture })
         #expect(loaded.allSatisfy { $0.fileSize > 0 })
+        #expect(loaded.allSatisfy { $0.modificationDate.timeIntervalSince1970 > 0 })
         #expect(loaded.allSatisfy { $0.isWritable })
         #expect(events.filter(isFinished).count == 1)
         #expect(events.last == .finished)
@@ -184,6 +185,7 @@ struct DirectoryScannerTests {
 
         #expect(loaded.count == 1)
         #expect(loaded[0].fileSize == 0)
+        #expect(loaded[0].modificationDate == .distantPast)
         #expect(
             loaded[0].id.rawValue
                 == "path:\(fileURL.standardizedFileURL.resolvingSymlinksInPath().path)"
