@@ -29,6 +29,19 @@ struct TagLibMetadataServiceTests {
         }
     }
 
+    @Test("reads and probes FLAC with a leading ID3v2 tag")
+    func readsFLACWithLeadingID3Tag() async throws {
+        let service = TagLibMetadataService()
+        var contents = Data([0x49, 0x44, 0x33, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
+        contents.append(try Data(contentsOf: fixtureURL("sample.flac")))
+
+        try await withTemporaryFile(named: "id3-prefixed.flac", contents: contents) { copy in
+            let metadata = try await service.read(url: copy)
+            #expect(metadata.title == "Fixture Title")
+            #expect(await service.canWrite(url: copy))
+        }
+    }
+
     @Test("raw AAC without tags is explicitly unreadable")
     func rawAACWithoutTagsIsUnreadable() async throws {
         let service = TagLibMetadataService()
@@ -78,6 +91,25 @@ struct TagLibMetadataServiceTests {
                 #expect(metadata.albums.first == "Original Album", "Album changed for \(name)")
                 #expect(metadata.title == "Fixture Title", "Title changed for \(name)")
             }
+        }
+    }
+
+    @Test("writes and rereads an artist stored beyond a 64 KiB ID3 tag")
+    func writesArtistBeyondLargeID3Tag() async throws {
+        let service = TagLibMetadataService()
+        let largeArtist = String(repeating: "A", count: 70_000)
+
+        try await withFixtureCopy("sample.mp3") { copy in
+            try await service.write(
+                url: copy,
+                patch: MetadataPatch(artist: largeArtist, album: nil)
+            )
+
+            #expect(await service.canWrite(url: copy))
+            let metadata = try await service.read(url: copy)
+            #expect(metadata.artists.first == largeArtist)
+            #expect(metadata.albums.first == "Original Album")
+            #expect(metadata.title == "Fixture Title")
         }
     }
 
@@ -145,6 +177,25 @@ struct TagLibMetadataServiceTests {
                 )
             }
             #expect(try Data(contentsOf: copy) == before)
+        }
+    }
+
+    @Test("rejects malformed or out-of-bounds ID3 declarations")
+    func rejectsMalformedID3Declarations() async throws {
+        let service = TagLibMetadataService()
+        let mp3 = try Data(contentsOf: fixtureURL("sample.mp3"))
+        let headers: [(String, [UInt8])] = [
+            ("unsupported-version.mp3", [0x49, 0x44, 0x33, 0x05, 0x00, 0x00, 0, 0, 0, 0]),
+            ("invalid-synchsafe.mp3", [0x49, 0x44, 0x33, 0x04, 0x00, 0x00, 0x80, 0, 0, 0]),
+            ("out-of-bounds.mp3", [0x49, 0x44, 0x33, 0x04, 0x00, 0x00, 0x7F, 0x7F, 0x7F, 0x7F])
+        ]
+
+        for (name, header) in headers {
+            var contents = Data(header)
+            contents.append(mp3)
+            try await withTemporaryFile(named: name, contents: contents) { copy in
+                try await expectRejectedWritePreservingBytes(copy, service: service)
+            }
         }
     }
 

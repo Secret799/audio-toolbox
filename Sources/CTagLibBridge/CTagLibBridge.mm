@@ -14,6 +14,7 @@
 #include <cstring>
 #include <exception>
 #include <fstream>
+#include <limits>
 #include <new>
 #include <string>
 
@@ -95,13 +96,56 @@ enum class ATContainer {
     RawADTS
 };
 
-struct ATFileHeader {
+struct ATFileProbe {
     std::array<unsigned char, ATHeaderProbeSize> bytes{};
     size_t size = 0;
     uint64_t file_size = 0;
+    uint64_t file_offset = 0;
+    bool has_leading_id3 = false;
 };
 
-bool ReadFileHeader(const char *path, ATFileHeader &header) {
+bool AddWithinFile(uint64_t base, uint64_t addition, uint64_t file_size, uint64_t &sum) {
+    if(addition > std::numeric_limits<uint64_t>::max() - base) {
+        return false;
+    }
+
+    sum = base + addition;
+    return sum <= file_size;
+}
+
+bool ReadProbeAt(
+    std::ifstream &stream,
+    uint64_t file_size,
+    uint64_t file_offset,
+    bool has_leading_id3,
+    ATFileProbe &probe
+) {
+    if(file_offset > file_size
+        || file_offset > static_cast<uint64_t>(std::numeric_limits<std::streamoff>::max())) {
+        return false;
+    }
+
+    const uint64_t remaining = file_size - file_offset;
+    const size_t requested = remaining < ATHeaderProbeSize
+        ? static_cast<size_t>(remaining)
+        : ATHeaderProbeSize;
+
+    stream.clear();
+    stream.seekg(static_cast<std::streamoff>(file_offset), std::ios::beg);
+    if(!stream) {
+        return false;
+    }
+
+    stream.read(reinterpret_cast<char *>(probe.bytes.data()),
+                static_cast<std::streamsize>(requested));
+    probe.size = static_cast<size_t>(stream.gcount());
+    probe.file_size = file_size;
+    probe.file_offset = file_offset;
+    probe.has_leading_id3 = has_leading_id3;
+    return probe.size == requested;
+}
+
+bool ReadFileProbe(const char *path, ATFileProbe &probe) {
     std::ifstream stream(path, std::ios::binary | std::ios::ate);
     if(!stream) {
         return false;
@@ -111,26 +155,62 @@ bool ReadFileHeader(const char *path, ATFileHeader &header) {
     if(end <= 0) {
         return false;
     }
+    const uint64_t file_size = static_cast<uint64_t>(end);
 
-    header.file_size = static_cast<uint64_t>(end);
-    const size_t requested = header.file_size < ATHeaderProbeSize
-        ? static_cast<size_t>(header.file_size)
-        : ATHeaderProbeSize;
+    std::array<unsigned char, 10> prefix{};
+    const size_t prefix_size = file_size < prefix.size()
+        ? static_cast<size_t>(file_size)
+        : prefix.size();
 
     stream.seekg(0, std::ios::beg);
     if(!stream) {
         return false;
     }
+    stream.read(reinterpret_cast<char *>(prefix.data()),
+                static_cast<std::streamsize>(prefix_size));
+    if(static_cast<size_t>(stream.gcount()) != prefix_size) {
+        return false;
+    }
 
-    stream.read(reinterpret_cast<char *>(header.bytes.data()),
-                static_cast<std::streamsize>(requested));
-    header.size = static_cast<size_t>(stream.gcount());
-    return header.size == requested;
+    const bool has_id3 = prefix_size >= 3
+        && std::memcmp(prefix.data(), "ID3", 3) == 0;
+    if(!has_id3) {
+        return ReadProbeAt(stream, file_size, 0, false, probe);
+    }
+
+    if(prefix_size < prefix.size()) {
+        return false;
+    }
+
+    const unsigned int major_version = prefix[3];
+    if(major_version != 2 && major_version != 3 && major_version != 4) {
+        return false;
+    }
+    for(size_t index = 6; index <= 9; ++index) {
+        if((prefix[index] & 0x80) != 0) {
+            return false;
+        }
+    }
+
+    const uint64_t declared_size = (static_cast<uint64_t>(prefix[6]) << 21)
+        | (static_cast<uint64_t>(prefix[7]) << 14)
+        | (static_cast<uint64_t>(prefix[8]) << 7)
+        | static_cast<uint64_t>(prefix[9]);
+    uint64_t payload_offset = 0;
+    if(!AddWithinFile(10, declared_size, file_size, payload_offset)) {
+        return false;
+    }
+    if(major_version == 4 && (prefix[5] & 0x10) != 0
+        && !AddWithinFile(payload_offset, 10, file_size, payload_offset)) {
+        return false;
+    }
+
+    return ReadProbeAt(stream, file_size, payload_offset, true, probe);
 }
 
-bool StartsWith(const ATFileHeader &header, const char *value, size_t length) {
-    return header.size >= length
-        && std::memcmp(header.bytes.data(), value, length) == 0;
+bool StartsWith(const ATFileProbe &probe, const char *value, size_t length) {
+    return probe.size >= length
+        && std::memcmp(probe.bytes.data(), value, length) == 0;
 }
 
 uint32_t ReadBigEndian32(const unsigned char *bytes) {
@@ -145,26 +225,29 @@ uint64_t ReadBigEndian64(const unsigned char *bytes) {
         | static_cast<uint64_t>(ReadBigEndian32(bytes + 4));
 }
 
-bool HasMP4FileTypeBox(const ATFileHeader &header) {
-    size_t offset = 0;
+bool HasMP4FileTypeBox(const ATFileProbe &probe) {
+    if(probe.has_leading_id3 || probe.file_offset != 0) {
+        return false;
+    }
 
-    while(offset + 8 <= header.size) {
-        const unsigned char *box = header.bytes.data() + offset;
+    size_t offset = 0;
+    while(offset + 8 <= probe.size) {
+        const unsigned char *box = probe.bytes.data() + offset;
         uint64_t box_size = ReadBigEndian32(box);
         uint64_t box_header_size = 8;
 
         if(box_size == 1) {
-            if(offset + 16 > header.size) {
+            if(offset + 16 > probe.size) {
                 return false;
             }
             box_size = ReadBigEndian64(box + 8);
             box_header_size = 16;
         }
         else if(box_size == 0) {
-            box_size = header.file_size - offset;
+            box_size = probe.file_size - offset;
         }
 
-        if(box_size < box_header_size || box_size > header.file_size - offset) {
+        if(box_size < box_header_size || box_size > probe.file_size - offset) {
             return false;
         }
 
@@ -172,7 +255,7 @@ bool HasMP4FileTypeBox(const ATFileHeader &header) {
             return box_size >= box_header_size + 8;
         }
 
-        if(box_size > header.size - offset) {
+        if(box_size > probe.size - offset) {
             return false;
         }
         offset += static_cast<size_t>(box_size);
@@ -181,41 +264,12 @@ bool HasMP4FileTypeBox(const ATFileHeader &header) {
     return false;
 }
 
-size_t AudioPayloadOffset(const ATFileHeader &header) {
-    if(!StartsWith(header, "ID3", 3)) {
-        return 0;
-    }
-    if(header.size < 10) {
-        return header.size;
-    }
-
-    for(size_t index = 6; index <= 9; ++index) {
-        if((header.bytes[index] & 0x80) != 0) {
-            return header.size;
-        }
-    }
-
-    const uint32_t tag_size = (static_cast<uint32_t>(header.bytes[6]) << 21)
-        | (static_cast<uint32_t>(header.bytes[7]) << 14)
-        | (static_cast<uint32_t>(header.bytes[8]) << 7)
-        | static_cast<uint32_t>(header.bytes[9]);
-    uint64_t payload_offset = 10 + static_cast<uint64_t>(tag_size);
-    if((header.bytes[5] & 0x10) != 0) {
-        payload_offset += 10;
-    }
-
-    if(payload_offset > header.file_size || payload_offset > header.size) {
-        return header.size;
-    }
-    return static_cast<size_t>(payload_offset);
-}
-
-bool IsRawADTSFrameAt(const ATFileHeader &header, size_t offset) {
-    if(offset + 7 > header.size) {
+bool IsRawADTSFrameAt(const ATFileProbe &probe, size_t offset) {
+    if(offset + 7 > probe.size || offset > probe.file_size - probe.file_offset) {
         return false;
     }
 
-    const unsigned char *frame = header.bytes.data() + offset;
+    const unsigned char *frame = probe.bytes.data() + offset;
     if(frame[0] != 0xFF || (frame[1] & 0xF6) != 0xF0) {
         return false;
     }
@@ -228,15 +282,16 @@ bool IsRawADTSFrameAt(const ATFileHeader &header, size_t offset) {
     const uint32_t frame_length = (static_cast<uint32_t>(frame[3] & 0x03) << 11)
         | (static_cast<uint32_t>(frame[4]) << 3)
         | (static_cast<uint32_t>(frame[5]) >> 5);
-    return frame_length >= 7 && frame_length <= header.file_size - offset;
+    const uint64_t absolute_offset = probe.file_offset + offset;
+    return frame_length >= 7 && frame_length <= probe.file_size - absolute_offset;
 }
 
-bool IsMPEGAudioFrameAt(const ATFileHeader &header, size_t offset) {
-    if(offset + 4 > header.size) {
+bool IsMPEGAudioFrameAt(const ATFileProbe &probe, size_t offset) {
+    if(offset + 4 > probe.size) {
         return false;
     }
 
-    const unsigned char *frame = header.bytes.data() + offset;
+    const unsigned char *frame = probe.bytes.data() + offset;
     if(frame[0] != 0xFF || (frame[1] & 0xE0) != 0xE0) {
         return false;
     }
@@ -253,29 +308,42 @@ bool IsMPEGAudioFrameAt(const ATFileHeader &header, size_t offset) {
         && sample_rate_index != 0x03;
 }
 
-ATContainer DetectContainer(const ATFileHeader &header) {
-    if(StartsWith(header, "fLaC", 4)) {
-        return ATContainer::FLAC;
-    }
-    if(StartsWith(header, "OggS", 4)) {
-        return ATContainer::Ogg;
-    }
-    if(header.size >= 12
-        && (StartsWith(header, "RIFF", 4) || StartsWith(header, "RF64", 4))
-        && std::memcmp(header.bytes.data() + 8, "WAVE", 4) == 0) {
-        return ATContainer::WAV;
-    }
-    if(HasMP4FileTypeBox(header)) {
-        return ATContainer::MP4;
+ATContainer DetectContainer(const ATFileProbe &probe) {
+    if(probe.has_leading_id3) {
+        if(StartsWith(probe, "fLaC", 4)) {
+            return ATContainer::FLAC;
+        }
+        if(IsRawADTSFrameAt(probe, 0)) {
+            return ATContainer::RawADTS;
+        }
+        for(size_t offset = 0; offset + 4 <= probe.size; ++offset) {
+            if(IsMPEGAudioFrameAt(probe, offset)) {
+                return ATContainer::MPEGAudio;
+            }
+        }
+        return ATContainer::Unknown;
     }
 
-    const size_t payload_offset = AudioPayloadOffset(header);
-    if(IsRawADTSFrameAt(header, payload_offset)) {
+    if(StartsWith(probe, "fLaC", 4)) {
+        return ATContainer::FLAC;
+    }
+    if(StartsWith(probe, "OggS", 4)) {
+        return ATContainer::Ogg;
+    }
+    if(probe.size >= 12
+        && (StartsWith(probe, "RIFF", 4) || StartsWith(probe, "RF64", 4))
+        && std::memcmp(probe.bytes.data() + 8, "WAVE", 4) == 0) {
+        return ATContainer::WAV;
+    }
+    if(HasMP4FileTypeBox(probe)) {
+        return ATContainer::MP4;
+    }
+    if(IsRawADTSFrameAt(probe, 0)) {
         return ATContainer::RawADTS;
     }
 
-    for(size_t offset = payload_offset; offset + 4 <= header.size; ++offset) {
-        if(IsMPEGAudioFrameAt(header, offset)) {
+    for(size_t offset = 0; offset + 4 <= probe.size; ++offset) {
+        if(IsMPEGAudioFrameAt(probe, offset)) {
             return ATContainer::MPEGAudio;
         }
     }
@@ -334,12 +402,12 @@ ATContainer ContainerForExtension(const char *path) {
 }
 
 bool ContentMatchesExtension(const char *path, bool require_writable_container) {
-    ATFileHeader header;
-    if(!ReadFileHeader(path, header)) {
+    ATFileProbe probe;
+    if(!ReadFileProbe(path, probe)) {
         return false;
     }
 
-    const ATContainer detected = DetectContainer(header);
+    const ATContainer detected = DetectContainer(probe);
     const ATContainer expected = ContainerForExtension(path);
     if(detected == ATContainer::Unknown || detected != expected) {
         return false;
