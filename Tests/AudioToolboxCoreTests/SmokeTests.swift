@@ -4,7 +4,7 @@ import Testing
 @Suite("SmokeTests")
 struct SmokeTests {
     @Test
-    func coreModuleHasExpectedApplicationName() {
-        #expect(AudioToolboxCore.applicationName == "Audio Toolbox")
+    func supportsExpectedAudioFormats() {
+        #expect(AudioFormat.allCases.count == 8)
     }
 }
