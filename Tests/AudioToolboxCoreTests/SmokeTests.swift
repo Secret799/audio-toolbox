@@ -1,8 +1,10 @@
-import XCTest
+import Testing
 @testable import AudioToolboxCore
 
-final class SmokeTests: XCTestCase {
-    func testCoreModuleHasExpectedApplicationName() {
-        XCTAssertEqual(AudioToolboxCore.applicationName, "Audio Toolbox")
+@Suite("SmokeTests")
+struct SmokeTests {
+    @Test
+    func coreModuleHasExpectedApplicationName() {
+        #expect(AudioToolboxCore.applicationName == "Audio Toolbox")
     }
 }
