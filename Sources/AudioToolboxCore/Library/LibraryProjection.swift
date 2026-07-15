@@ -15,52 +15,52 @@ public enum LibraryProjection {
             }
         }
 
-        return buckets.map { name, tracks in
-            (
-                group: AudioGroup(
-                    id: "\(mode.rawValue):\(normalized(name, locale: locale))",
-                    displayName: name,
-                    trackIDs: sortedTracks(tracks, locale: locale).map(\.id)
-                ),
-                isUnknown: tracks.first.map { isUnknown($0, mode: mode) } ?? true
+        return buckets.map { displayName, tracks in
+            AudioGroup(
+                id: "\(mode.rawValue):\(displayName)",
+                displayName: displayName,
+                trackIDs: sortedTracks(tracks, locale: locale).map(\.id)
             )
         }.sorted { left, right in
-            if left.isUnknown != right.isUnknown {
-                return !left.isUnknown
-            }
-            return compare(
-                left.group.displayName,
-                right.group.displayName,
-                locale: locale
-            ) == .orderedAscending
-        }.map(\.group)
+            isOrderedBefore(left.displayName, right.displayName, locale: locale)
+        }
     }
 
     public static func sortedTracks(
         _ tracks: [AudioTrack],
         locale: Locale = .current
     ) -> [AudioTrack] {
-        tracks.sorted {
-            let left = $0.metadata.title?.trimmedNonEmpty ?? $0.url.lastPathComponent
-            let right = $1.metadata.title?.trimmedNonEmpty ?? $1.url.lastPathComponent
-            return compare(left, right, locale: locale) == .orderedAscending
+        tracks.sorted { left, right in
+            let leftDisplayName = displayName(for: left)
+            let rightDisplayName = displayName(for: right)
+
+            switch compare(leftDisplayName, rightDisplayName, locale: locale) {
+            case .orderedAscending:
+                return true
+            case .orderedDescending:
+                return false
+            case .orderedSame:
+                if leftDisplayName != rightDisplayName {
+                    return leftDisplayName < rightDisplayName
+                }
+                return left.id.rawValue < right.id.rawValue
+            }
         }
     }
 
-    private static func isUnknown(_ track: AudioTrack, mode: GroupingMode) -> Bool {
-        switch mode {
-        case .artist:
-            track.metadata.artists.first?.trimmedNonEmpty == nil
-        case .album:
-            track.metadata.albums.first?.trimmedNonEmpty == nil
-        }
+    private static func displayName(for track: AudioTrack) -> String {
+        track.metadata.title?.trimmedNonEmpty ?? track.url.lastPathComponent
     }
 
-    private static func normalized(_ value: String, locale: Locale) -> String {
-        value.folding(
-            options: [.caseInsensitive, .diacriticInsensitive],
-            locale: locale
-        )
+    private static func isOrderedBefore(_ left: String, _ right: String, locale: Locale) -> Bool {
+        switch compare(left, right, locale: locale) {
+        case .orderedAscending:
+            true
+        case .orderedDescending:
+            false
+        case .orderedSame:
+            left < right
+        }
     }
 
     private static func compare(_ left: String, _ right: String, locale: Locale) -> ComparisonResult {
