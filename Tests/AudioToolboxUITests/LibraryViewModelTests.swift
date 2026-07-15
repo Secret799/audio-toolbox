@@ -578,6 +578,7 @@ struct LibraryViewModelTests {
         viewModel.closeBatchEditor()
         #expect(viewModel.batchState == .closed)
         #expect(!viewModel.isBatchSheetPresented)
+        #expect(viewModel.batchEditTracks.isEmpty)
         viewModel.openBatchEditor()
         #expect(viewModel.batchState == .editing)
 

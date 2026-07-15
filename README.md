@@ -10,14 +10,17 @@ Audio Toolbox 是一个面向 macOS 13 及更高版本的本地音频元数据�
 
 ## 支持格式与保守降级
 
-扫描器识别以下扩展名：
+首版自动化夹具已经完成以下读写回归；“写入”包括只改作者、只改专辑、同时修改作者和专辑，并验证标题保留及音频时长仍大于 0：
 
-- MP3：`.mp3`
-- MPEG-4 音频/容器：`.m4a`、`.mp4`
-- AAC：`.aac`
-- FLAC：`.flac`
-- WAVE：`.wav`
-- Ogg：`.ogg`、`.oga`
+| 格式 | 扩展名 | 读取 | 写入 | 首版说明 |
+| --- | --- | --- | --- | --- |
+| MP3 | `.mp3` | 已验证 | 已验证 | 带 ID3v2.4 footer 的 MP3 保守拒绝 |
+| MPEG-4 Audio | `.m4a` | 已验证 | 已验证 | 仅承诺已测试的 M4A 夹具 |
+| FLAC | `.flac` | 已验证 | 已验证 | 包含前置 ID3v2 探测回归 |
+| WAVE | `.wav` | 已验证 | 已验证 | 仅承诺已测试的 WAV 夹具 |
+| Ogg Vorbis | `.ogg` | 已验证 | 已验证 | 仅承诺已测试的 OGG 夹具 |
+| raw AAC/ADTS | `.aac` | 明确降级 | 明确降级 | 无受支持标签时不可读取、不可编辑 |
+| 其他候选扩展名 | `.mp4`、`.oga` | 未做首版夹具验收 | 未承诺 | 扫描器会发现候选文件，但仍须通过内容探测 |
 
 实际读取或写入还取决于 TagLib 能否确认文件内容及标签结构。为避免破坏文件，应用采用保守策略：
 
@@ -48,6 +51,26 @@ Scripts/test.sh
 ```bash
 Scripts/test.sh --filter LibraryViewModelTests
 ```
+
+### SDK 与 compiler 版本不匹配
+
+如果构建出现 `compiled with ... cannot be imported by the Swift ... compiler`、Swift interface compiler version 不一致或宏插件无法加载，先核对当前工具链与 SDK：
+
+```bash
+swift --version
+xcode-select -p
+xcrun --sdk macosx --show-sdk-path
+xcrun --sdk macosx --show-sdk-version
+```
+
+优先通过 `xcode-select` 选择与 Swift compiler 匹配的 Xcode 或 Command Line Tools。切换工具链后执行 `swift package clean` 再重试。若机器同时安装了多个 macOS SDK，也可以只对当前命令临时指定一个与 compiler 匹配的 SDK，不要写入项目配置：
+
+```bash
+SDKROOT=/path/to/compatible/MacOSX.sdk CODEX_CI=1 Scripts/test.sh
+SDKROOT=/path/to/compatible/MacOSX.sdk CODEX_CI=1 Scripts/build-app.sh
+```
+
+不要用不匹配的 SDK 结果宣称发布验收通过；最终报告应记录实际 compiler、SDK 及 Mach-O minimum macOS 版本。
 
 组装、ad-hoc 签名并验证沙盒 `.app`：
 

@@ -90,6 +90,7 @@ struct TagLibMetadataServiceTests {
                 #expect(metadata.artists.first == "New Artist", "Unexpected artist for \(name)")
                 #expect(metadata.albums.first == "Original Album", "Album changed for \(name)")
                 #expect(metadata.title == "Fixture Title", "Title changed for \(name)")
+                #expect((metadata.duration ?? 0) > 0, "Duration missing after artist write for \(name)")
             }
         }
     }
@@ -113,37 +114,47 @@ struct TagLibMetadataServiceTests {
         }
     }
 
-    @Test("writes only album and preserves artist and title")
+    @Test("writes only album and preserves artist, title, and duration in common formats")
     func writesOnlyAlbumAndPreservesOtherFields() async throws {
         let service = TagLibMetadataService()
 
-        try await withFixtureCopy("sample.mp3") { copy in
-            try await service.write(
-                url: copy,
-                patch: MetadataPatch(artist: nil, album: "New Album")
-            )
+        for name in writableFixtureNames {
+            try await withFixtureCopy(name) { copy in
+                #expect(await service.canWrite(url: copy), "Expected \(name) to be writable")
 
-            let metadata = try await service.read(url: copy)
-            #expect(metadata.artists.first == "Original Artist")
-            #expect(metadata.albums.first == "New Album")
-            #expect(metadata.title == "Fixture Title")
+                try await service.write(
+                    url: copy,
+                    patch: MetadataPatch(artist: nil, album: "New Album")
+                )
+
+                let metadata = try await service.read(url: copy)
+                #expect(metadata.artists.first == "Original Artist", "Artist changed for \(name)")
+                #expect(metadata.albums.first == "New Album", "Unexpected album for \(name)")
+                #expect(metadata.title == "Fixture Title", "Title changed for \(name)")
+                #expect((metadata.duration ?? 0) > 0, "Duration missing after album write for \(name)")
+            }
         }
     }
 
-    @Test("writes artist and album together")
+    @Test("writes artist and album together while preserving title and duration in common formats")
     func writesArtistAndAlbumTogether() async throws {
         let service = TagLibMetadataService()
 
-        try await withFixtureCopy("sample.flac") { copy in
-            try await service.write(
-                url: copy,
-                patch: MetadataPatch(artist: "Both Artist", album: "Both Album")
-            )
+        for name in writableFixtureNames {
+            try await withFixtureCopy(name) { copy in
+                #expect(await service.canWrite(url: copy), "Expected \(name) to be writable")
 
-            let metadata = try await service.read(url: copy)
-            #expect(metadata.artists.first == "Both Artist")
-            #expect(metadata.albums.first == "Both Album")
-            #expect(metadata.title == "Fixture Title")
+                try await service.write(
+                    url: copy,
+                    patch: MetadataPatch(artist: "Both Artist", album: "Both Album")
+                )
+
+                let metadata = try await service.read(url: copy)
+                #expect(metadata.artists.first == "Both Artist", "Unexpected artist for \(name)")
+                #expect(metadata.albums.first == "Both Album", "Unexpected album for \(name)")
+                #expect(metadata.title == "Fixture Title", "Title changed for \(name)")
+                #expect((metadata.duration ?? 0) > 0, "Duration missing after combined write for \(name)")
+            }
         }
     }
 

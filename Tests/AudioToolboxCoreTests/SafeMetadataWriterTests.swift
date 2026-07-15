@@ -549,23 +549,144 @@ struct SafeMetadataWriterTests {
     }
 
     @Test
-    func metadataWriteAndVerificationFailuresLeaveOriginalUntouchedAndCleanWorkspace() async throws {
-        for mode in [FakeSafeMetadataService.Mode.writeFails, .verificationMismatch] {
-            let directory = try TemporaryAudioDirectory()
-            defer { directory.remove() }
-            let original = try directory.createAudioFile()
-            let originalBytes = try Data(contentsOf: original)
-            let writer = makeTestWriter(metadataService: FakeSafeMetadataService(mode: mode))
+    func nonWritableOriginalFailsWithoutChangingOrRemovingOriginal() async throws {
+        let directory = try TemporaryAudioDirectory()
+        defer { directory.remove() }
+        let original = try directory.createAudioFile()
+        let originalBytes = try Data(contentsOf: original)
+        let operations = testFileOperations().overriding(isWritable: { _ in false })
+        let writer = makeTestWriter(
+            metadataService: FakeSafeMetadataService(),
+            operations: operations
+        )
 
-            let result = await writer.apply(
-                to: original,
-                patch: MetadataPatch(artist: "新作者", album: "新专辑")
-            )
+        let result = await writer.apply(
+            to: original,
+            patch: MetadataPatch(artist: "新作者", album: nil)
+        )
 
-            #expect(result.status == .failed)
-            #expect(try Data(contentsOf: original) == originalBytes)
-            #expect(try directory.workDirectories().isEmpty)
-        }
+        #expect(result.status == .failed)
+        #expect(FileManager.default.fileExists(atPath: original.path))
+        #expect(try Data(contentsOf: original) == originalBytes)
+        #expect(try directory.workDirectories().isEmpty)
+    }
+
+    @Test
+    func workingFileCreationFailureLeavesOriginalUntouchedAndCleansWorkspace() async throws {
+        let directory = try TemporaryAudioDirectory()
+        defer { directory.remove() }
+        let original = try directory.createAudioFile()
+        let originalBytes = try Data(contentsOf: original)
+        let live = testFileOperations()
+        let operations = live.overriding(copyIntoWorkspace: { _, _, _ in
+            throw SafeMetadataFileSystemError(operation: .copy, code: EACCES)
+        })
+        let writer = makeTestWriter(
+            metadataService: FakeSafeMetadataService(),
+            operations: operations
+        )
+
+        let result = await writer.apply(
+            to: original,
+            patch: MetadataPatch(artist: "新作者", album: nil)
+        )
+
+        #expect(result.status == .failed)
+        #expect(FileManager.default.fileExists(atPath: original.path))
+        #expect(try Data(contentsOf: original) == originalBytes)
+        #expect(try directory.workDirectories().isEmpty)
+    }
+
+    @Test
+    func metadataSaveFailureLeavesOriginalUntouchedAndCleansWorkspace() async throws {
+        let directory = try TemporaryAudioDirectory()
+        defer { directory.remove() }
+        let original = try directory.createAudioFile()
+        let originalBytes = try Data(contentsOf: original)
+        let writer = makeTestWriter(
+            metadataService: FakeSafeMetadataService(mode: .writeFails)
+        )
+
+        let result = await writer.apply(
+            to: original,
+            patch: MetadataPatch(artist: "新作者", album: "新专辑")
+        )
+
+        #expect(result.status == .failed)
+        #expect(FileManager.default.fileExists(atPath: original.path))
+        #expect(try Data(contentsOf: original) == originalBytes)
+        #expect(try directory.workDirectories().isEmpty)
+    }
+
+    @Test
+    func metadataVerificationFailureLeavesOriginalUntouchedAndCleansWorkspace() async throws {
+        let directory = try TemporaryAudioDirectory()
+        defer { directory.remove() }
+        let original = try directory.createAudioFile()
+        let originalBytes = try Data(contentsOf: original)
+        let writer = makeTestWriter(
+            metadataService: FakeSafeMetadataService(mode: .verificationMismatch)
+        )
+
+        let result = await writer.apply(
+            to: original,
+            patch: MetadataPatch(artist: "新作者", album: "新专辑")
+        )
+
+        #expect(result.status == .failed)
+        #expect(FileManager.default.fileExists(atPath: original.path))
+        #expect(try Data(contentsOf: original) == originalBytes)
+        #expect(try directory.workDirectories().isEmpty)
+    }
+
+    @Test
+    func atomicReplaceFailureLeavesOriginalUntouchedAndCleansWorkspace() async throws {
+        let directory = try TemporaryAudioDirectory()
+        defer { directory.remove() }
+        let original = try directory.createAudioFile()
+        let originalBytes = try Data(contentsOf: original)
+        let live = testFileOperations()
+        let operations = live.overriding(swap: { _, _ in
+            throw SafeMetadataFileSystemError(operation: .swap, code: EIO)
+        })
+        let writer = makeTestWriter(
+            metadataService: FakeSafeMetadataService(),
+            operations: operations
+        )
+
+        let result = await writer.apply(
+            to: original,
+            patch: MetadataPatch(artist: "新作者", album: nil)
+        )
+
+        #expect(result.status == .failed)
+        #expect(FileManager.default.fileExists(atPath: original.path))
+        #expect(try Data(contentsOf: original) == originalBytes)
+        #expect(try directory.workDirectories().isEmpty)
+    }
+
+    @Test
+    func legacyTemporaryFileIsIgnoredAndPreserved() async throws {
+        let directory = try TemporaryAudioDirectory()
+        defer { directory.remove() }
+        let original = try directory.createAudioFile()
+        let legacyTemporaryFile = directory.url.appendingPathComponent(
+            ".audio-toolbox-legacy.tmp"
+        )
+        let legacyBytes = Data("legacy recovery data".utf8)
+        try legacyBytes.write(to: legacyTemporaryFile)
+        let writer = makeTestWriter(metadataService: FakeSafeMetadataService())
+
+        let result = await writer.apply(
+            to: original,
+            patch: MetadataPatch(artist: "新作者", album: nil)
+        )
+
+        #expect(result.status == .succeeded)
+        #expect(FileManager.default.fileExists(atPath: original.path))
+        #expect(FileManager.default.fileExists(atPath: legacyTemporaryFile.path))
+        #expect(try Data(contentsOf: legacyTemporaryFile) == legacyBytes)
+        #expect(try directory.workDirectories().isEmpty)
     }
 
     @Test
