@@ -47,9 +47,9 @@ public struct ResultSheet: View {
 
     private var header: some View {
         HStack(spacing: 16) {
-            Image(systemName: summary.failedCount == 0 ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
+            Image(systemName: hasWarnings ? "exclamationmark.triangle.fill" : "checkmark.circle.fill")
                 .font(.system(size: 34))
-                .foregroundStyle(summary.failedCount == 0 ? Color.green : Color.orange)
+                .foregroundStyle(hasWarnings ? Color.orange : Color.green)
             VStack(alignment: .leading, spacing: 3) {
                 Text("批量编辑完成")
                     .font(.title2.weight(.semibold))
@@ -160,6 +160,10 @@ public struct ResultSheet: View {
                 .keyboardShortcut(.defaultAction)
         }
         .padding(16)
+    }
+
+    private var hasWarnings: Bool {
+        summary.failedCount > 0 || summary.notProcessedCount > 0
     }
 
     private func resultCount(title: String, value: Int, color: Color) -> some View {

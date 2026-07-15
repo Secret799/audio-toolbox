@@ -111,8 +111,17 @@ public final class LibraryViewModel: ObservableObject {
         }
     }
 
+    public var isLibraryInteractionLocked: Bool {
+        switch batchState {
+        case .editing, .running, .stopping:
+            true
+        case .closed, .completed:
+            false
+        }
+    }
+
     public var batchEditTracks: [AudioTrack] {
-        tracks.filter { selectedTrackIDs.contains($0.id) }
+        batchEditTrackSnapshot
     }
 
     public var validatedBatchPatch: MetadataPatch? {
@@ -125,7 +134,9 @@ public final class LibraryViewModel: ObservableObject {
     }
 
     public var canExecuteBatchEdit: Bool {
-        canAdvanceBatchEdit && batchAcknowledgedNoBackup
+        canAdvanceBatchEdit
+            && batchAcknowledgedNoBackup
+            && !batchEditTrackSnapshot.isEmpty
     }
 
     public var batchResultCounts: BatchResultCounts {
@@ -218,6 +229,7 @@ public final class LibraryViewModel: ObservableObject {
     private var batchProgressTask: Task<Void, Never>?
     private var scanGeneration: UInt64 = 0
     private var batchGeneration: UInt64 = 0
+    private var batchEditTrackSnapshot: [AudioTrack] = []
     private var hasAttemptedDirectoryRestore = false
     private var isRefreshingAfterBatch = false
     private var discoveredCount = 0
@@ -308,12 +320,14 @@ public final class LibraryViewModel: ObservableObject {
     }
 
     public func toggleSelection(_ id: FileIdentity) {
+        guard !isLibraryInteractionLocked else { return }
         guard tracks.contains(where: { $0.id == id }) else { return }
         selectionState.toggle(id)
         publishSelection()
     }
 
     public func setCurrentGroupSelected(_ selected: Bool) {
+        guard !isLibraryInteractionLocked else { return }
         guard let selectedGroupID,
               let group = groups.first(where: { $0.id == selectedGroupID }) else {
             return
@@ -325,7 +339,10 @@ public final class LibraryViewModel: ObservableObject {
     public func openBatchEditor() {
         guard case .closed = batchState else { return }
         guard !selectedTrackIDs.isEmpty, !isBatchActive else { return }
+        let selectedTracks = tracks.filter { selectedTrackIDs.contains($0.id) }
+        guard !selectedTracks.isEmpty else { return }
         resetBatchDraft()
+        batchEditTrackSnapshot = selectedTracks
         batchState = .editing
     }
 
@@ -334,6 +351,7 @@ public final class LibraryViewModel: ObservableObject {
         case .editing, .completed:
             batchState = .closed
             resetBatchDraft()
+            batchEditTrackSnapshot = []
         case .closed, .running, .stopping:
             return
         }
@@ -345,7 +363,7 @@ public final class LibraryViewModel: ObservableObject {
             return
         }
 
-        let selectedTracks = batchEditTracks
+        let selectedTracks = batchEditTrackSnapshot
         guard !selectedTracks.isEmpty else { return }
 
         batchGeneration &+= 1
@@ -430,9 +448,9 @@ public final class LibraryViewModel: ObservableObject {
     private var isBatchActive: Bool {
         if isRefreshingAfterBatch { return true }
         return switch batchState {
-        case .running, .stopping:
+        case .editing, .running, .stopping:
             true
-        case .closed, .editing, .completed:
+        case .closed, .completed:
             false
         }
     }

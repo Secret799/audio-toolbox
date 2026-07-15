@@ -316,7 +316,7 @@ struct BatchProgressSheet: View {
             .frame(width: 440)
 
             VStack(spacing: 5) {
-                Text("当前文件")
+                Text("最近处理文件")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Text(progress.currentURL?.lastPathComponent ?? "正在准备…")

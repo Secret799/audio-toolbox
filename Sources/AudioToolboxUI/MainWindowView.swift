@@ -59,6 +59,7 @@ public struct MainWindowView: View {
             }
         }
         .listStyle(.sidebar)
+        .disabled(viewModel.isLibraryInteractionLocked)
         .accessibilityLabel("音频分组")
     }
 
@@ -197,7 +198,7 @@ public struct MainWindowView: View {
             } label: {
                 Label("选择目录…", systemImage: "folder.badge.plus")
             }
-            .disabled(isPickingDirectory || isBatchRunning)
+            .disabled(isPickingDirectory || viewModel.isLibraryInteractionLocked)
             .accessibilityLabel("选择音频目录")
 
             Text(directorySummary)
@@ -212,6 +213,7 @@ public struct MainWindowView: View {
             }
             .pickerStyle(.segmented)
             .frame(width: 150)
+            .disabled(viewModel.isLibraryInteractionLocked)
             .accessibilityLabel("按作者或专辑分组")
 
             Button {
@@ -219,7 +221,11 @@ public struct MainWindowView: View {
             } label: {
                 Label("刷新", systemImage: "arrow.clockwise")
             }
-            .disabled(viewModel.currentDirectoryURL == nil || isScanning || isBatchRunning)
+            .disabled(
+                viewModel.currentDirectoryURL == nil
+                    || isScanning
+                    || viewModel.isLibraryInteractionLocked
+            )
             .accessibilityLabel("重新扫描当前目录")
 
             Button {
@@ -319,10 +325,6 @@ public struct MainWindowView: View {
         case .idle, .loaded, .empty, .failed:
             false
         }
-    }
-
-    private var isBatchRunning: Bool {
-        viewModel.isBatchExecutionActive
     }
 
     private func chooseDirectory() {

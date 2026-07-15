@@ -470,6 +470,40 @@ struct LibraryViewModelTests {
         #expect(viewModel.validatedBatchPatch == MetadataPatch(artist: "Edited Artist", album: "Edited Album"))
     }
 
+    @Test("打开批量编辑后冻结文件快照并拒绝目录与选择变化")
+    @MainActor
+    func batchEditorFreezesTrackSnapshotAndLibraryInteraction() async {
+        let scanner = ScriptedScanner(scripts: [[
+            .loaded(Self.firstTrack),
+            .loaded(Self.secondTrack),
+            .finished,
+        ]])
+        let editor = FakeBatchEditor(summary: BatchEditSummary(results: []))
+        let viewModel = makeViewModel(scanner: scanner, batchEditor: editor)
+        await viewModel.loadDirectory(firstRoot)
+        viewModel.toggleSelection(Self.firstTrack.id)
+        viewModel.openBatchEditor()
+
+        #expect(viewModel.batchEditTracks.map(\.id) == [Self.firstTrack.id])
+        #expect(viewModel.isLibraryInteractionLocked)
+
+        viewModel.toggleSelection(Self.firstTrack.id)
+        viewModel.toggleSelection(Self.secondTrack.id)
+        await viewModel.loadDirectory(secondRoot)
+
+        #expect(viewModel.currentDirectoryURL == firstRoot)
+        #expect(viewModel.selectedTrackIDs == [Self.firstTrack.id])
+        #expect(viewModel.batchEditTracks.map(\.id) == [Self.firstTrack.id])
+        #expect(scanner.scanCount == 1)
+
+        viewModel.batchArtist = "Frozen"
+        viewModel.batchAcknowledgedNoBackup = true
+        #expect(viewModel.canExecuteBatchEdit)
+        await viewModel.runBatchEdit()
+
+        #expect(await editor.requests.first?.files == [Self.firstTrack.url])
+    }
+
     @Test("未确认不能执行，执行中禁止重复提交")
     @MainActor
     func batchExecutionRequiresAcknowledgementAndRejectsDuplicateRun() async {
