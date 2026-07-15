@@ -16,6 +16,12 @@ struct DirectoryScannerTests {
                 values: URLResourceValues()
             )
         )
+        #expect(
+            AudioFileCandidate.shouldSkip(
+                URL(fileURLWithPath: "/tmp/.audio-toolbox-123.work/working.mp3"),
+                values: URLResourceValues()
+            )
+        )
     }
 
     @Test
@@ -36,6 +42,10 @@ struct DirectoryScannerTests {
         try directory.createFile("cover.jpg", contents: "cover")
         try directory.createFile(".hidden.mp3", contents: "hidden")
         try directory.createFile(".audio-toolbox-staging.mp3", contents: "temporary")
+        try directory.createFile(
+            ".audio-toolbox-12345678.work/working.mp3",
+            contents: "private working copy"
+        )
         try directory.createFile("album/track.FlAc", contents: "track")
         try directory.createFile(".hidden-album/secret.mp3", contents: "secret")
         try externalDirectory.createFile("external-only.mp3", contents: "external")

@@ -5,14 +5,73 @@
 #include <fcntl.h>
 #include <stdatomic.h>
 #include <stdlib.h>
-#include <stdio.h>
-#include <limits.h>
+#include <string.h>
+#include <sys/acl.h>
 #include <sys/stat.h>
+#include <sys/xattr.h>
 #include <unistd.h>
 
 struct ATSFCancellationFlag {
     atomic_bool cancelled;
+    atomic_uint callback_delay_microseconds;
 };
+
+typedef struct {
+    uint8_t *bytes;
+    size_t size;
+    size_t capacity;
+} ATSFBuffer;
+
+static int ATSFBufferReserve(ATSFBuffer *buffer, size_t additional) {
+    if(additional > SIZE_MAX - buffer->size) {
+        errno = EOVERFLOW;
+        return -1;
+    }
+    size_t required = buffer->size + additional;
+    if(required <= buffer->capacity) {
+        return 0;
+    }
+    size_t capacity = buffer->capacity == 0 ? 256 : buffer->capacity;
+    while(capacity < required) {
+        if(capacity > SIZE_MAX / 2) {
+            capacity = required;
+            break;
+        }
+        capacity *= 2;
+    }
+    uint8_t *bytes = realloc(buffer->bytes, capacity);
+    if(bytes == NULL) {
+        return -1;
+    }
+    buffer->bytes = bytes;
+    buffer->capacity = capacity;
+    return 0;
+}
+
+static int ATSFBufferAppend(ATSFBuffer *buffer, const void *bytes, size_t size) {
+    if(ATSFBufferReserve(buffer, size) != 0) {
+        return -1;
+    }
+    if(size > 0) {
+        memcpy(buffer->bytes + buffer->size, bytes, size);
+    }
+    buffer->size += size;
+    return 0;
+}
+
+static int ATSFBufferAppendUInt64(ATSFBuffer *buffer, uint64_t value) {
+    uint8_t encoded[8];
+    for(size_t index = 0; index < sizeof(encoded); ++index) {
+        encoded[index] = (uint8_t)(value >> (index * 8));
+    }
+    return ATSFBufferAppend(buffer, encoded, sizeof(encoded));
+}
+
+static int ATSFCompareStrings(const void *left, const void *right) {
+    const char *const *left_string = left;
+    const char *const *right_string = right;
+    return strcmp(*left_string, *right_string);
+}
 
 static int ATSFCopyStatusCallback(
     int what,
@@ -29,7 +88,21 @@ static int ATSFCopyStatusCallback(
     (void)destination;
 
     ATSFCancellationFlag *flag = context;
-    if(flag != NULL && atomic_load_explicit(&flag->cancelled, memory_order_acquire)) {
+    if(flag == NULL) {
+        return COPYFILE_CONTINUE;
+    }
+    if(atomic_load_explicit(&flag->cancelled, memory_order_acquire)) {
+        errno = ECANCELED;
+        return COPYFILE_QUIT;
+    }
+    uint32_t delay = atomic_load_explicit(
+        &flag->callback_delay_microseconds,
+        memory_order_relaxed
+    );
+    if(delay > 0) {
+        usleep(delay);
+    }
+    if(atomic_load_explicit(&flag->cancelled, memory_order_acquire)) {
         errno = ECANCELED;
         return COPYFILE_QUIT;
     }
@@ -42,6 +115,7 @@ ATSFCancellationFlag *ATSFCancellationFlagCreate(void) {
         return NULL;
     }
     atomic_init(&flag->cancelled, false);
+    atomic_init(&flag->callback_delay_microseconds, 0);
     return flag;
 }
 
@@ -54,6 +128,19 @@ void ATSFCancellationFlagCancel(ATSFCancellationFlag *flag) {
 bool ATSFCancellationFlagIsCancelled(const ATSFCancellationFlag *flag) {
     return flag != NULL
         && atomic_load_explicit(&flag->cancelled, memory_order_acquire);
+}
+
+void ATSFCancellationFlagSetCallbackDelayForTesting(
+    ATSFCancellationFlag *flag,
+    uint32_t microseconds
+) {
+    if(flag != NULL) {
+        atomic_store_explicit(
+            &flag->callback_delay_microseconds,
+            microseconds,
+            memory_order_relaxed
+        );
+    }
 }
 
 void ATSFCancellationFlagRelease(ATSFCancellationFlag *flag) {
@@ -75,28 +162,29 @@ ATSFCopyResult ATSFCopyFileToDirectory(
         return result;
     }
 
-    char directory_path[PATH_MAX];
-    if(fcntl(directory_fd, F_GETPATH, directory_path) != 0) {
+    int source_fd = open(source_path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if(source_fd < 0) {
         result.error_code = errno;
         return result;
     }
-
-    char destination_path[PATH_MAX];
-    int path_length = snprintf(
-        destination_path,
-        sizeof(destination_path),
-        "%s/%s",
-        directory_path,
-        destination_name
+    int destination_fd = openat(
+        directory_fd,
+        destination_name,
+        O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
+        0600
     );
-    if(path_length < 0 || (size_t)path_length >= sizeof(destination_path)) {
-        result.error_code = ENAMETOOLONG;
+    if(destination_fd < 0) {
+        result.error_code = errno;
+        close(source_fd);
         return result;
     }
 
     copyfile_state_t state = copyfile_state_alloc();
     if(state == NULL) {
         result.error_code = ENOMEM;
+        result.destination_fd = fcntl(destination_fd, F_DUPFD_CLOEXEC, 0);
+        close(destination_fd);
+        close(source_fd);
         return result;
     }
 
@@ -111,24 +199,19 @@ ATSFCopyResult ATSFCopyFileToDirectory(
             cancellation_flag
         ) != 0) {
         result.error_code = errno == 0 ? EIO : errno;
+        result.destination_fd = fcntl(destination_fd, F_DUPFD_CLOEXEC, 0);
         copyfile_state_free(state);
+        close(destination_fd);
+        close(source_fd);
         return result;
     }
 
-    copyfile_flags_t flags = COPYFILE_ALL
-        | COPYFILE_EXCL
-        | COPYFILE_NOFOLLOW_SRC
-        | COPYFILE_NOFOLLOW_DST
-        | COPYFILE_RECURSIVE;
-    int copy_result = copyfile(source_path, destination_path, state, flags);
+    int copy_result = fcopyfile(source_fd, destination_fd, state, COPYFILE_ALL);
     int copy_error = copy_result == 0 ? 0 : errno;
-
-    int destination_fd = -1;
-    if(copyfile_state_get(state, COPYFILE_STATE_DST_FD, &destination_fd) == 0
-        && destination_fd >= 0) {
-        result.destination_fd = dup(destination_fd);
-    }
+    result.destination_fd = fcntl(destination_fd, F_DUPFD_CLOEXEC, 0);
     copyfile_state_free(state);
+    close(destination_fd);
+    close(source_fd);
 
     if(copy_result != 0) {
         result.error_code = copy_error == 0 ? EIO : copy_error;
@@ -139,18 +222,186 @@ ATSFCopyResult ATSFCopyFileToDirectory(
         return result;
     }
     if(result.destination_fd < 0) {
-        result.destination_fd = openat(
-            directory_fd,
-            destination_name,
-            O_RDONLY | O_NOFOLLOW | O_CLOEXEC
-        );
-        if(result.destination_fd < 0) {
-            result.error_code = errno;
-            return result;
-        }
+        result.error_code = errno == 0 ? EIO : errno;
+        return result;
     }
 
     result.status = 0;
     result.error_code = 0;
     return result;
+}
+
+ATSFMetadataBlob ATSFMetadataSnapshotForFD(int32_t fd) {
+    ATSFMetadataBlob result = {-1, EINVAL, NULL, 0};
+    if(fd < 0) {
+        return result;
+    }
+
+    ATSFBuffer buffer = {NULL, 0, 0};
+    acl_t acl = acl_get_fd_np(fd, ACL_TYPE_EXTENDED);
+    if(acl == NULL) {
+        if(errno != ENOENT && errno != EINVAL) {
+            result.error_code = errno;
+            return result;
+        }
+        if(ATSFBufferAppendUInt64(&buffer, 0) != 0) {
+            result.error_code = errno == 0 ? ENOMEM : errno;
+            free(buffer.bytes);
+            return result;
+        }
+    } else {
+        ssize_t acl_length = 0;
+        char *acl_text = acl_to_text(acl, &acl_length);
+        acl_free(acl);
+        if(acl_text == NULL || acl_length < 0) {
+            result.error_code = errno == 0 ? EIO : errno;
+            acl_free(acl_text);
+            free(buffer.bytes);
+            return result;
+        }
+        int append_result = ATSFBufferAppendUInt64(
+            &buffer,
+            (uint64_t)acl_length
+        );
+        if(append_result == 0) {
+            append_result = ATSFBufferAppend(
+                &buffer,
+                acl_text,
+                (size_t)acl_length
+            );
+        }
+        acl_free(acl_text);
+        if(append_result != 0) {
+            result.error_code = errno == 0 ? ENOMEM : errno;
+            free(buffer.bytes);
+            return result;
+        }
+    }
+
+    ssize_t names_size = flistxattr(fd, NULL, 0, 0);
+    if(names_size < 0) {
+        result.error_code = errno;
+        free(buffer.bytes);
+        return result;
+    }
+    char *names = names_size == 0 ? NULL : malloc((size_t)names_size);
+    if(names_size > 0 && names == NULL) {
+        result.error_code = ENOMEM;
+        free(buffer.bytes);
+        return result;
+    }
+    if(names_size > 0 && flistxattr(fd, names, (size_t)names_size, 0) != names_size) {
+        result.error_code = errno == 0 ? EIO : errno;
+        free(names);
+        free(buffer.bytes);
+        return result;
+    }
+
+    size_t name_count = 0;
+    for(ssize_t offset = 0; offset < names_size;) {
+        size_t length = strlen(names + offset);
+        ++name_count;
+        offset += (ssize_t)length + 1;
+    }
+    char **sorted_names = name_count == 0
+        ? NULL
+        : malloc(name_count * sizeof(*sorted_names));
+    if(name_count > 0 && sorted_names == NULL) {
+        result.error_code = ENOMEM;
+        free(names);
+        free(buffer.bytes);
+        return result;
+    }
+    size_t name_index = 0;
+    for(ssize_t offset = 0; offset < names_size;) {
+        sorted_names[name_index++] = names + offset;
+        offset += (ssize_t)strlen(names + offset) + 1;
+    }
+    qsort(sorted_names, name_count, sizeof(*sorted_names), ATSFCompareStrings);
+
+    if(ATSFBufferAppendUInt64(&buffer, (uint64_t)name_count) != 0) {
+        result.error_code = errno == 0 ? ENOMEM : errno;
+        free(sorted_names);
+        free(names);
+        free(buffer.bytes);
+        return result;
+    }
+
+    for(size_t index = 0; index < name_count; ++index) {
+        const char *name = sorted_names[index];
+        size_t name_length = strlen(name);
+        ssize_t value_size = fgetxattr(fd, name, NULL, 0, 0, 0);
+        if(value_size < 0) {
+            result.error_code = errno;
+            free(sorted_names);
+            free(names);
+            free(buffer.bytes);
+            return result;
+        }
+        uint8_t *value = value_size == 0 ? NULL : malloc((size_t)value_size);
+        if(value_size > 0 && value == NULL) {
+            result.error_code = ENOMEM;
+            free(sorted_names);
+            free(names);
+            free(buffer.bytes);
+            return result;
+        }
+        if(value_size > 0
+            && fgetxattr(fd, name, value, (size_t)value_size, 0, 0) != value_size) {
+            result.error_code = errno == 0 ? EIO : errno;
+            free(value);
+            free(sorted_names);
+            free(names);
+            free(buffer.bytes);
+            return result;
+        }
+
+        int append_result = ATSFBufferAppendUInt64(
+            &buffer,
+            (uint64_t)name_length
+        );
+        if(append_result == 0) {
+            append_result = ATSFBufferAppend(&buffer, name, name_length);
+        }
+        if(append_result == 0) {
+            append_result = ATSFBufferAppendUInt64(
+                &buffer,
+                (uint64_t)value_size
+            );
+        }
+        if(append_result == 0) {
+            append_result = ATSFBufferAppend(
+                &buffer,
+                value,
+                (size_t)value_size
+            );
+        }
+        free(value);
+        if(append_result != 0) {
+            result.error_code = errno == 0 ? ENOMEM : errno;
+            free(sorted_names);
+            free(names);
+            free(buffer.bytes);
+            return result;
+        }
+    }
+
+    free(sorted_names);
+    free(names);
+    result.status = 0;
+    result.error_code = 0;
+    result.bytes = buffer.bytes;
+    result.size = buffer.size;
+    return result;
+}
+
+void ATSFMetadataBlobRelease(ATSFMetadataBlob *blob) {
+    if(blob == NULL) {
+        return;
+    }
+    free(blob->bytes);
+    blob->bytes = NULL;
+    blob->size = 0;
+    blob->status = 0;
+    blob->error_code = 0;
 }

@@ -96,9 +96,9 @@ struct SafeMetadataWriterTests {
         )
 
         #expect(result.status == .failed)
-        #expect(result.message?.contains("私有工作区路径身份发生变化") == true)
+        #expect(result.message?.contains("保守保留") == true)
         #expect(await service.recordedWriteURLs().isEmpty)
-        let workFile = try #require(try directory.firstWorkFile())
+        let workFile = try #require(findFile(named: "working.mp3", under: directory.url))
         #expect(try Data(contentsOf: workFile) == competitorBytes)
     }
 
@@ -162,7 +162,11 @@ struct SafeMetadataWriterTests {
         let operations = live.overriding(snapshotURL: { url, cancellationFlag in
             let actual = try live.snapshotURL(url, cancellationFlag)
             if sameFileSystemPath(url, original) {
-                return SafeMetadataFileSnapshot(nodeState: initial.nodeState, digest: actual.digest)
+                return SafeMetadataFileSnapshot(
+                    nodeState: initial.nodeState,
+                    digest: actual.digest,
+                    fileSystemMetadata: actual.fileSystemMetadata
+                )
             }
             return actual
         })
@@ -396,8 +400,8 @@ struct SafeMetadataWriterTests {
             SafeMetadataFileOperations.removeWorkspaceFileIfOwnedForTesting(
                 workspace,
                 expectedIdentity: expected,
-                beforeRename: {
-                    try? competitorBytes.write(to: workspace.fileURL, options: .atomic)
+                afterQuarantineValidation: { quarantineURL in
+                    try? competitorBytes.write(to: quarantineURL, options: .atomic)
                 }
             )
         })
@@ -615,6 +619,239 @@ struct SafeMetadataWriterTests {
         #expect(try directory.workDirectories().isEmpty)
     }
 
+
+    @Test
+    func metadataServiceRemovingPreservedXattrAndModeIsRejected() async throws {
+        let directory = try TemporaryAudioDirectory()
+        defer { directory.remove() }
+        let original = try directory.createAudioFile()
+        try FileManager.default.setAttributes([.posixPermissions: 0o640], ofItemAtPath: original.path)
+        let xattrName = "com.audio-toolbox.preserved-test"
+        let xattrValue = Data("preserved metadata".utf8)
+        try setExtendedAttribute(xattrValue, named: xattrName, at: original)
+        let service = FakeSafeMetadataService(
+            mode: .removeWorkingMetadata(xattrName, 0o600)
+        )
+        let writer = makeTestWriter(metadataService: service)
+
+        let result = await writer.apply(
+            to: original,
+            patch: MetadataPatch(artist: "新作者", album: nil)
+        )
+
+        #expect(result.status == .failed)
+        #expect(result.message?.contains("文件系统属性") == true)
+        #expect(try extendedAttribute(named: xattrName, at: original) == xattrValue)
+        let attributes = try FileManager.default.attributesOfItem(atPath: original.path)
+        #expect((attributes[.posixPermissions] as? NSNumber)?.uint16Value == 0o640)
+    }
+
+    @Test
+    func finalWindowOriginalXattrChangeTriggersRollbackAndPreservesConcurrentMetadata() async throws {
+        let directory = try TemporaryAudioDirectory()
+        defer { directory.remove() }
+        let original = try directory.createAudioFile()
+        let xattrName = "com.audio-toolbox.concurrent-xattr"
+        let initialValue = Data("initial".utf8)
+        let concurrentValue = Data("concurrent".utf8)
+        try setExtendedAttribute(initialValue, named: xattrName, at: original)
+        let live = testFileOperations()
+        let swaps = LockedCounter()
+        let operations = live.overriding(swap: { originalURL, workURL in
+            if swaps.incrementAndGet() == 1 {
+                try setExtendedAttribute(concurrentValue, named: xattrName, at: originalURL)
+            }
+            try live.swap(originalURL, workURL)
+        })
+        let writer = makeTestWriter(metadataService: FakeSafeMetadataService(), operations: operations)
+
+        let result = await writer.apply(
+            to: original,
+            patch: MetadataPatch(artist: "新作者", album: nil)
+        )
+
+        #expect(result.status == .failed)
+        #expect(result.message?.contains("已安全回滚") == true)
+        #expect(swaps.value == 2)
+        #expect(try extendedAttribute(named: xattrName, at: original) == concurrentValue)
+    }
+
+    @Test
+    func fileQuarantineReplacementAfterFirstValidationIsNeverDeleted() async throws {
+        let directory = try TemporaryAudioDirectory()
+        defer { directory.remove() }
+        let original = try directory.createAudioFile()
+        let competitorBytes = Data("quarantine file competitor".utf8)
+        let live = testFileOperations()
+        let operations = live.overriding(removeWorkspaceFileIfOwned: { workspace, expected in
+            SafeMetadataFileOperations.removeWorkspaceFileIfOwnedForTesting(
+                workspace,
+                expectedIdentity: expected,
+                afterQuarantineValidation: { quarantineURL in
+                    try? competitorBytes.write(to: quarantineURL, options: .atomic)
+                }
+            )
+        })
+        let writer = makeTestWriter(
+            metadataService: FakeSafeMetadataService(mode: .writeFails),
+            operations: operations
+        )
+
+        let result = await writer.apply(to: original, patch: MetadataPatch(artist: "新作者", album: nil))
+
+        #expect(result.status == .failed)
+        #expect(result.message?.contains("保守保留") == true)
+        let preserved = try #require(try directory.firstWorkFile())
+        #expect(try Data(contentsOf: preserved) == competitorBytes)
+    }
+
+    @Test
+    func directoryQuarantineReplacementAfterFirstValidationIsNeverDeleted() async throws {
+        let directory = try TemporaryAudioDirectory()
+        defer { directory.remove() }
+        let original = try directory.createAudioFile()
+        let markerBytes = Data("quarantine directory competitor".utf8)
+        let live = testFileOperations()
+        let operations = live.overriding(removeWorkspaceDirectoryIfOwned: { workspace in
+            SafeMetadataFileOperations.removeWorkspaceDirectoryIfOwnedForTesting(
+                workspace,
+                afterQuarantineValidation: { quarantineURL in
+                    let moved = quarantineURL.deletingLastPathComponent()
+                        .appendingPathComponent(".audio-toolbox-owned-quarantine-moved.work")
+                    try? FileManager.default.moveItem(at: quarantineURL, to: moved)
+                    try? FileManager.default.createDirectory(
+                        at: quarantineURL,
+                        withIntermediateDirectories: false
+                    )
+                    try? markerBytes.write(to: quarantineURL.appendingPathComponent("marker"))
+                }
+            )
+        })
+        let writer = makeTestWriter(
+            metadataService: FakeSafeMetadataService(mode: .writeFails),
+            operations: operations
+        )
+
+        let result = await writer.apply(to: original, patch: MetadataPatch(artist: "新作者", album: nil))
+
+        #expect(result.status == .failed)
+        #expect(result.message?.contains("保守保留") == true)
+        let marker = try #require(findFile(named: "marker", under: directory.url))
+        #expect(try Data(contentsOf: marker) == markerBytes)
+    }
+
+    @Test
+    func successfulCommitUsesExactlyFourCoordinationDigestsAndTwoAfterGate() async throws {
+        let directory = try TemporaryAudioDirectory()
+        defer { directory.remove() }
+        let original = try directory.createAudioFile()
+        let live = testFileOperations()
+        let budget = LockedIOBudget()
+        let operations = live.overriding(
+            snapshotURL: { url, flag in
+                budget.recordDigestIfCoordinating()
+                return try live.snapshotURL(url, flag)
+            },
+            snapshotWorkspace: { workspace, flag in
+                budget.recordDigestIfCoordinating()
+                return try live.snapshotWorkspace(workspace, flag)
+            },
+            coordinateReplacing: { original, work, accessor in
+                budget.setCoordinating(true)
+                defer { budget.setCoordinating(false) }
+                try accessor(original, work)
+            }
+        )
+        let writer = makeTestWriter(
+            metadataService: FakeSafeMetadataService(),
+            operations: operations,
+            commitGate: {
+                budget.markGatePassed()
+                return true
+            }
+        )
+
+        let result = await writer.apply(to: original, patch: MetadataPatch(artist: "新作者", album: nil))
+
+        #expect(result.status == .succeeded)
+        #expect(budget.coordinationDigests == 4)
+        #expect(budget.postGateDigests == 2)
+    }
+
+    @Test
+    func realInFlightCopyCancellationReturnsOwnedPartialFileForCleanup() async throws {
+        let directory = try TemporaryAudioDirectory()
+        defer { directory.remove() }
+        let original = try directory.createLargeFile(megabytes: 32)
+        let operations = testFileOperations()
+        let workspace = try operations.createWorkspace(original, "inflight-copy-cancel")
+        let flag = try SafeMetadataCancellationFlag()
+        flag.setCopyCallbackDelayForTesting(microseconds: 50_000)
+        let copyTask = Task.detached(priority: .utility) {
+            try operations.copyIntoWorkspace(original, workspace, flag)
+        }
+
+        try await waitUntilFileExists(workspace.fileURL)
+        flag.cancel()
+        let ownedIdentity: SafeMetadataFileIdentity?
+        do {
+            _ = try await copyTask.value
+            Issue.record("in-flight copy 取消后不应成功")
+            ownedIdentity = nil
+        } catch let error as SafeMetadataFileSystemError {
+            #expect(error.code == ECANCELED)
+            ownedIdentity = error.ownedNodeState?.identity
+        }
+
+        let identity = try #require(ownedIdentity)
+        let removal = operations.removeWorkspaceFileIfOwned(workspace, identity)
+        if case .removed = removal {
+            // expected
+        } else {
+            Issue.record("部分副本应可按 owned inode 清理")
+        }
+        let directoryRemoval = operations.removeWorkspaceDirectoryIfOwned(workspace)
+        workspace.closeDescriptors()
+        if case .removed = directoryRemoval {
+            // expected
+        } else {
+            Issue.record("清理部分副本后私有目录应可删除")
+        }
+    }
+
+    @Test
+    func dirfdCopyContinuesIntoOwnedDirectoryAfterWorkspacePathReplacement() async throws {
+        let directory = try TemporaryAudioDirectory()
+        defer { directory.remove() }
+        let original = try directory.createLargeFile(megabytes: 2)
+        let operations = testFileOperations()
+        let workspace = try operations.createWorkspace(original, "dirfd-anchor")
+        let movedOwnedDirectory = directory.url.appendingPathComponent(
+            ".audio-toolbox-dirfd-owned-moved.work",
+            isDirectory: true
+        )
+        try FileManager.default.moveItem(at: workspace.directoryURL, to: movedOwnedDirectory)
+        try FileManager.default.createDirectory(
+            at: workspace.directoryURL,
+            withIntermediateDirectories: false
+        )
+        let competitorMarker = workspace.directoryURL.appendingPathComponent("competitor")
+        try Data("competitor".utf8).write(to: competitorMarker)
+        let flag = try SafeMetadataCancellationFlag()
+
+        let copied = try operations.copyIntoWorkspace(original, workspace, flag)
+
+        #expect(copied.isRegularFile)
+        #expect(FileManager.default.fileExists(
+            atPath: movedOwnedDirectory.appendingPathComponent("working.mp3").path
+        ))
+        #expect(!FileManager.default.fileExists(
+            atPath: workspace.directoryURL.appendingPathComponent("working.mp3").path
+        ))
+        #expect(try Data(contentsOf: competitorMarker) == Data("competitor".utf8))
+        workspace.closeDescriptors()
+    }
+
     @Test
     func copyNoSpaceErrorUsesStableChineseMessage() async throws {
         let directory = try TemporaryAudioDirectory()
@@ -642,6 +879,7 @@ private actor FakeSafeMetadataService: MetadataService {
         case replaceWorkingFileInode
         case mutateOriginal(URL, Data, Date)
         case corruptWorkingAfterRead(Data)
+        case removeWorkingMetadata(String, UInt16)
     }
 
     private let mode: Mode
@@ -690,6 +928,13 @@ private actor FakeSafeMetadataService: MetadataService {
             return
         }
         try writeInPlace(Self.encodedFields(fields), to: url)
+        if case let .removeWorkingMetadata(xattrName, mode) = mode {
+            _ = removexattr(url.path, xattrName, 0)
+            try FileManager.default.setAttributes(
+                [.posixPermissions: mode],
+                ofItemAtPath: url.path
+            )
+        }
         if case let .mutateOriginal(original, changedBytes, mtime) = mode {
             try writeInPlace(changedBytes, to: original)
             try FileManager.default.setAttributes([.modificationDate: mtime], ofItemAtPath: original.path)
@@ -748,6 +993,19 @@ private struct TemporaryAudioDirectory {
         return file
     }
 
+    func createLargeFile(megabytes: Int) throws -> URL {
+        let file = url.appendingPathComponent("large.mp3")
+        FileManager.default.createFile(atPath: file.path, contents: nil)
+        let handle = try FileHandle(forWritingTo: file)
+        defer { try? handle.close() }
+        let chunk = Data(repeating: 0x5A, count: 1024 * 1024)
+        for _ in 0..<megabytes {
+            try handle.write(contentsOf: chunk)
+        }
+        try handle.synchronize()
+        return file
+    }
+
     func workDirectories() throws -> [URL] {
         try FileManager.default.contentsOfDirectory(at: url, includingPropertiesForKeys: nil)
             .filter {
@@ -800,6 +1058,33 @@ private final class LockedCounter: @unchecked Sendable {
     var value: Int { lock.withLock { storedValue } }
 }
 
+private final class LockedIOBudget: @unchecked Sendable {
+    private let lock = NSLock()
+    private var coordinating = false
+    private var gatePassed = false
+    private var storedCoordinationDigests = 0
+    private var storedPostGateDigests = 0
+
+    func setCoordinating(_ value: Bool) {
+        lock.withLock { coordinating = value }
+    }
+
+    func markGatePassed() {
+        lock.withLock { gatePassed = true }
+    }
+
+    func recordDigestIfCoordinating() {
+        lock.withLock {
+            guard coordinating else { return }
+            storedCoordinationDigests += 1
+            if gatePassed { storedPostGateDigests += 1 }
+        }
+    }
+
+    var coordinationDigests: Int { lock.withLock { storedCoordinationDigests } }
+    var postGateDigests: Int { lock.withLock { storedPostGateDigests } }
+}
+
 private final class AsyncSignal: @unchecked Sendable {
     private let condition = NSCondition()
     private var signaled = false
@@ -822,6 +1107,7 @@ private final class AsyncSignal: @unchecked Sendable {
 
 private enum FakeWriterError: Error {
     case coordinatorTailFailed
+    case timeout
 }
 
 private func testFileOperations() -> SafeMetadataFileOperations {
@@ -889,4 +1175,25 @@ private func resultWorkspaceName(from message: String?) -> String {
     else { return "missing" }
     let suffix = message[range.lowerBound...]
     return String(suffix.split(separator: "/").first ?? "missing")
+}
+
+private func waitUntilFileExists(_ url: URL) async throws {
+    let clock = ContinuousClock()
+    let deadline = clock.now.advanced(by: .seconds(2))
+    while clock.now < deadline {
+        if FileManager.default.fileExists(atPath: url.path) { return }
+        try await Task.sleep(for: .milliseconds(2))
+    }
+    throw FakeWriterError.timeout
+}
+
+private func findFile(named name: String, under root: URL) -> URL? {
+    guard let enumerator = FileManager.default.enumerator(
+        at: root,
+        includingPropertiesForKeys: nil
+    ) else { return nil }
+    for case let url as URL in enumerator where url.lastPathComponent == name {
+        return url
+    }
+    return nil
 }

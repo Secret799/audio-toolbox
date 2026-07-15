@@ -13,6 +13,9 @@ struct SafeMetadataFileNodeState: Equatable, Sendable {
     let statusChangeNanoseconds: Int64
     let linkCount: UInt64
     let mode: UInt16
+    let ownerID: UInt32
+    let groupID: UInt32
+    let flags: UInt32
 
     var identity: SafeMetadataFileIdentity {
         SafeMetadataFileIdentity(device: device, inode: inode)
@@ -39,6 +42,15 @@ struct SafeMetadataFileIdentity: Equatable, Sendable {
 struct SafeMetadataFileSnapshot: Equatable, Sendable {
     let nodeState: SafeMetadataFileNodeState
     let digest: Data
+    let fileSystemMetadata: Data
+
+    func preservesFileSystemMetadata(of expected: Self) -> Bool {
+        nodeState.mode == expected.nodeState.mode
+            && nodeState.ownerID == expected.nodeState.ownerID
+            && nodeState.groupID == expected.nodeState.groupID
+            && nodeState.flags == expected.nodeState.flags
+            && fileSystemMetadata == expected.fileSystemMetadata
+    }
 
     // renameatx_np(RENAME_SWAP) legitimately advances ctime for both inodes.
     // Post-swap comparisons retain every other stat field plus SHA-256.
@@ -50,7 +62,11 @@ struct SafeMetadataFileSnapshot: Equatable, Sendable {
             && nodeState.modificationNanoseconds == expected.nodeState.modificationNanoseconds
             && nodeState.linkCount == expected.nodeState.linkCount
             && nodeState.mode == expected.nodeState.mode
+            && nodeState.ownerID == expected.nodeState.ownerID
+            && nodeState.groupID == expected.nodeState.groupID
+            && nodeState.flags == expected.nodeState.flags
             && digest == expected.digest
+            && fileSystemMetadata == expected.fileSystemMetadata
     }
 }
 
@@ -110,6 +126,10 @@ final class SafeMetadataCancellationFlag: @unchecked Sendable {
 
     var rawValue: OpaquePointer {
         rawFlag
+    }
+
+    func setCopyCallbackDelayForTesting(microseconds: UInt32) {
+        ATSFCancellationFlagSetCallbackDelayForTesting(rawFlag, microseconds)
     }
 }
 
@@ -219,10 +239,15 @@ struct SafeMetadataFileOperations: @unchecked Sendable {
                 removeWorkspaceFileIfOwnedForTesting(
                     workspace,
                     expectedIdentity: expectedIdentity,
-                    beforeRename: {}
+                    afterQuarantineValidation: { _ in }
                 )
             },
-            removeWorkspaceDirectoryIfOwned: removeWorkspaceDirectoryIfOwned
+            removeWorkspaceDirectoryIfOwned: { workspace in
+                removeWorkspaceDirectoryIfOwnedForTesting(
+                    workspace,
+                    afterQuarantineValidation: { _ in }
+                )
+            }
         )
     }
 
@@ -396,6 +421,10 @@ struct SafeMetadataFileOperations: @unchecked Sendable {
         guard descriptorBefore == pathBefore else {
             throw SafeMetadataFileSystemError(operation: .digest, code: ESTALE)
         }
+        let metadata = try fileSystemMetadata(
+            descriptor: descriptor,
+            cancellationFlag: cancellationFlag
+        )
         let digest = try digest(descriptor: descriptor, cancellationFlag: cancellationFlag)
         let descriptorAfter = try stateForDescriptor(descriptor, operation: .digest)
         let pathAfter = try nodeState(url: url)
@@ -404,7 +433,11 @@ struct SafeMetadataFileOperations: @unchecked Sendable {
         else {
             throw SafeMetadataFileSystemError(operation: .digest, code: ESTALE)
         }
-        return SafeMetadataFileSnapshot(nodeState: pathAfter, digest: digest)
+        return SafeMetadataFileSnapshot(
+            nodeState: pathAfter,
+            digest: digest,
+            fileSystemMetadata: metadata
+        )
     }
 
     private static func snapshotWorkspace(
@@ -429,6 +462,10 @@ struct SafeMetadataFileOperations: @unchecked Sendable {
         guard descriptorBefore == pathBefore else {
             throw SafeMetadataFileSystemError(operation: .digest, code: ESTALE)
         }
+        let metadata = try fileSystemMetadata(
+            descriptor: descriptor,
+            cancellationFlag: cancellationFlag
+        )
         let digest = try digest(descriptor: descriptor, cancellationFlag: cancellationFlag)
         let descriptorAfter = try stateForDescriptor(descriptor, operation: .digest)
         let pathAfter = try workspaceFileState(workspace)
@@ -437,7 +474,11 @@ struct SafeMetadataFileOperations: @unchecked Sendable {
         else {
             throw SafeMetadataFileSystemError(operation: .digest, code: ESTALE)
         }
-        return SafeMetadataFileSnapshot(nodeState: pathAfter, digest: digest)
+        return SafeMetadataFileSnapshot(
+            nodeState: pathAfter,
+            digest: digest,
+            fileSystemMetadata: metadata
+        )
     }
 
     private static func validateWorkspacePath(
@@ -525,8 +566,11 @@ struct SafeMetadataFileOperations: @unchecked Sendable {
     static func removeWorkspaceFileIfOwnedForTesting(
         _ workspace: SafeMetadataWorkspace,
         expectedIdentity: SafeMetadataFileIdentity,
-        beforeRename: () -> Void
+        afterQuarantineValidation: (URL) -> Void
     ) -> SafeMetadataConditionalRemoval {
+        // The 0700 directory and random quarantine name are the boundary
+        // against ordinary same-UID competitors. If either identity check
+        // fails, the quarantine object is retained rather than deleted.
         do {
             let directoryState = try stateForDescriptor(
                 workspace.directoryFD,
@@ -561,16 +605,14 @@ struct SafeMetadataFileOperations: @unchecked Sendable {
             return .identityMismatch(preservedURL: workspace.fileURL)
         }
 
-        beforeRename()
-
-        let cleanupName = ".cleanup-\(UUID().uuidString)"
+        let quarantineName = ".quarantine-file-\(UUID().uuidString)"
         let renameResult = workspace.fileName.withCString { fileName in
-            cleanupName.withCString { cleanupName in
+            quarantineName.withCString { quarantineName in
                 renameatx_np(
                     workspace.directoryFD,
                     fileName,
                     workspace.directoryFD,
-                    cleanupName,
+                    quarantineName,
                     UInt32(RENAME_EXCL)
                 )
             }
@@ -583,40 +625,38 @@ struct SafeMetadataFileOperations: @unchecked Sendable {
             )
         }
 
-        let cleanupURL = workspace.directoryURL.appendingPathComponent(cleanupName)
-        var cleanupStatus = stat()
-        let statusResult = cleanupName.withCString { name in
-            fstatat(
-                workspace.directoryFD,
-                name,
-                &cleanupStatus,
-                AT_SYMLINK_NOFOLLOW
-            )
-        }
-        guard statusResult == 0 else {
-            return .failed(
-                SafeMetadataFileSystemError(operation: .unlink, code: errno),
-                preservedURL: cleanupURL
-            )
-        }
-        guard SafeMetadataFileNodeState(cleanupStatus).identity == expectedIdentity else {
-            return .identityMismatch(preservedURL: cleanupURL)
+        let quarantineURL = workspace.directoryURL.appendingPathComponent(quarantineName)
+        guard quarantineEntryIdentity(
+            directoryFD: workspace.directoryFD,
+            name: quarantineName
+        ) == expectedIdentity else {
+            return .identityMismatch(preservedURL: quarantineURL)
         }
 
-        let unlinkResult = cleanupName.withCString { name in
+        afterQuarantineValidation(quarantineURL)
+
+        guard quarantineEntryIdentity(
+            directoryFD: workspace.directoryFD,
+            name: quarantineName
+        ) == expectedIdentity else {
+            return .identityMismatch(preservedURL: quarantineURL)
+        }
+
+        let unlinkResult = quarantineName.withCString { name in
             unlinkat(workspace.directoryFD, name, 0)
         }
         guard unlinkResult == 0 else {
             return .failed(
                 SafeMetadataFileSystemError(operation: .unlink, code: errno),
-                preservedURL: cleanupURL
+                preservedURL: quarantineURL
             )
         }
         return .removed
     }
 
-    private static func removeWorkspaceDirectoryIfOwned(
-        workspace: SafeMetadataWorkspace
+    static func removeWorkspaceDirectoryIfOwnedForTesting(
+        _ workspace: SafeMetadataWorkspace,
+        afterQuarantineValidation: (URL) -> Void
     ) -> SafeMetadataConditionalRemoval {
         do {
             let openState = try stateForDescriptor(
@@ -635,36 +675,75 @@ struct SafeMetadataFileOperations: @unchecked Sendable {
             )
         }
 
-        var status = stat()
-        let stateResult = workspace.directoryName.withCString { name in
-            fstatat(
-                workspace.parentDirectoryFD,
-                name,
-                &status,
-                AT_SYMLINK_NOFOLLOW
-            )
+        guard quarantineEntryIdentity(
+            directoryFD: workspace.parentDirectoryFD,
+            name: workspace.directoryName
+        ) == workspace.directoryIdentity else {
+            return .identityMismatch(preservedURL: workspace.directoryURL)
         }
-        if stateResult != 0 {
+
+        let quarantineName = ".quarantine-directory-\(UUID().uuidString).work"
+        let renameResult = workspace.directoryName.withCString { directoryName in
+            quarantineName.withCString { quarantineName in
+                renameatx_np(
+                    workspace.parentDirectoryFD,
+                    directoryName,
+                    workspace.parentDirectoryFD,
+                    quarantineName,
+                    UInt32(RENAME_EXCL)
+                )
+            }
+        }
+        guard renameResult == 0 else {
             if errno == ENOENT { return .missing }
             return .failed(
                 SafeMetadataFileSystemError(operation: .unlink, code: errno),
                 preservedURL: workspace.directoryURL
             )
         }
-        guard SafeMetadataFileNodeState(status).identity == workspace.directoryIdentity else {
-            return .identityMismatch(preservedURL: workspace.directoryURL)
+
+        let quarantineURL = workspace.parentDirectoryURL.appendingPathComponent(
+            quarantineName,
+            isDirectory: true
+        )
+        guard quarantineEntryIdentity(
+            directoryFD: workspace.parentDirectoryFD,
+            name: quarantineName
+        ) == workspace.directoryIdentity else {
+            return .identityMismatch(preservedURL: quarantineURL)
         }
 
-        let removeResult = workspace.directoryName.withCString { name in
+        afterQuarantineValidation(quarantineURL)
+
+        guard quarantineEntryIdentity(
+            directoryFD: workspace.parentDirectoryFD,
+            name: quarantineName
+        ) == workspace.directoryIdentity else {
+            return .identityMismatch(preservedURL: quarantineURL)
+        }
+
+        let removeResult = quarantineName.withCString { name in
             unlinkat(workspace.parentDirectoryFD, name, AT_REMOVEDIR)
         }
         guard removeResult == 0 else {
             return .failed(
                 SafeMetadataFileSystemError(operation: .unlink, code: errno),
-                preservedURL: workspace.directoryURL
+                preservedURL: quarantineURL
             )
         }
         return .removed
+    }
+
+    private static func quarantineEntryIdentity(
+        directoryFD: Int32,
+        name: String
+    ) -> SafeMetadataFileIdentity? {
+        var status = stat()
+        let result = name.withCString { name in
+            fstatat(directoryFD, name, &status, AT_SYMLINK_NOFOLLOW)
+        }
+        guard result == 0 else { return nil }
+        return SafeMetadataFileNodeState(status).identity
     }
 
     private static func workspaceFileState(
@@ -707,6 +786,27 @@ struct SafeMetadataFileOperations: @unchecked Sendable {
         return SafeMetadataFileNodeState(status)
     }
 
+    private static func fileSystemMetadata(
+        descriptor: Int32,
+        cancellationFlag: SafeMetadataCancellationFlag
+    ) throws -> Data {
+        try checkCancellation(cancellationFlag)
+        var blob = ATSFMetadataSnapshotForFD(descriptor)
+        defer { ATSFMetadataBlobRelease(&blob) }
+        guard blob.status == 0 else {
+            throw SafeMetadataFileSystemError(
+                operation: .stat,
+                code: blob.error_code
+            )
+        }
+        try checkCancellation(cancellationFlag)
+        guard blob.size > 0 else { return Data() }
+        guard let bytes = blob.bytes else {
+            throw SafeMetadataFileSystemError(operation: .stat, code: EIO)
+        }
+        return Data(bytes: bytes, count: blob.size)
+    }
+
     private static func digest(
         descriptor: Int32,
         cancellationFlag: SafeMetadataCancellationFlag
@@ -727,7 +827,14 @@ struct SafeMetadataFileOperations: @unchecked Sendable {
                 if errno == EINTR { continue }
                 throw SafeMetadataFileSystemError(operation: .digest, code: errno)
             }
-            hasher.update(data: Data(buffer[0..<count]))
+            buffer.withUnsafeBytes { bytes in
+                hasher.update(
+                    bufferPointer: UnsafeRawBufferPointer(
+                        start: bytes.baseAddress,
+                        count: count
+                    )
+                )
+            }
         }
         try checkCancellation(cancellationFlag)
         return Data(hasher.finalize())
@@ -753,5 +860,8 @@ private extension SafeMetadataFileNodeState {
         statusChangeNanoseconds = Int64(status.st_ctimespec.tv_nsec)
         linkCount = UInt64(status.st_nlink)
         mode = UInt16(status.st_mode)
+        ownerID = UInt32(status.st_uid)
+        groupID = UInt32(status.st_gid)
+        flags = UInt32(status.st_flags)
     }
 }

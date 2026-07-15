@@ -176,11 +176,23 @@ public actor SafeMetadataWriter: SafeMetadataWriting {
             else {
                 throw WorkValidationError.identityChanged
             }
+            guard writtenSnapshot.preservesFileSystemMetadata(
+                of: ownedWork.copiedExpected
+            ) else {
+                throw WorkValidationError.preservedMetadataChanged
+            }
         } catch is CancellationError {
             return await finishBeforeCommit(
                 url: url,
                 status: .notProcessed,
                 message: "操作已取消",
+                ownedWork: ownedWork
+            )
+        } catch WorkValidationError.preservedMetadataChanged {
+            return await finishBeforeCommit(
+                url: url,
+                status: .failed,
+                message: "元数据服务改变了必须保留的文件系统属性，已拒绝提交",
                 ownedWork: ownedWork
             )
         } catch {
@@ -432,6 +444,7 @@ public actor SafeMetadataWriter: SafeMetadataWriting {
                 )
             }
 
+            var copiedIdentity: SafeMetadataFileIdentity?
             do {
                 let copiedState = try await Self.runBlocking {
                     try operations.copyIntoWorkspace(
@@ -440,6 +453,7 @@ public actor SafeMetadataWriter: SafeMetadataWriting {
                         cancellationFlag
                     )
                 }
+                copiedIdentity = copiedState.identity
                 guard copiedState.isRegularFile,
                       copiedState.linkCount == 1
                 else {
@@ -454,14 +468,24 @@ public actor SafeMetadataWriter: SafeMetadataWriting {
                         )
                     )
                 }
+                let copiedExpected = try await Self.runBlocking {
+                    try operations.snapshotWorkspace(
+                        workspace,
+                        cancellationFlag
+                    )
+                }
+                guard copiedExpected.nodeState.identity == copiedState.identity else {
+                    throw WorkValidationError.identityChanged
+                }
                 return OwnedWorkFile(
                     workspace: workspace,
-                    identity: copiedState.identity
+                    identity: copiedState.identity,
+                    copiedExpected: copiedExpected
                 )
             } catch is CancellationError {
                 let cleanup = await cleanupWorkspace(
                     workspace,
-                    expectedFileIdentity: nil
+                    expectedFileIdentity: copiedIdentity
                 )
                 throw WorkspaceCancellationError(
                     message: appendCleanupWarning("操作已取消", cleanup.warning)
@@ -469,7 +493,7 @@ public actor SafeMetadataWriter: SafeMetadataWriting {
             } catch let error as SafeMetadataFileSystemError {
                 let cleanup = await cleanupWorkspace(
                     workspace,
-                    expectedFileIdentity: error.ownedNodeState?.identity
+                    expectedFileIdentity: error.ownedNodeState?.identity ?? copiedIdentity
                 )
                 if error.code == ECANCELED || cancellationFlag.isCancelled {
                     throw WorkspaceCancellationError(
@@ -485,7 +509,7 @@ public actor SafeMetadataWriter: SafeMetadataWriting {
             } catch {
                 let cleanup = await cleanupWorkspace(
                     workspace,
-                    expectedFileIdentity: nil
+                    expectedFileIdentity: copiedIdentity
                 )
                 throw WorkspaceCreationError(
                     message: appendCleanupWarning(
@@ -603,12 +627,7 @@ public actor SafeMetadataWriter: SafeMetadataWriting {
                     coordinatedWork,
                     cancellationFlag
                 )
-                let workspaceSnapshot = try operations.snapshotWorkspace(
-                    ownedWork.workspace,
-                    cancellationFlag
-                )
-                guard coordinatedWorkSnapshot == editedExpected,
-                      workspaceSnapshot == editedExpected
+                guard coordinatedWorkSnapshot == editedExpected
                 else {
                     observed = .preSwapFailed("已验证工作副本在提交前发生变化，已取消替换")
                     return
@@ -974,6 +993,7 @@ public actor SafeMetadataWriter: SafeMetadataWriting {
 private struct OwnedWorkFile: Sendable {
     let workspace: SafeMetadataWorkspace
     let identity: SafeMetadataFileIdentity
+    let copiedExpected: SafeMetadataFileSnapshot
 }
 
 private struct WorkspaceCleanupReport: Sendable {
@@ -1012,6 +1032,7 @@ private struct WorkspaceCancellationError: Error, Sendable {
 
 private enum WorkValidationError: Error {
     case identityChanged
+    case preservedMetadataChanged
     case changedAfterVerification
 }
 
