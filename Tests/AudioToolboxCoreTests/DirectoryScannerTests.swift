@@ -75,25 +75,38 @@ struct DirectoryScannerTests {
     }
 
     @Test
-    func metadataFailureEmitsFailedAndScanningContinues() async throws {
+    func metadataFailureEmitsPlaceholderAndScanningContinues() async throws {
         let directory = try TemporaryDirectory()
         defer { directory.remove() }
 
         try directory.createFile("broken.mp3", contents: "broken")
+        try directory.createFile("unsupported.ogg", contents: "unsupported")
         try directory.createFile("good.flac", contents: "good")
 
-        let service = FakeMetadataService(failingFileNames: ["broken.mp3"])
+        let service = FakeMetadataService(
+            failingFileNames: ["broken.mp3"],
+            unsupportedFileNames: ["unsupported.ogg"]
+        )
         let events = await collect(DirectoryScanner(metadataService: service).scan(root: directory.url))
 
-        #expect(events.contains { event in
-            guard case let .failed(url, message) = event else { return false }
-            return url.lastPathComponent == "broken.mp3" && message.contains("broken.mp3")
+        let placeholders = events.compactMap(unreadableTrack)
+        #expect(placeholders.count == 2)
+        #expect(placeholders.allSatisfy { $0.metadata == .empty })
+        #expect(placeholders.allSatisfy { !$0.isWritable })
+        #expect(placeholders.contains { track in
+            track.url.lastPathComponent == "broken.mp3"
+                && track.issue == .unreadable("broken.mp3")
+        })
+        #expect(placeholders.contains { track in
+            track.url.lastPathComponent == "unsupported.ogg"
+                && track.issue == .unsupportedTag("unsupported.ogg")
         })
         #expect(events.contains { event in
             guard case let .loaded(track) = event else { return false }
             return track.url.lastPathComponent == "good.flac"
         })
-        #expect(events.compactMap(discoveredCount) == [1, 2])
+        #expect(events.compactMap(discoveredCount) == [1, 2, 3])
+        #expect(events.filter { if case .failed = $0 { true } else { false } }.isEmpty)
         #expect(events.filter(isFinished).count == 1)
         #expect(events.last == .finished)
     }
@@ -342,11 +355,17 @@ struct DirectoryScannerTests {
 
 private actor FakeMetadataService: MetadataService {
     private let failingFileNames: Set<String>
+    private let unsupportedFileNames: Set<String>
     private let readDelay: Duration?
     private var readURLs: [URL] = []
 
-    init(failingFileNames: Set<String> = [], readDelay: Duration? = nil) {
+    init(
+        failingFileNames: Set<String> = [],
+        unsupportedFileNames: Set<String> = [],
+        readDelay: Duration? = nil
+    ) {
         self.failingFileNames = failingFileNames
+        self.unsupportedFileNames = unsupportedFileNames
         self.readDelay = readDelay
     }
 
@@ -357,6 +376,9 @@ private actor FakeMetadataService: MetadataService {
         }
         if failingFileNames.contains(url.lastPathComponent) {
             throw MetadataServiceError.unreadable(url.lastPathComponent)
+        }
+        if unsupportedFileNames.contains(url.lastPathComponent) {
+            throw MetadataServiceError.unsupported(url.lastPathComponent)
         }
         return .fixture
     }
@@ -481,6 +503,8 @@ private struct TemporaryDirectory {
 }
 
 private extension AudioMetadata {
+    static let empty = AudioMetadata(title: nil, artists: [], albums: [], duration: nil)
+
     static let fixture = AudioMetadata(
         title: "Fixture",
         artists: ["Artist"],
@@ -499,6 +523,11 @@ private func collect(_ stream: AsyncStream<ScanEvent>) async -> [ScanEvent] {
 
 private func loadedTrack(_ event: ScanEvent) -> AudioTrack? {
     guard case let .loaded(track) = event else { return nil }
+    return track
+}
+
+private func unreadableTrack(_ event: ScanEvent) -> AudioTrack? {
+    guard case let .unreadable(track, _) = event else { return nil }
     return track
 }
 

@@ -93,8 +93,10 @@ public final class LibraryViewModel: ObservableObject {
     }
 
     public var canOpenBatchEditor: Bool {
-        guard case .closed = batchState else { return false }
-        return !selectedTrackIDs.isEmpty && !isBatchActive
+        guard case .closed = batchState, !isBatchActive else { return false }
+        return tracks.contains { track in
+            track.isEditable && selectedTrackIDs.contains(track.id)
+        }
     }
 
     public var isBatchSheetPresented: Bool {
@@ -137,6 +139,15 @@ public final class LibraryViewModel: ObservableObject {
         canAdvanceBatchEdit
             && batchAcknowledgedNoBackup
             && !batchEditTrackSnapshot.isEmpty
+            && batchEditTrackSnapshot.allSatisfy(\.isEditable)
+            && batchSnapshotIsCurrentlyEditable
+    }
+
+    private var batchSnapshotIsCurrentlyEditable: Bool {
+        let currentTracks = Dictionary(uniqueKeysWithValues: tracks.map { ($0.id, $0) })
+        return batchEditTrackSnapshot.allSatisfy { snapshot in
+            currentTracks[snapshot.id]?.isEditable == true
+        }
     }
 
     public var batchResultCounts: BatchResultCounts {
@@ -154,14 +165,18 @@ public final class LibraryViewModel: ObservableObject {
     }
 
     public var currentGroupSelectionState: CurrentGroupSelectionState {
-        guard let currentGroup, !currentGroup.trackIDs.isEmpty else { return .none }
-        let selectedInGroup = currentGroup.trackIDs.reduce(into: 0) { count, id in
+        guard let currentGroup else { return .none }
+        let editableIDs = Set(tracks.lazy.filter(\.isEditable).map(\.id))
+        let selectableIDs = currentGroup.trackIDs.filter(editableIDs.contains)
+        guard !selectableIDs.isEmpty else { return .none }
+
+        let selectedInGroup = selectableIDs.reduce(into: 0) { count, id in
             if selectedTrackIDs.contains(id) {
                 count += 1
             }
         }
         if selectedInGroup == 0 { return .none }
-        if selectedInGroup == currentGroup.trackIDs.count { return .all }
+        if selectedInGroup == selectableIDs.count { return .all }
         return .mixed
     }
 
@@ -321,7 +336,7 @@ public final class LibraryViewModel: ObservableObject {
 
     public func toggleSelection(_ id: FileIdentity) {
         guard !isLibraryInteractionLocked else { return }
-        guard tracks.contains(where: { $0.id == id }) else { return }
+        guard tracks.contains(where: { $0.id == id && $0.isEditable }) else { return }
         selectionState.toggle(id)
         publishSelection()
     }
@@ -332,14 +347,24 @@ public final class LibraryViewModel: ObservableObject {
               let group = groups.first(where: { $0.id == selectedGroupID }) else {
             return
         }
-        selectionState.setSelected(group.trackIDs, selected: selected)
+        let editableIDs = Set(
+            tracks.lazy
+                .filter { $0.isEditable }
+                .map(\.id)
+        )
+        let affectedIDs = selected
+            ? group.trackIDs.filter(editableIDs.contains)
+            : group.trackIDs
+        selectionState.setSelected(affectedIDs, selected: selected)
         publishSelection()
     }
 
     public func openBatchEditor() {
         guard case .closed = batchState else { return }
         guard !selectedTrackIDs.isEmpty, !isBatchActive else { return }
-        let selectedTracks = tracks.filter { selectedTrackIDs.contains($0.id) }
+        let selectedTracks = tracks.filter {
+            $0.isEditable && selectedTrackIDs.contains($0.id)
+        }
         guard !selectedTracks.isEmpty else { return }
         resetBatchDraft()
         batchEditTrackSnapshot = selectedTracks
@@ -553,6 +578,15 @@ public final class LibraryViewModel: ObservableObject {
                         preservingMissingGroupID: preservingGroupID
                     )
                     self.publishScanningState()
+                case let .unreadable(track, message):
+                    self.scanFailureValues.append(
+                        LibraryScanFailure(url: track.url, message: message)
+                    )
+                    self.upsert(
+                        track,
+                        preservingMissingGroupID: preservingGroupID
+                    )
+                    self.publishScanningState()
                 case let .failed(url, message):
                     self.scanFailureValues.append(
                         LibraryScanFailure(url: url, message: message)
@@ -590,6 +624,10 @@ public final class LibraryViewModel: ObservableObject {
         } else {
             tracks.append(track)
         }
+        if !track.isEditable {
+            selectionState.setSelected([track.id], selected: false)
+            publishSelection()
+        }
         tracks = LibraryProjection.sortedTracks(tracks)
         rebuildGroups(preservingMissingGroupID: preservingMissingGroupID)
     }
@@ -620,7 +658,7 @@ public final class LibraryViewModel: ObservableObject {
     }
 
     private func finishScan() {
-        selectionState.retainOnly(Set(tracks.map(\.id)))
+        selectionState.retainOnly(Set(tracks.filter(\.isEditable).map(\.id)))
         publishSelection()
         rebuildGroups()
         if tracks.isEmpty {

@@ -4,10 +4,13 @@
 #include <taglib/fileref.h>
 #include <taglib/tag.h>
 #include <taglib/tfile.h>
+#include <taglib/tpropertymap.h>
 #include <taglib/tstring.h>
+#include <taglib/tstringlist.h>
 
 #include <unistd.h>
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstdlib>
@@ -16,7 +19,10 @@
 #include <fstream>
 #include <limits>
 #include <new>
+#include <sstream>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace {
 constexpr int32_t ATStatusInvalidPath = 1;
@@ -84,6 +90,56 @@ bool CopyTagStrings(const TagLib::Tag &tag, ATReadResult &result) {
     }
 
     return true;
+}
+
+void AppendLengthPrefixed(std::ostringstream &stream, const std::string &value) {
+    stream << value.size() << ':' << value;
+}
+
+std::string CanonicalPropertyMap(
+    const TagLib::PropertyMap &properties,
+    bool exclude_artist,
+    bool exclude_album
+) {
+    std::vector<std::pair<std::string, std::vector<std::string>>> entries;
+    for(auto iterator = properties.cbegin(); iterator != properties.cend(); ++iterator) {
+        const std::string key = iterator->first.upper().to8Bit(true);
+        if((exclude_artist && key == "ARTIST") || (exclude_album && key == "ALBUM")) {
+            continue;
+        }
+
+        std::vector<std::string> values;
+        values.reserve(iterator->second.size());
+        for(const auto &value : iterator->second) {
+            values.push_back(value.to8Bit(true));
+        }
+        entries.emplace_back(key, std::move(values));
+    }
+    std::sort(entries.begin(), entries.end(), [](const auto &left, const auto &right) {
+        return left.first < right.first;
+    });
+
+    std::ostringstream stream;
+    for(const auto &entry : entries) {
+        AppendLengthPrefixed(stream, entry.first);
+        stream << '=' << entry.second.size() << '[';
+        for(const auto &value : entry.second) {
+            AppendLengthPrefixed(stream, value);
+            stream << ';';
+        }
+        stream << "]\n";
+    }
+    return stream.str();
+}
+
+std::vector<std::string> CanonicalUnsupportedData(const TagLib::StringList &values) {
+    std::vector<std::string> result;
+    result.reserve(values.size());
+    for(const auto &value : values) {
+        result.push_back(value.to8Bit(true));
+    }
+    std::sort(result.begin(), result.end());
+    return result;
 }
 
 enum class ATContainer {
@@ -525,6 +581,10 @@ ATReadResult ATReadMetadata(const char *path) {
             SetError(result, ATStatusUnreadable, "不支持读取带 ID3v2.4 footer 的 MP3");
             return result;
         }
+        if(content.container == ATContainer::RawADTS) {
+            SetError(result, ATStatusUnreadable, "原始 AAC/ADTS 不包含受支持的标签容器");
+            return result;
+        }
 
         TagLib::FileRef file(path, true, TagLib::AudioProperties::Accurate);
         if(!IsUsableFileRef(file, false)) {
@@ -533,7 +593,7 @@ ATReadResult ATReadMetadata(const char *path) {
         }
 
         const TagLib::Tag *tag = file.tag();
-        if(tag == nullptr || tag->isEmpty()) {
+        if(tag == nullptr) {
             SetError(result, ATStatusMissingTag, "音频文件不包含可读取的标签");
             return result;
         }
@@ -633,15 +693,75 @@ ATWriteResult ATWriteMetadata(
             return result;
         }
 
-        if(artist_or_null != nullptr) {
-            tag->setArtist(TagLib::String(artist_or_null, TagLib::String::UTF8));
+        const bool changes_artist = artist_or_null != nullptr;
+        const bool changes_album = album_or_null != nullptr;
+        const TagLib::PropertyMap properties_before = file.file()->properties();
+        const std::string non_target_before = CanonicalPropertyMap(
+            properties_before,
+            changes_artist,
+            changes_album
+        );
+        const std::vector<std::string> unsupported_before = CanonicalUnsupportedData(
+            properties_before.unsupportedData()
+        );
+
+        TagLib::PropertyMap updated_properties = properties_before;
+        if(changes_artist) {
+            updated_properties.replace(
+                "ARTIST",
+                TagLib::StringList(TagLib::String(artist_or_null, TagLib::String::UTF8))
+            );
         }
-        if(album_or_null != nullptr) {
-            tag->setAlbum(TagLib::String(album_or_null, TagLib::String::UTF8));
+        if(changes_album) {
+            updated_properties.replace(
+                "ALBUM",
+                TagLib::StringList(TagLib::String(album_or_null, TagLib::String::UTF8))
+            );
+        }
+        if(!file.file()->setProperties(updated_properties).isEmpty()) {
+            SetError(result, ATStatusSaveFailed, "目标标签无法写入当前音频格式");
+            return result;
         }
 
         if(!file.save()) {
             SetError(result, ATStatusSaveFailed, "TagLib 保存音频标签失败");
+            return result;
+        }
+
+        const TagLib::FileRef saved_file(path, true, TagLib::AudioProperties::Accurate);
+        if(saved_file.isNull() || saved_file.file() == nullptr) {
+            SetError(result, ATStatusSaveFailed, "保存后无法重新打开音频文件");
+            return result;
+        }
+        if(!saved_file.file()->isValid()) {
+            SetError(result, ATStatusSaveFailed, "保存后音频文件结构无效");
+            return result;
+        }
+        if(saved_file.tag() == nullptr) {
+            SetError(result, ATStatusSaveFailed, "保存后无法重新读取音频标签");
+            return result;
+        }
+        if(!HasSaneAudioProperties(saved_file)) {
+            SetError(result, ATStatusSaveFailed, "保存后音频属性无效");
+            return result;
+        }
+        const TagLib::PropertyMap properties_after = saved_file.file()->properties();
+        const std::string non_target_after = CanonicalPropertyMap(
+            properties_after,
+            changes_artist,
+            changes_album
+        );
+        if(non_target_after != non_target_before) {
+            SetError(result, ATStatusSaveFailed, "保存改变了非目标标签，已拒绝提交");
+            return result;
+        }
+
+        const std::vector<std::string> unsupported_after = CanonicalUnsupportedData(
+            properties_after.unsupportedData()
+        );
+        if(unsupported_after != unsupported_before) {
+            SetError(result, ATStatusSaveFailed, "保存改变了无法识别的标签结构，已拒绝提交");
+            return result;
         }
         return result;
     }

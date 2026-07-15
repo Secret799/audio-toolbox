@@ -17,6 +17,7 @@ public struct TrackTableView: View {
                 )
                 .labelsHidden()
                 .toggleStyle(.checkbox)
+                .disabled(!track.isEditable || viewModel.isLibraryInteractionLocked)
                 .accessibilityLabel("选择 \(displayTitle(for: track))")
             }
             .width(min: 42, ideal: 48, max: 56)

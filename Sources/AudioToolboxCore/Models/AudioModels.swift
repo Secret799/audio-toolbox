@@ -49,6 +49,10 @@ public struct AudioTrack: Identifiable, Equatable, Sendable {
     public let modificationDate: Date
     public let isWritable: Bool
     public let issue: AudioFileIssue?
+
+    public var isEditable: Bool {
+        isWritable && issue == nil
+    }
 }
 
 public enum GroupingMode: String, CaseIterable, Sendable {

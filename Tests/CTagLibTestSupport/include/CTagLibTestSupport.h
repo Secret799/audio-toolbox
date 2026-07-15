@@ -1,0 +1,25 @@
+#ifndef CTagLibTestSupport_h
+#define CTagLibTestSupport_h
+
+#include <stdbool.h>
+#include <stddef.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+bool ATTestClearMetadata(const char *path);
+bool ATTestTagIsEmpty(const char *path);
+bool ATTestSeedRichMetadata(const char *path, bool include_unknown_mp3_frame);
+char *ATTestPropertyValues(const char *path, const char *key);
+char *ATTestCanonicalProperties(const char *path, bool exclude_artist, bool exclude_album);
+char *ATTestUnsupportedData(const char *path);
+size_t ATTestComplexPropertyCount(const char *path, const char *key);
+bool ATTestHasID3v2Frame(const char *path, const char *identifier);
+void ATTestFreeString(char *value);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif

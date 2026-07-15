@@ -1,3 +1,4 @@
+import CTagLibTestSupport
 import Foundation
 import Testing
 @testable import AudioToolboxCore
@@ -26,6 +27,42 @@ struct TagLibMetadataServiceTests {
                 (0.1...1.0).contains(metadata.duration ?? 0),
                 "Unexpected duration for \(name): \(String(describing: metadata.duration))"
             )
+        }
+    }
+
+    @Test("reads and first-writes truly untagged common formats")
+    func readsAndWritesUntaggedCommonFormats() async throws {
+        let service = TagLibMetadataService()
+
+        for name in writableFixtureNames {
+            let untaggedSource = name == "sample.ogg" ? "sample-long.ogg" : name
+            try await withFixtureCopy(untaggedSource) { copy in
+                #expect(clearMetadata(copy), "Could not clear metadata for \(name)")
+                #expect(tagIsEmpty(copy), "Expected TagLib tag to be empty for \(name)")
+
+                let metadata = try await service.read(url: copy)
+                #expect(metadata.title == nil, "Unexpected title for \(name)")
+                #expect(metadata.artists.isEmpty, "Unexpected artist for \(name)")
+                #expect(metadata.albums.isEmpty, "Unexpected album for \(name)")
+                #expect(metadata.artistDisplayName == "未知作者")
+                #expect(metadata.albumDisplayName == "未知专辑")
+                #expect((metadata.duration ?? 0) > 0, "Duration missing for \(name)")
+                #expect(await service.canWrite(url: copy), "Expected untagged \(name) to be writable")
+
+                do {
+                    try await service.write(
+                        url: copy,
+                        patch: MetadataPatch(artist: "First Artist", album: "First Album")
+                    )
+                } catch {
+                    Issue.record("First write failed for \(name): \(error)")
+                    return
+                }
+
+                let saved = try await service.read(url: copy)
+                #expect(saved.artists.first == "First Artist", "Artist not created for \(name)")
+                #expect(saved.albums.first == "First Album", "Album not created for \(name)")
+            }
         }
     }
 
@@ -132,6 +169,74 @@ struct TagLibMetadataServiceTests {
                 #expect(metadata.albums.first == "New Album", "Unexpected album for \(name)")
                 #expect(metadata.title == "Fixture Title", "Title changed for \(name)")
                 #expect((metadata.duration ?? 0) > 0, "Duration missing after album write for \(name)")
+            }
+        }
+    }
+
+    @Test("album-only writes preserve all artist values and rich non-target metadata")
+    func albumOnlyPreservesRichMetadata() async throws {
+        let service = TagLibMetadataService()
+
+        for name in ["sample.mp3", "sample.m4a", "sample.flac", "sample.ogg"] {
+            try await withFixtureCopy(name) { copy in
+                #expect(seedRichMetadata(copy, includeUnknownMP3Frame: name.hasSuffix(".mp3")))
+                let beforeProperties = try canonicalProperties(copy, excludeArtist: false, excludeAlbum: true)
+                let beforeArtists = try propertyValues(copy, key: "ARTIST")
+                let beforeUnsupported = try unsupportedData(copy)
+                let beforePictures = complexPropertyCount(copy, key: "PICTURE")
+                #expect(beforeArtists.contains("Original Artist"))
+                #expect(beforeArtists.contains("Second Artist"))
+                for key in ["GENRE", "DATE", "TRACKNUMBER", "LYRICS", "COMMENT"] {
+                    #expect(
+                        !(try propertyValues(copy, key: key)).isEmpty,
+                        "\(key) not seeded for \(name)"
+                    )
+                }
+                #expect(beforePictures > 0, "Cover not seeded for \(name)")
+                if name.hasSuffix(".mp3") {
+                    #expect(hasID3v2Frame(copy, identifier: "XZZZ"))
+                    #expect(!beforeUnsupported.isEmpty)
+                }
+
+                try await service.write(
+                    url: copy,
+                    patch: MetadataPatch(artist: nil, album: "Changed Album")
+                )
+
+                #expect(try propertyValues(copy, key: "ARTIST") == beforeArtists)
+                #expect(try canonicalProperties(copy, excludeArtist: false, excludeAlbum: true) == beforeProperties)
+                #expect(try unsupportedData(copy) == beforeUnsupported)
+                #expect(complexPropertyCount(copy, key: "PICTURE") == beforePictures)
+                if name.hasSuffix(".mp3") {
+                    #expect(hasID3v2Frame(copy, identifier: "XZZZ"))
+                }
+            }
+        }
+    }
+
+    @Test("artist-only writes preserve album and rich non-target metadata")
+    func artistOnlyPreservesRichMetadata() async throws {
+        let service = TagLibMetadataService()
+
+        for name in ["sample.mp3", "sample.m4a", "sample.flac", "sample.ogg"] {
+            try await withFixtureCopy(name) { copy in
+                #expect(seedRichMetadata(copy, includeUnknownMP3Frame: name.hasSuffix(".mp3")))
+                let beforeProperties = try canonicalProperties(copy, excludeArtist: true, excludeAlbum: false)
+                let beforeUnsupported = try unsupportedData(copy)
+                let beforePictures = complexPropertyCount(copy, key: "PICTURE")
+                #expect(beforePictures > 0, "Cover not seeded for \(name)")
+
+                try await service.write(
+                    url: copy,
+                    patch: MetadataPatch(artist: "Changed Artist", album: nil)
+                )
+
+                #expect(try canonicalProperties(copy, excludeArtist: true, excludeAlbum: false) == beforeProperties)
+                #expect(try unsupportedData(copy) == beforeUnsupported)
+                #expect(complexPropertyCount(copy, key: "PICTURE") == beforePictures)
+                if name.hasSuffix(".mp3") {
+                    #expect(hasID3v2Frame(copy, identifier: "XZZZ"))
+                }
             }
         }
     }
@@ -321,6 +426,61 @@ struct TagLibMetadataServiceTests {
             )
         }
         #expect(try Data(contentsOf: url) == before)
+    }
+
+    private func clearMetadata(_ url: URL) -> Bool {
+        url.path.withCString(ATTestClearMetadata)
+    }
+
+    private func tagIsEmpty(_ url: URL) -> Bool {
+        url.path.withCString(ATTestTagIsEmpty)
+    }
+
+    private func seedRichMetadata(_ url: URL, includeUnknownMP3Frame: Bool) -> Bool {
+        url.path.withCString { ATTestSeedRichMetadata($0, includeUnknownMP3Frame) }
+    }
+
+    private func propertyValues(_ url: URL, key: String) throws -> String {
+        try readTestString(url: url) { path in
+            key.withCString { ATTestPropertyValues(path, $0) }
+        }
+    }
+
+    private func canonicalProperties(
+        _ url: URL,
+        excludeArtist: Bool,
+        excludeAlbum: Bool
+    ) throws -> String {
+        try readTestString(url: url) { path in
+            ATTestCanonicalProperties(path, excludeArtist, excludeAlbum)
+        }
+    }
+
+    private func unsupportedData(_ url: URL) throws -> String {
+        try readTestString(url: url, operation: ATTestUnsupportedData)
+    }
+
+    private func complexPropertyCount(_ url: URL, key: String) -> Int {
+        Int(url.path.withCString { path in
+            key.withCString { ATTestComplexPropertyCount(path, $0) }
+        })
+    }
+
+    private func hasID3v2Frame(_ url: URL, identifier: String) -> Bool {
+        url.path.withCString { path in
+            identifier.withCString { ATTestHasID3v2Frame(path, $0) }
+        }
+    }
+
+    private func readTestString(
+        url: URL,
+        operation: (UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?
+    ) throws -> String {
+        guard let value = url.path.withCString(operation) else {
+            throw CocoaError(.fileReadUnknown)
+        }
+        defer { ATTestFreeString(value) }
+        return String(cString: value)
     }
 
     private func withFixtureCopy<T>(

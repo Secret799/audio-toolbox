@@ -3,6 +3,7 @@ import Foundation
 public enum ScanEvent: Equatable, Sendable {
     case discovered(Int)
     case loaded(AudioTrack)
+    case unreadable(AudioTrack, String)
     case failed(URL, String)
     case finished
 }
@@ -177,10 +178,59 @@ public struct DirectoryScanner: DirectoryScanning {
             } catch is CancellationError where Task.isCancelled {
                 return
             } catch {
-                continuation.yield(.failed(url, String(describing: error)))
+                let message = Self.metadataFailureMessage(error)
+                continuation.yield(
+                    .unreadable(
+                        AudioTrack(
+                            id: identity,
+                            url: url,
+                            format: format,
+                            metadata: AudioMetadata(
+                                title: nil,
+                                artists: [],
+                                albums: [],
+                                duration: nil
+                            ),
+                            fileSize: Int64(detailValues?.fileSize ?? 0),
+                            modificationDate: detailValues?.contentModificationDate ?? .distantPast,
+                            isWritable: false,
+                            issue: Self.metadataFailureIssue(error)
+                        ),
+                        message
+                    )
+                )
             }
 
             iterationBoundary()
+        }
+    }
+
+    private static func metadataFailureMessage(_ error: Error) -> String {
+        guard let metadataError = error as? MetadataServiceError else {
+            return String(describing: error)
+        }
+        return switch metadataError {
+        case let .unreadable(message),
+             let .unsupported(message),
+             let .notWritable(message),
+             let .saveFailed(message),
+             let .verificationFailed(message):
+            message
+        }
+    }
+
+    private static func metadataFailureIssue(_ error: Error) -> AudioFileIssue {
+        guard let metadataError = error as? MetadataServiceError else {
+            return .unreadable(String(describing: error))
+        }
+        return switch metadataError {
+        case let .unsupported(message):
+            .unsupportedTag(message)
+        case let .unreadable(message),
+             let .notWritable(message),
+             let .saveFailed(message),
+             let .verificationFailed(message):
+            .unreadable(message)
         }
     }
 

@@ -511,6 +511,37 @@ struct LibraryViewModelTests {
         ])
     }
 
+    @Test("批量执行前拒绝扫描中变为不可编辑的快照曲目")
+    @MainActor
+    func batchRejectsSnapshotThatBecomesUnreadable() async {
+        let scanner = ControllableScanner()
+        let editor = FakeBatchEditor(summary: BatchEditSummary(results: []))
+        let viewModel = makeViewModel(scanner: scanner, batchEditor: editor)
+
+        let load = Task { await viewModel.loadDirectory(firstRoot) }
+        await scanner.waitForScanCount(1)
+        scanner.yield(.loaded(Self.firstTrack), toScan: 0)
+        await waitUntil { viewModel.tracks == [Self.firstTrack] }
+
+        viewModel.toggleSelection(Self.firstTrack.id)
+        viewModel.openBatchEditor()
+        viewModel.batchArtist = "Should Not Run"
+        viewModel.batchAcknowledgedNoBackup = true
+        #expect(viewModel.canExecuteBatchEdit)
+
+        scanner.yield(
+            .unreadable(Self.firstTrackUnreadable, "标签后来变得不可读"),
+            toScan: 0
+        )
+        scanner.finish(scan: 0)
+        await load.value
+
+        #expect(!viewModel.canExecuteBatchEdit)
+        await viewModel.runBatchEdit()
+        #expect(await editor.requests.isEmpty)
+        #expect(viewModel.batchState == .editing)
+    }
+
     @Test("未确认不能执行，执行中禁止重复提交")
     @MainActor
     func batchExecutionRequiresAcknowledgementAndRejectsDuplicateRun() async {
@@ -538,26 +569,57 @@ struct LibraryViewModelTests {
         await firstRun.value
     }
 
-    @Test("扫描失败会保留可展示的文件和原因")
+    @Test("不可读候选会进入表格未知分组且始终不可选择")
     @MainActor
-    func scanFailureIsPresented() async {
-        let failedURL = firstRoot.appendingPathComponent("broken.mp3")
-        let failure = LibraryScanFailure(url: failedURL, message: "标签损坏")
+    func unreadableCandidatesAreDisplayedButNotSelectable() async {
+        let unreadableFailure = LibraryScanFailure(
+            url: Self.unreadableTrack.url,
+            message: "标签损坏"
+        )
+        let unsupportedFailure = LibraryScanFailure(
+            url: Self.unsupportedTrack.url,
+            message: "标签结构不支持"
+        )
         let scanner = ScriptedScanner(scripts: [[
-            .discovered(2),
-            .loaded(Self.firstTrack),
-            .failed(failedURL, "标签损坏"),
+            .discovered(4),
+            .unreadable(Self.unreadableTrack, "标签损坏"),
+            .unreadable(Self.unsupportedTrack, "标签结构不支持"),
+            .loaded(Self.readOnlyTrack),
+            .loaded(Self.untaggedWritableTrack),
             .finished,
         ]])
         let viewModel = makeViewModel(scanner: scanner)
 
         await viewModel.loadDirectory(firstRoot)
-        await waitUntil { viewModel.scanState == .loaded(failures: [failure]) }
+        await waitUntil {
+            viewModel.scanState == .loaded(failures: [unreadableFailure, unsupportedFailure])
+        }
 
-        #expect(viewModel.scanState == .loaded(failures: [failure]))
-        #expect(viewModel.scanFailures == [failure])
-        #expect(viewModel.scanFailureCount == 1)
-        #expect(viewModel.scanFailureMessage == "broken.mp3：标签损坏")
+        #expect(viewModel.tracks == LibraryProjection.sortedTracks([
+            Self.unreadableTrack, Self.unsupportedTrack, Self.readOnlyTrack,
+            Self.untaggedWritableTrack,
+        ]))
+        #expect(viewModel.groups.map(\.displayName) == ["未知作者"])
+        #expect(viewModel.filteredTracks.count == 4)
+        #expect(viewModel.scanFailureCount == 2)
+        #expect(viewModel.scanFailureMessage == "broken.mp3：标签损坏\nunsupported.ogg：标签结构不支持")
+        #expect(Self.unreadableTrack.issue == .unreadable("标签损坏"))
+        #expect(Self.unsupportedTrack.issue == .unsupportedTag("标签结构不支持"))
+
+        viewModel.toggleSelection(Self.unreadableTrack.id)
+        viewModel.toggleSelection(Self.readOnlyTrack.id)
+        #expect(viewModel.selectedTrackIDs.isEmpty)
+        #expect(viewModel.currentGroupSelectionState == .none)
+        #expect(!viewModel.canOpenBatchEditor)
+
+        viewModel.setCurrentGroupSelected(true)
+        #expect(viewModel.selectedTrackIDs == [Self.untaggedWritableTrack.id])
+        #expect(viewModel.currentGroupSelectionState == .all)
+        #expect(viewModel.canOpenBatchEditor)
+
+        viewModel.toggleSelection(Self.unreadableTrack.id)
+        viewModel.openBatchEditor()
+        #expect(viewModel.batchEditTracks == [Self.untaggedWritableTrack])
     }
 
     @Test("打开、执行批量编辑会发布进度和结果，完成后刷新目录")
@@ -794,6 +856,61 @@ struct LibraryViewModelTests {
         title: "Late Event",
         artist: "Old Root",
         album: "Old Root"
+    )
+
+    private static let readOnlyTrack = AudioTrack(
+        id: FileIdentity(rawValue: "read-only"),
+        url: URL(fileURLWithPath: "/virtual/read-only.wav"),
+        format: .wav,
+        metadata: AudioMetadata(title: nil, artists: [], albums: [], duration: 120),
+        fileSize: 896,
+        modificationDate: Date(timeIntervalSince1970: 1_700_000_000),
+        isWritable: false,
+        issue: nil
+    )
+
+    private static let untaggedWritableTrack = AudioTrack(
+        id: FileIdentity(rawValue: "untagged-writable"),
+        url: URL(fileURLWithPath: "/virtual/untagged.flac"),
+        format: .flac,
+        metadata: AudioMetadata(title: nil, artists: [], albums: [], duration: 120),
+        fileSize: 1_024,
+        modificationDate: Date(timeIntervalSince1970: 1_700_000_000),
+        isWritable: true,
+        issue: nil
+    )
+
+    private static let firstTrackUnreadable = AudioTrack(
+        id: firstTrack.id,
+        url: firstTrack.url,
+        format: firstTrack.format,
+        metadata: AudioMetadata(title: nil, artists: [], albums: [], duration: nil),
+        fileSize: firstTrack.fileSize,
+        modificationDate: firstTrack.modificationDate,
+        isWritable: false,
+        issue: .unreadable("标签后来变得不可读")
+    )
+
+    private static let unreadableTrack = AudioTrack(
+        id: FileIdentity(rawValue: "broken"),
+        url: URL(fileURLWithPath: "/virtual/broken.mp3"),
+        format: .mp3,
+        metadata: AudioMetadata(title: nil, artists: [], albums: [], duration: nil),
+        fileSize: 512,
+        modificationDate: Date(timeIntervalSince1970: 1_700_000_000),
+        isWritable: false,
+        issue: .unreadable("标签损坏")
+    )
+
+    private static let unsupportedTrack = AudioTrack(
+        id: FileIdentity(rawValue: "unsupported"),
+        url: URL(fileURLWithPath: "/virtual/unsupported.ogg"),
+        format: .ogg,
+        metadata: AudioMetadata(title: nil, artists: [], albums: [], duration: nil),
+        fileSize: 768,
+        modificationDate: Date(timeIntervalSince1970: 1_700_000_000),
+        isWritable: false,
+        issue: .unsupportedTag("标签结构不支持")
     )
 
     private static let editedFirstTrack = track(

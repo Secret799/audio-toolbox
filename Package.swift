@@ -22,6 +22,12 @@ let package = Package(
             dependencies: [.product(name: "taglib", package: "CXXTagLib")],
             publicHeadersPath: "include"
         ),
+        .target(
+            name: "CTagLibTestSupport",
+            dependencies: [.product(name: "taglib", package: "CXXTagLib")],
+            path: "Tests/CTagLibTestSupport",
+            publicHeadersPath: "include"
+        ),
         .target(name: "AudioToolboxCore", dependencies: ["CTagLibBridge", "CSafeFileBridge"]),
         .target(name: "AudioToolboxUI", dependencies: ["AudioToolboxCore"]),
         .executableTarget(
@@ -35,7 +41,7 @@ let package = Package(
         ),
         .testTarget(
             name: "AudioToolboxIntegrationTests",
-            dependencies: ["AudioToolboxCore"],
+            dependencies: ["AudioToolboxCore", "CTagLibTestSupport"],
             resources: [.copy("Fixtures")]
         )
     ]
