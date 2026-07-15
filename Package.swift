@@ -24,7 +24,10 @@ let package = Package(
         ),
         .target(name: "AudioToolboxCore", dependencies: ["CTagLibBridge", "CSafeFileBridge"]),
         .target(name: "AudioToolboxUI", dependencies: ["AudioToolboxCore"]),
-        .executableTarget(name: "AudioToolbox", dependencies: ["AudioToolboxUI"]),
+        .executableTarget(
+            name: "AudioToolbox",
+            dependencies: ["AudioToolboxUI", "AudioToolboxCore"]
+        ),
         .testTarget(name: "AudioToolboxCoreTests", dependencies: ["AudioToolboxCore"]),
         .testTarget(
             name: "AudioToolboxUITests",

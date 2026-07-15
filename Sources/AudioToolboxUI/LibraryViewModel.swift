@@ -21,6 +21,12 @@ public enum LibraryScreenState: Equatable, Sendable {
     case failed(String)
 }
 
+public enum CurrentGroupSelectionState: Equatable, Sendable {
+    case none
+    case mixed
+    case all
+}
+
 public enum BatchSheetState: Equatable, Sendable {
     case closed
     case editing
@@ -51,6 +57,36 @@ public final class LibraryViewModel: ObservableObject {
 
     public var selectedCount: Int {
         selectedTrackIDs.count
+    }
+
+    public var canOpenBatchEditor: Bool {
+        !selectedTrackIDs.isEmpty && !isBatchActive
+    }
+
+    public var currentGroup: AudioGroup? {
+        guard let selectedGroupID else { return nil }
+        return groups.first { $0.id == selectedGroupID }
+    }
+
+    public var currentGroupSelectionState: CurrentGroupSelectionState {
+        guard let currentGroup, !currentGroup.trackIDs.isEmpty else { return .none }
+        let selectedInGroup = currentGroup.trackIDs.reduce(into: 0) { count, id in
+            if selectedTrackIDs.contains(id) {
+                count += 1
+            }
+        }
+        if selectedInGroup == 0 { return .none }
+        if selectedInGroup == currentGroup.trackIDs.count { return .all }
+        return .mixed
+    }
+
+    public var emptyDirectoryMessage: String? {
+        guard case .empty = scanState, let currentDirectoryURL else { return nil }
+        return "\(currentDirectoryURL.lastPathComponent) 中没有支持的音频文件"
+    }
+
+    public var scanFailureCount: Int {
+        scanFailures.count
     }
 
     public var scanFailures: [LibraryScanFailure] {
@@ -202,6 +238,11 @@ public final class LibraryViewModel: ObservableObject {
     public func openBatchEditor() {
         guard !selectedTrackIDs.isEmpty, !isBatchActive else { return }
         batchState = .editing
+    }
+
+    public func closeBatchEditor() {
+        guard case .editing = batchState else { return }
+        batchState = .closed
     }
 
     public func runBatchEdit(patch: MetadataPatch) async {

@@ -144,6 +144,51 @@ struct LibraryViewModelTests {
         #expect(viewModel.selectedGroupID == "album:Album Two")
     }
 
+    @Test("主窗口派生批量入口和当前组全选三态")
+    @MainActor
+    func mainWindowDerivesBatchAvailabilityAndGroupSelectionState() async {
+        let scanner = ScriptedScanner(scripts: [[
+            .loaded(Self.firstTrack),
+            .loaded(Self.sameArtistTrack),
+            .loaded(Self.secondTrack),
+            .finished,
+        ]])
+        let viewModel = makeViewModel(scanner: scanner)
+
+        await viewModel.loadDirectory(firstRoot)
+        viewModel.selectedGroupID = "artist:Artist One"
+
+        #expect(viewModel.currentGroup?.displayName == "Artist One")
+        #expect(viewModel.currentGroupSelectionState == .none)
+        #expect(!viewModel.canOpenBatchEditor)
+
+        viewModel.toggleSelection(Self.firstTrack.id)
+        #expect(viewModel.currentGroupSelectionState == .mixed)
+        #expect(viewModel.canOpenBatchEditor)
+
+        viewModel.setCurrentGroupSelected(true)
+        #expect(viewModel.currentGroupSelectionState == .all)
+        #expect(viewModel.selectedCount == 2)
+
+        viewModel.setCurrentGroupSelected(false)
+        #expect(viewModel.currentGroupSelectionState == .none)
+        #expect(!viewModel.canOpenBatchEditor)
+    }
+
+    @Test("空目录派生用户文案")
+    @MainActor
+    func emptyDirectoryDerivesUserMessage() async {
+        let scanner = ScriptedScanner(scripts: [[.finished]])
+        let viewModel = makeViewModel(scanner: scanner)
+
+        await viewModel.loadDirectory(firstRoot)
+
+        #expect(viewModel.scanState == .empty(failures: []))
+        #expect(viewModel.currentGroup == nil)
+        #expect(viewModel.filteredTracks.isEmpty)
+        #expect(viewModel.emptyDirectoryMessage == "library-one 中没有支持的音频文件")
+    }
+
     @Test("bookmark 保存错误独立于旧扫描并在成功重试时清除")
     @MainActor
     func bookmarkSaveErrorSurvivesOldScanAndClearsOnRetry() async throws {
@@ -347,6 +392,7 @@ struct LibraryViewModelTests {
 
         #expect(viewModel.scanState == .loaded(failures: [failure]))
         #expect(viewModel.scanFailures == [failure])
+        #expect(viewModel.scanFailureCount == 1)
         #expect(viewModel.scanFailureMessage == "broken.mp3：标签损坏")
     }
 
@@ -369,6 +415,10 @@ struct LibraryViewModelTests {
         await waitUntil { viewModel.scanState == .loaded(failures: []) }
         viewModel.toggleSelection(Self.firstTrack.id)
 
+        viewModel.openBatchEditor()
+        #expect(viewModel.batchState == .editing)
+        viewModel.closeBatchEditor()
+        #expect(viewModel.batchState == .closed)
         viewModel.openBatchEditor()
         #expect(viewModel.batchState == .editing)
 
