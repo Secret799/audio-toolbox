@@ -18,6 +18,11 @@ public struct MetadataPatch: Equatable, Sendable {
 public struct BatchEditRequest: Sendable {
     public let files: [URL]
     public let patch: MetadataPatch
+
+    public init(files: [URL], patch: MetadataPatch) {
+        self.files = files
+        self.patch = patch
+    }
 }
 
 public enum BatchFileStatus: Equatable, Sendable {

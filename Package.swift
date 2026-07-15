@@ -27,6 +27,10 @@ let package = Package(
         .executableTarget(name: "AudioToolbox", dependencies: ["AudioToolboxUI"]),
         .testTarget(name: "AudioToolboxCoreTests", dependencies: ["AudioToolboxCore"]),
         .testTarget(
+            name: "AudioToolboxUITests",
+            dependencies: ["AudioToolboxUI", "AudioToolboxCore"]
+        ),
+        .testTarget(
             name: "AudioToolboxIntegrationTests",
             dependencies: ["AudioToolboxCore"],
             resources: [.copy("Fixtures")]
