@@ -4,33 +4,12 @@ public protocol SafeMetadataWriting: Sendable {
     func apply(to url: URL, patch: MetadataPatch) async -> BatchFileResult
 }
 
-struct SafeMetadataFileOperations: @unchecked Sendable {
-    let copyItem: (URL, URL) throws -> Void
-    let replaceItem: (URL, URL) throws -> URL?
-
-    static func live(fileManager: FileManager) -> Self {
-        Self(
-            copyItem: { source, destination in
-                try fileManager.copyItem(at: source, to: destination)
-            },
-            replaceItem: { original, replacement in
-                try fileManager.replaceItemAt(
-                    original,
-                    withItemAt: replacement,
-                    backupItemName: nil,
-                    options: []
-                )
-            }
-        )
-    }
-}
-
 public actor SafeMetadataWriter: SafeMetadataWriting {
     private static let maximumTemporaryNameAttempts = 16
 
     private let metadataService: any MetadataService
-    private let fileManager: FileManager
     private let fileOperations: SafeMetadataFileOperations
+    private let commitGate: @Sendable () -> Bool
     private let temporaryIdentifierProvider: @Sendable () -> String
 
     public init(
@@ -38,20 +17,20 @@ public actor SafeMetadataWriter: SafeMetadataWriting {
         fileManager: FileManager = .default
     ) {
         self.metadataService = metadataService
-        self.fileManager = fileManager
         fileOperations = .live(fileManager: fileManager)
+        commitGate = { !Task.isCancelled }
         temporaryIdentifierProvider = { UUID().uuidString }
     }
 
     init(
         metadataService: any MetadataService,
-        fileManager: FileManager,
         fileOperations: SafeMetadataFileOperations,
+        commitGate: @escaping @Sendable () -> Bool,
         temporaryIdentifierProvider: @escaping @Sendable () -> String
     ) {
         self.metadataService = metadataService
-        self.fileManager = fileManager
         self.fileOperations = fileOperations
+        self.commitGate = commitGate
         self.temporaryIdentifierProvider = temporaryIdentifierProvider
     }
 
@@ -63,73 +42,137 @@ public actor SafeMetadataWriter: SafeMetadataWriting {
             return result(for: url, status: .failed, message: "没有需要写入的标签")
         }
 
-        if let message = preflightFailureMessage(for: url) {
-            return result(for: url, status: .failed, message: message)
-        }
-
         let originalSnapshot: OriginalFileSnapshot
         do {
-            originalSnapshot = try fileSnapshot(for: url)
+            originalSnapshot = try initialSnapshot(for: url)
         } catch {
             return result(
                 for: url,
                 status: .failed,
-                message: "无法记录原文件状态：\(errorMessage(error))"
+                message: initialFailureMessage(error)
             )
         }
 
-        guard await metadataService.canWrite(url: url) else {
+        let canWrite = await metadataService.canWrite(url: url)
+        guard !Task.isCancelled else {
+            return result(for: url, status: .notProcessed, message: "操作已取消")
+        }
+        guard canWrite else {
             return result(for: url, status: .failed, message: "文件格式不支持标签写入")
         }
-        guard !Task.isCancelled else {
-            return result(for: url, status: .notProcessed, message: "操作已取消")
-        }
 
-        let temporaryURL: URL
+        let temporary: OwnedTemporaryFile
         do {
-            temporaryURL = try createTemporaryCopy(of: url)
+            temporary = try createTemporaryCopy(of: url)
+        } catch let error as TemporaryCreationError {
+            return result(for: url, status: .failed, message: error.message)
         } catch {
             return result(
                 for: url,
                 status: .failed,
-                message: "无法创建安全工作副本：\(errorMessage(error))"
+                message: "无法创建安全工作副本：\(copyFailureDetail(error))"
             )
         }
 
-        defer {
-            removeTemporaryItemIfPresent(at: temporaryURL)
+        guard !Task.isCancelled else {
+            return preCommitResult(
+                for: url,
+                status: .notProcessed,
+                message: "操作已取消",
+                temporary: temporary
+            )
         }
 
-        guard !Task.isCancelled else {
-            return result(for: url, status: .notProcessed, message: "操作已取消")
+        let preWriteState: SafeMetadataFileNodeState
+        do {
+            preWriteState = try fileOperations.nodeState(temporary.url)
+        } catch {
+            return preCommitResult(
+                for: url,
+                status: .failed,
+                message: "工作副本身份发生变化，已拒绝写入",
+                temporary: temporary
+            )
+        }
+        guard preWriteState.identity == temporary.identity,
+              preWriteState.isRegularFile,
+              preWriteState.linkCount == 1
+        else {
+            return preCommitResult(
+                for: url,
+                status: .failed,
+                message: "工作副本身份发生变化，已拒绝写入",
+                temporary: temporary
+            )
         }
 
         do {
-            try await metadataService.write(url: temporaryURL, patch: patch)
+            try await metadataService.write(url: temporary.url, patch: patch)
         } catch is CancellationError where Task.isCancelled {
-            return result(for: url, status: .notProcessed, message: "操作已取消")
+            return preCommitResult(
+                for: url,
+                status: .notProcessed,
+                message: "操作已取消",
+                temporary: temporary
+            )
         } catch {
-            return result(
+            return preCommitResult(
                 for: url,
                 status: .failed,
-                message: "写入安全工作副本失败：\(errorMessage(error))"
+                message: "元数据写入失败",
+                temporary: temporary
+            )
+        }
+
+        let editedState: SafeMetadataFileNodeState
+        do {
+            editedState = try fileOperations.nodeState(temporary.url)
+        } catch {
+            return preCommitResult(
+                for: url,
+                status: .failed,
+                message: "工作副本身份发生变化，已拒绝提交",
+                temporary: temporary
+            )
+        }
+        guard editedState.identity == preWriteState.identity,
+              editedState.identity == temporary.identity,
+              editedState.isRegularFile,
+              editedState.linkCount == 1
+        else {
+            return preCommitResult(
+                for: url,
+                status: .failed,
+                message: "工作副本身份发生变化，已拒绝提交",
+                temporary: temporary
             )
         }
 
         guard !Task.isCancelled else {
-            return result(for: url, status: .notProcessed, message: "操作已取消")
+            return preCommitResult(
+                for: url,
+                status: .notProcessed,
+                message: "操作已取消",
+                temporary: temporary
+            )
         }
 
         let savedMetadata: AudioMetadata
         do {
-            savedMetadata = try await metadataService.read(url: temporaryURL)
+            savedMetadata = try await metadataService.read(url: temporary.url)
         } catch is CancellationError where Task.isCancelled {
-            return result(for: url, status: .notProcessed, message: "操作已取消")
+            return preCommitResult(
+                for: url,
+                status: .notProcessed,
+                message: "操作已取消",
+                temporary: temporary
+            )
         } catch {
-            return result(
+            return preCommitResult(
                 for: url,
                 status: .failed,
-                message: "写入后验证失败：无法重新读取工作副本（\(errorMessage(error))）"
+                message: "写入后验证失败：无法读取工作副本",
+                temporary: temporary
             )
         }
 
@@ -137,99 +180,111 @@ public actor SafeMetadataWriter: SafeMetadataWriting {
             metadata: savedMetadata,
             patch: patch
         ) {
-            return result(for: url, status: .failed, message: verificationMessage)
+            return preCommitResult(
+                for: url,
+                status: .failed,
+                message: verificationMessage,
+                temporary: temporary
+            )
         }
 
         guard !Task.isCancelled else {
-            return result(for: url, status: .notProcessed, message: "操作已取消")
-        }
-
-        guard preflightFailureMessage(for: url) == nil else {
-            return result(
+            return preCommitResult(
                 for: url,
-                status: .failed,
-                message: "原文件在编辑期间发生变化，已取消替换"
+                status: .notProcessed,
+                message: "操作已取消",
+                temporary: temporary
             )
         }
+
         do {
-            guard try fileSnapshot(for: url) == originalSnapshot else {
-                return result(
+            let currentTemporaryState = try fileOperations.nodeState(temporary.url)
+            guard currentTemporaryState.identity == temporary.identity else {
+                return preCommitResult(
                     for: url,
                     status: .failed,
-                    message: "原文件在编辑期间发生变化，已取消替换"
+                    message: "工作副本身份发生变化，已拒绝提交",
+                    temporary: temporary
                 )
             }
         } catch {
-            return result(
+            return preCommitResult(
                 for: url,
                 status: .failed,
-                message: "原文件在编辑期间发生变化，已取消替换"
+                message: "工作副本身份发生变化，已拒绝提交",
+                temporary: temporary
             )
         }
 
+        let coordinatedResult: CoordinatedCommitResult
         do {
-            _ = try fileOperations.replaceItem(url, temporaryURL)
-        } catch {
-            return result(
+            coordinatedResult = try coordinatedCommit(
+                originalURL: url,
+                originalSnapshot: originalSnapshot,
+                temporary: temporary
+            )
+        } catch let failure as CoordinatedCommitFailure {
+            let message: String
+            if let validationError = failure.cause as? CommitValidationError {
+                message = validationError.message
+            } else {
+                message = swapFailureMessage(failure.cause)
+            }
+            return preCommitResult(
                 for: url,
                 status: .failed,
-                message: "安全替换原文件失败：\(errorMessage(error))"
+                message: message,
+                temporary: failure.temporary
+            )
+        } catch {
+            return preCommitResult(
+                for: url,
+                status: .failed,
+                message: swapFailureMessage(error),
+                temporary: temporary
             )
         }
 
-        return result(for: url, status: .succeeded, message: nil)
+        switch coordinatedResult.outcome {
+        case .cancelled:
+            return preCommitResult(
+                for: url,
+                status: .notProcessed,
+                message: "操作已取消",
+                temporary: coordinatedResult.temporary
+            )
+        case let .swapped(warning):
+            return result(for: url, status: .succeeded, message: warning)
+        }
     }
 
-    private func preflightFailureMessage(for url: URL) -> String? {
-        var isDirectory: ObjCBool = false
-        guard fileManager.fileExists(atPath: url.path, isDirectory: &isDirectory) else {
-            return "文件不存在"
+    private func initialSnapshot(for url: URL) throws -> OriginalFileSnapshot {
+        let before = try fileOperations.nodeState(url)
+        if before.isSymbolicLink {
+            throw InitialValidationError.symbolicLink
         }
-        guard !isDirectory.boolValue else {
-            return "目标不是普通文件"
+        guard before.isRegularFile else {
+            throw InitialValidationError.notRegularFile
         }
-
-        do {
-            let values = try url.resourceValues(forKeys: [
-                .isRegularFileKey,
-                .isSymbolicLinkKey,
-                .isReadableKey,
-                .isWritableKey,
-            ])
-            guard values.isRegularFile == true,
-                  values.isSymbolicLink != true
-            else {
-                return "目标不是普通文件"
-            }
-            guard values.isReadable != false,
-                  fileManager.isReadableFile(atPath: url.path)
-            else {
-                return "文件不可读"
-            }
-            guard values.isWritable != false,
-                  fileManager.isWritableFile(atPath: url.path)
-            else {
-                return "文件不可写"
-            }
-        } catch {
-            return "无法检查文件状态：\(errorMessage(error))"
+        guard before.linkCount == 1 else {
+            throw InitialValidationError.hardLinked
+        }
+        guard fileOperations.isReadable(url) else {
+            throw InitialValidationError.notReadable
+        }
+        guard fileOperations.isWritable(url) else {
+            throw InitialValidationError.notWritable
         }
 
-        return nil
+        let digest = try fileOperations.digest(url)
+        let after = try fileOperations.nodeState(url)
+        guard before == after else {
+            throw InitialValidationError.changedDuringInspection
+        }
+        return OriginalFileSnapshot(nodeState: after, digest: digest)
     }
 
-    private func fileSnapshot(for url: URL) throws -> OriginalFileSnapshot {
-        let attributes = try fileManager.attributesOfItem(atPath: url.path)
-        return OriginalFileSnapshot(
-            systemNumber: (attributes[.systemNumber] as? NSNumber)?.uint64Value,
-            systemFileNumber: (attributes[.systemFileNumber] as? NSNumber)?.uint64Value,
-            fileSize: (attributes[.size] as? NSNumber)?.uint64Value,
-            modificationDate: attributes[.modificationDate] as? Date,
-            posixPermissions: (attributes[.posixPermissions] as? NSNumber)?.uint16Value
-        )
-    }
-
-    private func createTemporaryCopy(of originalURL: URL) throws -> URL {
+    private func createTemporaryCopy(of originalURL: URL) throws -> OwnedTemporaryFile {
         let directory = originalURL.deletingLastPathComponent()
         let pathExtension = originalURL.pathExtension
 
@@ -239,22 +294,211 @@ public actor SafeMetadataWriter: SafeMetadataWriting {
             let fileName = pathExtension.isEmpty ? baseName : "\(baseName).\(pathExtension)"
             let candidate = directory.appendingPathComponent(fileName, isDirectory: false)
 
-            guard !fileManager.fileExists(atPath: candidate.path) else {
-                continue
-            }
-
             do {
-                try fileOperations.copyItem(originalURL, candidate)
-                return candidate
-            } catch where isFileExistsError(error) {
+                let copiedState = try fileOperations.copyExclusive(originalURL, candidate)
+                guard copiedState.isRegularFile,
+                      copiedState.linkCount == 1
+                else {
+                    let temporary = OwnedTemporaryFile(
+                        url: candidate,
+                        identity: copiedState.identity
+                    )
+                    let cleanup = cleanupOwnedTemporaryFile(temporary)
+                    throw TemporaryCreationError(
+                        message: appendCleanupMessage(
+                            "无法创建安全工作副本：副本类型不安全",
+                            cleanup
+                        )
+                    )
+                }
+                return OwnedTemporaryFile(url: candidate, identity: copiedState.identity)
+            } catch let error as SafeMetadataFileSystemError where error.code == EEXIST {
                 continue
-            } catch {
-                removeTemporaryItemIfPresent(at: candidate)
+            } catch let error as TemporaryCreationError {
                 throw error
+            } catch let error as SafeMetadataFileSystemError {
+                let cleanup: CleanupOutcome
+                if let ownedState = error.ownedNodeState {
+                    cleanup = cleanupOwnedTemporaryFile(
+                        OwnedTemporaryFile(url: candidate, identity: ownedState.identity)
+                    )
+                } else {
+                    cleanup = cleanupCandidateWithoutOwnership(at: candidate)
+                }
+                throw TemporaryCreationError(
+                    message: appendCleanupMessage(
+                        "无法创建安全工作副本：\(copyFailureDetail(error))",
+                        cleanup
+                    )
+                )
+            } catch {
+                throw TemporaryCreationError(
+                    message: "无法创建安全工作副本：文件复制失败"
+                )
             }
         }
 
-        throw SafeMetadataWriterError.unableToReserveTemporaryName
+        throw TemporaryCreationError(message: "无法创建安全工作副本：临时文件名持续冲突")
+    }
+
+    private func coordinatedCommit(
+        originalURL: URL,
+        originalSnapshot: OriginalFileSnapshot,
+        temporary: OwnedTemporaryFile
+    ) throws -> CoordinatedCommitResult {
+        var coordinatedTemporary = temporary
+        var outcome: CommitOutcome?
+        do {
+            try fileOperations.coordinateReplacing(
+                originalURL,
+                temporary.url
+            ) { coordinatedOriginal, coordinatedTemporaryURL in
+                coordinatedTemporary = OwnedTemporaryFile(
+                    url: coordinatedTemporaryURL,
+                    identity: temporary.identity
+                )
+                outcome = try commitInsideCoordination(
+                    originalURL: coordinatedOriginal,
+                    originalSnapshot: originalSnapshot,
+                    temporary: coordinatedTemporary
+                )
+            }
+        } catch {
+            throw CoordinatedCommitFailure(
+                cause: error,
+                temporary: coordinatedTemporary
+            )
+        }
+        guard let outcome else {
+            throw CoordinatedCommitFailure(
+                cause: CommitValidationError(message: "无法进入原文件替换协调区"),
+                temporary: coordinatedTemporary
+            )
+        }
+        return CoordinatedCommitResult(
+            outcome: outcome,
+            temporary: coordinatedTemporary
+        )
+    }
+
+    private func commitInsideCoordination(
+        originalURL: URL,
+        originalSnapshot: OriginalFileSnapshot,
+        temporary: OwnedTemporaryFile
+    ) throws -> CommitOutcome {
+        let before = try fileOperations.nodeState(originalURL)
+        guard before == originalSnapshot.nodeState else {
+            throw CommitValidationError(message: "原文件在编辑期间发生变化，已取消替换")
+        }
+        let digest = try fileOperations.digest(originalURL)
+        let after = try fileOperations.nodeState(originalURL)
+        guard before == after,
+              after == originalSnapshot.nodeState
+        else {
+            throw CommitValidationError(message: "原文件在编辑期间发生变化，已取消替换")
+        }
+        guard digest == originalSnapshot.digest else {
+            throw CommitValidationError(message: "原文件内容已发生变化，已取消替换")
+        }
+
+        let temporaryState = try fileOperations.nodeState(temporary.url)
+        guard temporaryState.identity == temporary.identity,
+              temporaryState.isRegularFile,
+              temporaryState.linkCount == 1
+        else {
+            throw CommitValidationError(message: "工作副本身份发生变化，已拒绝提交")
+        }
+
+        guard commitGate() else {
+            return .cancelled
+        }
+
+        try fileOperations.swap(originalURL, temporary.url)
+        return postSwapOutcome(
+            originalURL: originalURL,
+            originalIdentity: originalSnapshot.nodeState.identity,
+            editedIdentity: temporary.identity,
+            recoveryURL: temporary.url
+        )
+    }
+
+    private func postSwapOutcome(
+        originalURL: URL,
+        originalIdentity: SafeMetadataFileIdentity,
+        editedIdentity: SafeMetadataFileIdentity,
+        recoveryURL: URL
+    ) -> CommitOutcome {
+        let warning = "修改已提交，但隐藏恢复副本 \(recoveryURL.lastPathComponent) 已保留，请确认文件后手动处理"
+        do {
+            let committedState = try fileOperations.nodeState(originalURL)
+            let recoveryState = try fileOperations.nodeState(recoveryURL)
+            guard committedState.identity == editedIdentity,
+                  committedState.isRegularFile,
+                  recoveryState.identity == originalIdentity,
+                  recoveryState.isRegularFile,
+                  recoveryState.linkCount == 1
+            else {
+                return .swapped(warning: warning)
+            }
+            do {
+                try fileOperations.unlink(recoveryURL)
+                return .swapped(warning: nil)
+            } catch {
+                return .swapped(
+                    warning: "修改已提交，但旧文件恢复副本 \(recoveryURL.lastPathComponent) 未能清理（\(cleanupFailureDetail(error))），已保留供恢复"
+                )
+            }
+        } catch {
+            return .swapped(warning: warning)
+        }
+    }
+
+    private func preCommitResult(
+        for url: URL,
+        status: BatchFileStatus,
+        message: String,
+        temporary: OwnedTemporaryFile
+    ) -> BatchFileResult {
+        let cleanup = cleanupOwnedTemporaryFile(temporary)
+        return result(
+            for: url,
+            status: status,
+            message: appendCleanupMessage(message, cleanup)
+        )
+    }
+
+    private func cleanupCandidateWithoutOwnership(at url: URL) -> CleanupOutcome {
+        do {
+            _ = try fileOperations.nodeState(url)
+            return .ownershipUnknown
+        } catch let error as SafeMetadataFileSystemError where error.code == ENOENT {
+            return .notNeeded
+        } catch {
+            return .failed("无法确认临时路径状态")
+        }
+    }
+
+    private func cleanupOwnedTemporaryFile(
+        _ temporary: OwnedTemporaryFile
+    ) -> CleanupOutcome {
+        let state: SafeMetadataFileNodeState
+        do {
+            state = try fileOperations.nodeState(temporary.url)
+        } catch let error as SafeMetadataFileSystemError where error.code == ENOENT {
+            return .notNeeded
+        } catch {
+            return .failed("无法确认临时文件身份")
+        }
+
+        guard state.identity == temporary.identity else {
+            return .identityMismatch
+        }
+        do {
+            try fileOperations.unlink(temporary.url)
+            return .removed
+        } catch {
+            return .failed(cleanupFailureDetail(error))
+        }
     }
 
     private func verificationFailureMessage(
@@ -274,9 +518,107 @@ public actor SafeMetadataWriter: SafeMetadataWriting {
         return nil
     }
 
-    private func removeTemporaryItemIfPresent(at url: URL) {
-        guard fileManager.fileExists(atPath: url.path) else { return }
-        try? fileManager.removeItem(at: url)
+    private func appendCleanupMessage(
+        _ message: String,
+        _ cleanup: CleanupOutcome
+    ) -> String {
+        switch cleanup {
+        case .removed, .notNeeded:
+            return message
+        case .identityMismatch:
+            return "\(message)；临时路径已被其他文件占用，为避免误删未删除该隐藏文件"
+        case .ownershipUnknown:
+            return "\(message)；临时路径存在但无法确认所有权，为避免误删未删除该隐藏文件"
+        case let .failed(detail):
+            return "\(message)；临时工作文件清理失败：\(detail)，隐藏文件已保留"
+        }
+    }
+
+    private func cleanupFailureDetail(_ error: Error) -> String {
+        guard let error = error as? SafeMetadataFileSystemError else {
+            return "文件系统拒绝删除"
+        }
+        switch error.code {
+        case EACCES, EPERM:
+            return "没有删除权限"
+        case EBUSY:
+            return "文件正被占用"
+        case EROFS:
+            return "所在文件系统为只读"
+        default:
+            return "删除操作失败"
+        }
+    }
+
+    private func initialFailureMessage(_ error: Error) -> String {
+        if let error = error as? InitialValidationError {
+            switch error {
+            case .symbolicLink:
+                return "拒绝编辑符号链接"
+            case .notRegularFile:
+                return "目标不是普通文件"
+            case .hardLinked:
+                return "文件存在硬链接别名，为避免路径分叉已拒绝编辑"
+            case .notReadable:
+                return "文件不可读"
+            case .notWritable:
+                return "文件不可写"
+            case .changedDuringInspection:
+                return "文件在安全检查期间发生变化"
+            }
+        }
+        if let error = error as? SafeMetadataFileSystemError {
+            switch error.code {
+            case ENOENT:
+                return "文件不存在"
+            case EACCES, EPERM:
+                return "没有权限检查或读取文件"
+            case ELOOP:
+                return "拒绝编辑符号链接"
+            default:
+                return "无法完成文件安全检查"
+            }
+        }
+        return "无法完成文件安全检查"
+    }
+
+    private func copyFailureDetail(_ error: Error) -> String {
+        guard let error = error as? SafeMetadataFileSystemError else {
+            return "文件复制失败"
+        }
+        switch error.code {
+        case ENOSPC, EDQUOT:
+            return "磁盘空间不足"
+        case EACCES, EPERM:
+            return "没有创建副本的权限"
+        case ELOOP:
+            return "源文件或目标路径包含符号链接"
+        case EXDEV:
+            return "无法在同一文件系统中创建副本"
+        default:
+            return "文件复制失败"
+        }
+    }
+
+    private func swapFailureMessage(_ error: Error) -> String {
+        if error is SafeMetadataCoordinationError {
+            return "无法协调原文件替换"
+        }
+        guard let error = error as? SafeMetadataFileSystemError else {
+            return "无法原子提交修改"
+        }
+        switch error.code {
+        case EACCES, EPERM:
+            return "无法原子提交修改：没有替换权限"
+        case EXDEV:
+            return "无法原子提交修改：工作副本与原文件不在同一卷"
+        case ENOSPC, EDQUOT:
+            return "无法原子提交修改：磁盘空间不足"
+        case EBUSY:
+            return "无法原子提交修改：文件正被占用"
+        default:
+            return "无法原子提交修改"
+        }
     }
 
     private func result(
@@ -286,37 +628,54 @@ public actor SafeMetadataWriter: SafeMetadataWriting {
     ) -> BatchFileResult {
         BatchFileResult(url: url, status: status, message: message)
     }
-
-    private func isFileExistsError(_ error: Error) -> Bool {
-        let cocoaError = error as NSError
-        return cocoaError.domain == NSCocoaErrorDomain
-            && cocoaError.code == CocoaError.fileWriteFileExists.rawValue
-    }
-
-    private func errorMessage(_ error: Error) -> String {
-        switch error {
-        case let MetadataServiceError.unreadable(message),
-             let MetadataServiceError.unsupported(message),
-             let MetadataServiceError.notWritable(message),
-             let MetadataServiceError.saveFailed(message),
-             let MetadataServiceError.verificationFailed(message):
-            return message
-        case SafeMetadataWriterError.unableToReserveTemporaryName:
-            return "无法生成不冲突的临时文件名"
-        default:
-            return error.localizedDescription
-        }
-    }
 }
 
-private struct OriginalFileSnapshot: Equatable {
-    let systemNumber: UInt64?
-    let systemFileNumber: UInt64?
-    let fileSize: UInt64?
-    let modificationDate: Date?
-    let posixPermissions: UInt16?
+private struct OriginalFileSnapshot: Sendable {
+    let nodeState: SafeMetadataFileNodeState
+    let digest: Data
 }
 
-private enum SafeMetadataWriterError: Error {
-    case unableToReserveTemporaryName
+private struct OwnedTemporaryFile: Sendable {
+    let url: URL
+    let identity: SafeMetadataFileIdentity
+}
+
+private enum CleanupOutcome {
+    case removed
+    case notNeeded
+    case identityMismatch
+    case ownershipUnknown
+    case failed(String)
+}
+
+private struct CoordinatedCommitResult {
+    let outcome: CommitOutcome
+    let temporary: OwnedTemporaryFile
+}
+
+private struct CoordinatedCommitFailure: Error {
+    let cause: Error
+    let temporary: OwnedTemporaryFile
+}
+
+private enum CommitOutcome {
+    case cancelled
+    case swapped(warning: String?)
+}
+
+private struct CommitValidationError: Error {
+    let message: String
+}
+
+private struct TemporaryCreationError: Error {
+    let message: String
+}
+
+private enum InitialValidationError: Error {
+    case symbolicLink
+    case notRegularFile
+    case hardLinked
+    case notReadable
+    case notWritable
+    case changedDuringInspection
 }
