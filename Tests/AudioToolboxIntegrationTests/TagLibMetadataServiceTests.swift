@@ -14,24 +14,29 @@ struct TagLibMetadataServiceTests {
             #expect(metadata.title == "Fixture Title", "Unexpected title for \(name)")
             #expect(metadata.artists.first == "Original Artist", "Unexpected artist for \(name)")
             #expect(metadata.albums.first == "Original Album", "Unexpected album for \(name)")
-            #expect((metadata.duration ?? 0) > 0, "Missing duration for \(name)")
+            #expect(
+                (0.1...1.0).contains(metadata.duration ?? 0),
+                "Unexpected duration for \(name): \(String(describing: metadata.duration))"
+            )
         }
     }
 
-    @Test("raw AAC is readable or fails without crashing")
-    func rawAACIsReadableOrFailsCleanly() async throws {
+    @Test("raw AAC without tags is explicitly unreadable")
+    func rawAACWithoutTagsIsUnreadable() async throws {
         let service = TagLibMetadataService()
         let url = try fixtureURL("sample.aac")
 
         do {
-            let metadata = try await service.read(url: url)
-            #expect((metadata.duration ?? 0) > 0)
+            _ = try await service.read(url: url)
+            Issue.record("Expected untagged raw AAC to be unreadable")
         } catch let error as MetadataServiceError {
             guard case let .unreadable(message) = error else {
                 Issue.record("Unexpected metadata error: \(error)")
                 return
             }
             #expect(!message.isEmpty)
+        } catch {
+            Issue.record("Unexpected error type: \(error)")
         }
     }
 
