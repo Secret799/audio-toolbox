@@ -14,11 +14,15 @@ let package = Package(
     ],
     targets: [
         .target(
+            name: "CSafeFileBridge",
+            publicHeadersPath: "include"
+        ),
+        .target(
             name: "CTagLibBridge",
             dependencies: [.product(name: "taglib", package: "CXXTagLib")],
             publicHeadersPath: "include"
         ),
-        .target(name: "AudioToolboxCore", dependencies: ["CTagLibBridge"]),
+        .target(name: "AudioToolboxCore", dependencies: ["CTagLibBridge", "CSafeFileBridge"]),
         .target(name: "AudioToolboxUI", dependencies: ["AudioToolboxCore"]),
         .executableTarget(name: "AudioToolbox", dependencies: ["AudioToolboxUI"]),
         .testTarget(name: "AudioToolboxCoreTests", dependencies: ["AudioToolboxCore"]),

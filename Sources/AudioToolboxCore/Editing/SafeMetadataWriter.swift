@@ -5,7 +5,7 @@ public protocol SafeMetadataWriting: Sendable {
 }
 
 public actor SafeMetadataWriter: SafeMetadataWriting {
-    private static let maximumTemporaryNameAttempts = 16
+    private static let maximumWorkspaceNameAttempts = 16
 
     private let metadataService: any MetadataService
     private let fileOperations: SafeMetadataFileOperations
@@ -18,7 +18,7 @@ public actor SafeMetadataWriter: SafeMetadataWriting {
     ) {
         self.metadataService = metadataService
         fileOperations = .live(fileManager: fileManager)
-        commitGate = { !Task.isCancelled }
+        commitGate = { true }
         temporaryIdentifierProvider = { UUID().uuidString }
     }
 
@@ -35,16 +35,45 @@ public actor SafeMetadataWriter: SafeMetadataWriting {
     }
 
     public func apply(to url: URL, patch: MetadataPatch) async -> BatchFileResult {
-        guard !Task.isCancelled else {
+        let cancellationFlag: SafeMetadataCancellationFlag
+        do {
+            cancellationFlag = try SafeMetadataCancellationFlag()
+        } catch {
+            return result(for: url, status: .failed, message: "无法初始化安全写入状态")
+        }
+
+        return await withTaskCancellationHandler {
+            await applyInternal(to: url, patch: patch, cancellationFlag: cancellationFlag)
+        } onCancel: {
+            cancellationFlag.cancel()
+        }
+    }
+
+    private func applyInternal(
+        to url: URL,
+        patch: MetadataPatch,
+        cancellationFlag: SafeMetadataCancellationFlag
+    ) async -> BatchFileResult {
+        guard !cancellationFlag.isCancelled else {
             return result(for: url, status: .notProcessed, message: "操作已取消")
         }
         guard patch.artist != nil || patch.album != nil else {
             return result(for: url, status: .failed, message: "没有需要写入的标签")
         }
 
-        let originalSnapshot: OriginalFileSnapshot
+        let operations = fileOperations
+        let initialSnapshot: SafeMetadataFileSnapshot
         do {
-            originalSnapshot = try initialSnapshot(for: url)
+            initialSnapshot = try await Self.runBlocking {
+                try operations.snapshotURL(url, cancellationFlag)
+            }
+            try validateInitialSnapshot(
+                initialSnapshot,
+                url: url,
+                operations: operations
+            )
+        } catch is CancellationError {
+            return result(for: url, status: .notProcessed, message: "操作已取消")
         } catch {
             return result(
                 for: url,
@@ -54,125 +83,156 @@ public actor SafeMetadataWriter: SafeMetadataWriting {
         }
 
         let canWrite = await metadataService.canWrite(url: url)
-        guard !Task.isCancelled else {
+        guard !cancellationFlag.isCancelled else {
             return result(for: url, status: .notProcessed, message: "操作已取消")
         }
         guard canWrite else {
             return result(for: url, status: .failed, message: "文件格式不支持标签写入")
         }
 
-        let temporary: OwnedTemporaryFile
+        let ownedWork: OwnedWorkFile
         do {
-            temporary = try createTemporaryCopy(of: url)
-        } catch let error as TemporaryCreationError {
+            ownedWork = try await createOwnedWorkFile(
+                originalURL: url,
+                cancellationFlag: cancellationFlag
+            )
+        } catch let error as WorkspaceCancellationError {
+            return result(for: url, status: .notProcessed, message: error.message)
+        } catch is CancellationError {
+            return result(for: url, status: .notProcessed, message: "操作已取消")
+        } catch let error as WorkspaceCreationError {
             return result(for: url, status: .failed, message: error.message)
         } catch {
-            return result(
-                for: url,
-                status: .failed,
-                message: "无法创建安全工作副本：\(copyFailureDetail(error))"
-            )
+            return result(for: url, status: .failed, message: copyFailureMessage(error))
         }
 
-        guard !Task.isCancelled else {
-            return preCommitResult(
-                for: url,
+        guard !cancellationFlag.isCancelled else {
+            return await finishBeforeCommit(
+                url: url,
                 status: .notProcessed,
                 message: "操作已取消",
-                temporary: temporary
-            )
-        }
-
-        let preWriteState: SafeMetadataFileNodeState
-        do {
-            preWriteState = try fileOperations.nodeState(temporary.url)
-        } catch {
-            return preCommitResult(
-                for: url,
-                status: .failed,
-                message: "工作副本身份发生变化，已拒绝写入",
-                temporary: temporary
-            )
-        }
-        guard preWriteState.identity == temporary.identity,
-              preWriteState.isRegularFile,
-              preWriteState.linkCount == 1
-        else {
-            return preCommitResult(
-                for: url,
-                status: .failed,
-                message: "工作副本身份发生变化，已拒绝写入",
-                temporary: temporary
+                ownedWork: ownedWork
             )
         }
 
         do {
-            try await metadataService.write(url: temporary.url, patch: patch)
-        } catch is CancellationError where Task.isCancelled {
-            return preCommitResult(
-                for: url,
+            try await Self.runBlocking {
+                try operations.validateWorkspacePath(
+                    ownedWork.workspace,
+                    ownedWork.identity
+                )
+            }
+        } catch {
+            return await finishBeforeCommit(
+                url: url,
+                status: .failed,
+                message: "私有工作区路径身份发生变化，已拒绝写入",
+                ownedWork: ownedWork
+            )
+        }
+
+        guard !cancellationFlag.isCancelled else {
+            return await finishBeforeCommit(
+                url: url,
                 status: .notProcessed,
                 message: "操作已取消",
-                temporary: temporary
+                ownedWork: ownedWork
+            )
+        }
+
+        do {
+            try await metadataService.write(url: ownedWork.workspace.fileURL, patch: patch)
+        } catch is CancellationError where cancellationFlag.isCancelled {
+            return await finishBeforeCommit(
+                url: url,
+                status: .notProcessed,
+                message: "操作已取消",
+                ownedWork: ownedWork
             )
         } catch {
-            return preCommitResult(
-                for: url,
+            return await finishBeforeCommit(
+                url: url,
                 status: .failed,
                 message: "元数据写入失败",
-                temporary: temporary
+                ownedWork: ownedWork
             )
         }
 
-        let editedState: SafeMetadataFileNodeState
+        let writtenSnapshot: SafeMetadataFileSnapshot
         do {
-            editedState = try fileOperations.nodeState(temporary.url)
-        } catch {
-            return preCommitResult(
-                for: url,
-                status: .failed,
-                message: "工作副本身份发生变化，已拒绝提交",
-                temporary: temporary
-            )
-        }
-        guard editedState.identity == preWriteState.identity,
-              editedState.identity == temporary.identity,
-              editedState.isRegularFile,
-              editedState.linkCount == 1
-        else {
-            return preCommitResult(
-                for: url,
-                status: .failed,
-                message: "工作副本身份发生变化，已拒绝提交",
-                temporary: temporary
-            )
-        }
-
-        guard !Task.isCancelled else {
-            return preCommitResult(
-                for: url,
+            writtenSnapshot = try await Self.runBlocking {
+                try operations.validateWorkspacePath(
+                    ownedWork.workspace,
+                    ownedWork.identity
+                )
+                return try operations.snapshotWorkspace(
+                    ownedWork.workspace,
+                    cancellationFlag
+                )
+            }
+            guard writtenSnapshot.nodeState.identity == ownedWork.identity,
+                  writtenSnapshot.nodeState.isRegularFile,
+                  writtenSnapshot.nodeState.linkCount == 1
+            else {
+                throw WorkValidationError.identityChanged
+            }
+        } catch is CancellationError {
+            return await finishBeforeCommit(
+                url: url,
                 status: .notProcessed,
                 message: "操作已取消",
-                temporary: temporary
+                ownedWork: ownedWork
+            )
+        } catch {
+            return await finishBeforeCommit(
+                url: url,
+                status: .failed,
+                message: "工作副本身份发生变化，已拒绝提交",
+                ownedWork: ownedWork
+            )
+        }
+
+        do {
+            try await Self.runBlocking {
+                try operations.validateWorkspacePath(
+                    ownedWork.workspace,
+                    ownedWork.identity
+                )
+            }
+        } catch {
+            return await finishBeforeCommit(
+                url: url,
+                status: .failed,
+                message: "私有工作区路径身份发生变化，已拒绝验证",
+                ownedWork: ownedWork
+            )
+        }
+
+        guard !cancellationFlag.isCancelled else {
+            return await finishBeforeCommit(
+                url: url,
+                status: .notProcessed,
+                message: "操作已取消",
+                ownedWork: ownedWork
             )
         }
 
         let savedMetadata: AudioMetadata
         do {
-            savedMetadata = try await metadataService.read(url: temporary.url)
-        } catch is CancellationError where Task.isCancelled {
-            return preCommitResult(
-                for: url,
+            savedMetadata = try await metadataService.read(url: ownedWork.workspace.fileURL)
+        } catch is CancellationError where cancellationFlag.isCancelled {
+            return await finishBeforeCommit(
+                url: url,
                 status: .notProcessed,
                 message: "操作已取消",
-                temporary: temporary
+                ownedWork: ownedWork
             )
         } catch {
-            return preCommitResult(
-                for: url,
+            return await finishBeforeCommit(
+                url: url,
                 status: .failed,
                 message: "写入后验证失败：无法读取工作副本",
-                temporary: temporary
+                ownedWork: ownedWork
             )
         }
 
@@ -180,325 +240,593 @@ public actor SafeMetadataWriter: SafeMetadataWriting {
             metadata: savedMetadata,
             patch: patch
         ) {
-            return preCommitResult(
-                for: url,
+            return await finishBeforeCommit(
+                url: url,
                 status: .failed,
                 message: verificationMessage,
-                temporary: temporary
+                ownedWork: ownedWork
             )
         }
 
-        guard !Task.isCancelled else {
-            return preCommitResult(
-                for: url,
-                status: .notProcessed,
-                message: "操作已取消",
-                temporary: temporary
-            )
-        }
-
+        let editedExpected: SafeMetadataFileSnapshot
         do {
-            let currentTemporaryState = try fileOperations.nodeState(temporary.url)
-            guard currentTemporaryState.identity == temporary.identity else {
-                return preCommitResult(
-                    for: url,
-                    status: .failed,
-                    message: "工作副本身份发生变化，已拒绝提交",
-                    temporary: temporary
+            editedExpected = try await Self.runBlocking {
+                try operations.validateWorkspacePath(
+                    ownedWork.workspace,
+                    ownedWork.identity
+                )
+                return try operations.snapshotWorkspace(
+                    ownedWork.workspace,
+                    cancellationFlag
                 )
             }
-        } catch {
-            return preCommitResult(
-                for: url,
-                status: .failed,
-                message: "工作副本身份发生变化，已拒绝提交",
-                temporary: temporary
-            )
-        }
-
-        let coordinatedResult: CoordinatedCommitResult
-        do {
-            coordinatedResult = try coordinatedCommit(
-                originalURL: url,
-                originalSnapshot: originalSnapshot,
-                temporary: temporary
-            )
-        } catch let failure as CoordinatedCommitFailure {
-            let message: String
-            if let validationError = failure.cause as? CommitValidationError {
-                message = validationError.message
-            } else {
-                message = swapFailureMessage(failure.cause)
+            guard editedExpected == writtenSnapshot else {
+                throw WorkValidationError.changedAfterVerification
             }
-            return preCommitResult(
-                for: url,
-                status: .failed,
-                message: message,
-                temporary: failure.temporary
-            )
-        } catch {
-            return preCommitResult(
-                for: url,
-                status: .failed,
-                message: swapFailureMessage(error),
-                temporary: temporary
-            )
-        }
-
-        switch coordinatedResult.outcome {
-        case .cancelled:
-            return preCommitResult(
-                for: url,
+        } catch is CancellationError {
+            return await finishBeforeCommit(
+                url: url,
                 status: .notProcessed,
                 message: "操作已取消",
-                temporary: coordinatedResult.temporary
+                ownedWork: ownedWork
             )
-        case let .swapped(warning):
-            return result(for: url, status: .succeeded, message: warning)
+        } catch {
+            return await finishBeforeCommit(
+                url: url,
+                status: .failed,
+                message: "已验证工作副本在读取期间发生变化，已拒绝提交",
+                ownedWork: ownedWork
+            )
+        }
+
+        guard !cancellationFlag.isCancelled else {
+            return await finishBeforeCommit(
+                url: url,
+                status: .notProcessed,
+                message: "操作已取消",
+                ownedWork: ownedWork
+            )
+        }
+
+        let gate = commitGate
+        let commitResult: CommitExecutionResult
+        do {
+            commitResult = try await Self.runBlocking {
+                try Self.executeCommit(
+                    originalURL: url,
+                    initialSnapshot: initialSnapshot,
+                    editedExpected: editedExpected,
+                    ownedWork: ownedWork,
+                    operations: operations,
+                    cancellationFlag: cancellationFlag,
+                    commitGate: gate
+                )
+            }
+        } catch is CancellationError {
+            return await finishBeforeCommit(
+                url: url,
+                status: .notProcessed,
+                message: "操作已取消",
+                ownedWork: ownedWork
+            )
+        } catch {
+            return await finishBeforeCommit(
+                url: url,
+                status: .failed,
+                message: Self.commitFailureMessage(error),
+                ownedWork: ownedWork
+            )
+        }
+
+        switch commitResult.disposition {
+        case let .committed(coordinatorTailWarning):
+            let cleanup = await cleanupWorkspace(
+                ownedWork.workspace,
+                expectedFileIdentity: commitResult.cleanupIdentity
+            )
+            var messages: [String] = []
+            if coordinatorTailWarning {
+                messages.append("修改已提交，但文件协调收尾异常")
+            }
+            if let warning = cleanup.warning {
+                messages.append(warning)
+            }
+            return result(
+                for: url,
+                status: .succeeded,
+                message: messages.isEmpty ? nil : messages.joined(separator: "；")
+            )
+
+        case let .rolledBack(coordinatorTailWarning):
+            let cleanup = await cleanupWorkspace(
+                ownedWork.workspace,
+                expectedFileIdentity: editedExpected.nodeState.identity
+            )
+            var message = "提交后检测到并发修改，已安全回滚"
+            if coordinatorTailWarning {
+                message += "；文件协调收尾异常"
+            }
+            if let warning = cleanup.warning {
+                message += "；\(warning)"
+            }
+            return result(for: url, status: .failed, message: message)
+
+        case let .cancelled(coordinatorTailWarning):
+            let cleanup = await cleanupWorkspace(
+                ownedWork.workspace,
+                expectedFileIdentity: editedExpected.nodeState.identity
+            )
+            var message = "操作已取消"
+            if coordinatorTailWarning {
+                message += "；文件协调收尾异常"
+            }
+            if let warning = cleanup.warning {
+                message += "；\(warning)"
+            }
+            return result(for: url, status: .notProcessed, message: message)
+
+        case let .preSwapFailed(message, coordinatorTailWarning):
+            let cleanup = await cleanupWorkspace(
+                ownedWork.workspace,
+                expectedFileIdentity: editedExpected.nodeState.identity
+            )
+            var finalMessage = message
+            if coordinatorTailWarning {
+                finalMessage += "；文件协调收尾异常"
+            }
+            if let warning = cleanup.warning {
+                finalMessage += "；\(warning)"
+            }
+            return result(for: url, status: .failed, message: finalMessage)
+
+        case let .uncertain(message):
+            ownedWork.workspace.closeDescriptors()
+            return result(
+                for: url,
+                status: .failed,
+                message: "\(message)；提交状态不确定，恢复文件路径：\(ownedWork.workspace.fileURL.path)"
+            )
         }
     }
 
-    private func initialSnapshot(for url: URL) throws -> OriginalFileSnapshot {
-        let before = try fileOperations.nodeState(url)
-        if before.isSymbolicLink {
+    private func validateInitialSnapshot(
+        _ snapshot: SafeMetadataFileSnapshot,
+        url: URL,
+        operations: SafeMetadataFileOperations
+    ) throws {
+        if snapshot.nodeState.isSymbolicLink {
             throw InitialValidationError.symbolicLink
         }
-        guard before.isRegularFile else {
+        guard snapshot.nodeState.isRegularFile else {
             throw InitialValidationError.notRegularFile
         }
-        guard before.linkCount == 1 else {
+        guard snapshot.nodeState.linkCount == 1 else {
             throw InitialValidationError.hardLinked
         }
-        guard fileOperations.isReadable(url) else {
+        guard operations.isReadable(url) else {
             throw InitialValidationError.notReadable
         }
-        guard fileOperations.isWritable(url) else {
+        guard operations.isWritable(url) else {
             throw InitialValidationError.notWritable
         }
-
-        let digest = try fileOperations.digest(url)
-        let after = try fileOperations.nodeState(url)
-        guard before == after else {
-            throw InitialValidationError.changedDuringInspection
-        }
-        return OriginalFileSnapshot(nodeState: after, digest: digest)
     }
 
-    private func createTemporaryCopy(of originalURL: URL) throws -> OwnedTemporaryFile {
-        let directory = originalURL.deletingLastPathComponent()
-        let pathExtension = originalURL.pathExtension
-
-        for _ in 0..<Self.maximumTemporaryNameAttempts {
+    private func createOwnedWorkFile(
+        originalURL: URL,
+        cancellationFlag: SafeMetadataCancellationFlag
+    ) async throws -> OwnedWorkFile {
+        let operations = fileOperations
+        for _ in 0..<Self.maximumWorkspaceNameAttempts {
+            if cancellationFlag.isCancelled { throw CancellationError() }
             let identifier = temporaryIdentifierProvider()
-            let baseName = ".audio-toolbox-\(identifier)"
-            let fileName = pathExtension.isEmpty ? baseName : "\(baseName).\(pathExtension)"
-            let candidate = directory.appendingPathComponent(fileName, isDirectory: false)
+            let workspace: SafeMetadataWorkspace
+            do {
+                workspace = try await Self.runBlocking {
+                    try operations.createWorkspace(originalURL, identifier)
+                }
+            } catch let error as SafeMetadataFileSystemError where error.code == EEXIST {
+                continue
+            } catch let error as SafeMetadataWorkspaceSetupError {
+                throw WorkspaceCreationError(
+                    message: "无法完成私有工作目录初始化；为避免误删已保守保留：\(error.preservedURL.path)"
+                )
+            }
 
             do {
-                let copiedState = try fileOperations.copyExclusive(originalURL, candidate)
+                let copiedState = try await Self.runBlocking {
+                    try operations.copyIntoWorkspace(
+                        originalURL,
+                        workspace,
+                        cancellationFlag
+                    )
+                }
                 guard copiedState.isRegularFile,
                       copiedState.linkCount == 1
                 else {
-                    let temporary = OwnedTemporaryFile(
-                        url: candidate,
-                        identity: copiedState.identity
+                    let cleanup = await cleanupWorkspace(
+                        workspace,
+                        expectedFileIdentity: copiedState.identity
                     )
-                    let cleanup = cleanupOwnedTemporaryFile(temporary)
-                    throw TemporaryCreationError(
-                        message: appendCleanupMessage(
+                    throw WorkspaceCreationError(
+                        message: appendCleanupWarning(
                             "无法创建安全工作副本：副本类型不安全",
-                            cleanup
+                            cleanup.warning
                         )
                     )
                 }
-                return OwnedTemporaryFile(url: candidate, identity: copiedState.identity)
-            } catch let error as SafeMetadataFileSystemError where error.code == EEXIST {
-                continue
-            } catch let error as TemporaryCreationError {
-                throw error
+                return OwnedWorkFile(
+                    workspace: workspace,
+                    identity: copiedState.identity
+                )
+            } catch is CancellationError {
+                let cleanup = await cleanupWorkspace(
+                    workspace,
+                    expectedFileIdentity: nil
+                )
+                throw WorkspaceCancellationError(
+                    message: appendCleanupWarning("操作已取消", cleanup.warning)
+                )
             } catch let error as SafeMetadataFileSystemError {
-                let cleanup: CleanupOutcome
-                if let ownedState = error.ownedNodeState {
-                    cleanup = cleanupOwnedTemporaryFile(
-                        OwnedTemporaryFile(url: candidate, identity: ownedState.identity)
+                let cleanup = await cleanupWorkspace(
+                    workspace,
+                    expectedFileIdentity: error.ownedNodeState?.identity
+                )
+                if error.code == ECANCELED || cancellationFlag.isCancelled {
+                    throw WorkspaceCancellationError(
+                        message: appendCleanupWarning("操作已取消", cleanup.warning)
                     )
-                } else {
-                    cleanup = cleanupCandidateWithoutOwnership(at: candidate)
                 }
-                throw TemporaryCreationError(
-                    message: appendCleanupMessage(
-                        "无法创建安全工作副本：\(copyFailureDetail(error))",
-                        cleanup
+                throw WorkspaceCreationError(
+                    message: appendCleanupWarning(
+                        copyFailureMessage(error),
+                        cleanup.warning
                     )
                 )
             } catch {
-                throw TemporaryCreationError(
-                    message: "无法创建安全工作副本：文件复制失败"
+                let cleanup = await cleanupWorkspace(
+                    workspace,
+                    expectedFileIdentity: nil
+                )
+                throw WorkspaceCreationError(
+                    message: appendCleanupWarning(
+                        "无法创建安全工作副本：文件复制失败",
+                        cleanup.warning
+                    )
                 )
             }
         }
-
-        throw TemporaryCreationError(message: "无法创建安全工作副本：临时文件名持续冲突")
+        throw WorkspaceCreationError(message: "无法创建安全工作副本：私有工作目录名持续冲突")
     }
 
-    private func coordinatedCommit(
-        originalURL: URL,
-        originalSnapshot: OriginalFileSnapshot,
-        temporary: OwnedTemporaryFile
-    ) throws -> CoordinatedCommitResult {
-        var coordinatedTemporary = temporary
-        var outcome: CommitOutcome?
-        do {
-            try fileOperations.coordinateReplacing(
-                originalURL,
-                temporary.url
-            ) { coordinatedOriginal, coordinatedTemporaryURL in
-                coordinatedTemporary = OwnedTemporaryFile(
-                    url: coordinatedTemporaryURL,
-                    identity: temporary.identity
-                )
-                outcome = try commitInsideCoordination(
-                    originalURL: coordinatedOriginal,
-                    originalSnapshot: originalSnapshot,
-                    temporary: coordinatedTemporary
-                )
-            }
-        } catch {
-            throw CoordinatedCommitFailure(
-                cause: error,
-                temporary: coordinatedTemporary
-            )
-        }
-        guard let outcome else {
-            throw CoordinatedCommitFailure(
-                cause: CommitValidationError(message: "无法进入原文件替换协调区"),
-                temporary: coordinatedTemporary
-            )
-        }
-        return CoordinatedCommitResult(
-            outcome: outcome,
-            temporary: coordinatedTemporary
-        )
-    }
-
-    private func commitInsideCoordination(
-        originalURL: URL,
-        originalSnapshot: OriginalFileSnapshot,
-        temporary: OwnedTemporaryFile
-    ) throws -> CommitOutcome {
-        let before = try fileOperations.nodeState(originalURL)
-        guard before == originalSnapshot.nodeState else {
-            throw CommitValidationError(message: "原文件在编辑期间发生变化，已取消替换")
-        }
-        let digest = try fileOperations.digest(originalURL)
-        let after = try fileOperations.nodeState(originalURL)
-        guard before == after,
-              after == originalSnapshot.nodeState
-        else {
-            throw CommitValidationError(message: "原文件在编辑期间发生变化，已取消替换")
-        }
-        guard digest == originalSnapshot.digest else {
-            throw CommitValidationError(message: "原文件内容已发生变化，已取消替换")
-        }
-
-        let temporaryState = try fileOperations.nodeState(temporary.url)
-        guard temporaryState.identity == temporary.identity,
-              temporaryState.isRegularFile,
-              temporaryState.linkCount == 1
-        else {
-            throw CommitValidationError(message: "工作副本身份发生变化，已拒绝提交")
-        }
-
-        guard commitGate() else {
-            return .cancelled
-        }
-
-        try fileOperations.swap(originalURL, temporary.url)
-        return postSwapOutcome(
-            originalURL: originalURL,
-            originalIdentity: originalSnapshot.nodeState.identity,
-            editedIdentity: temporary.identity,
-            recoveryURL: temporary.url
-        )
-    }
-
-    private func postSwapOutcome(
-        originalURL: URL,
-        originalIdentity: SafeMetadataFileIdentity,
-        editedIdentity: SafeMetadataFileIdentity,
-        recoveryURL: URL
-    ) -> CommitOutcome {
-        let warning = "修改已提交，但隐藏恢复副本 \(recoveryURL.lastPathComponent) 已保留，请确认文件后手动处理"
-        do {
-            let committedState = try fileOperations.nodeState(originalURL)
-            let recoveryState = try fileOperations.nodeState(recoveryURL)
-            guard committedState.identity == editedIdentity,
-                  committedState.isRegularFile,
-                  recoveryState.identity == originalIdentity,
-                  recoveryState.isRegularFile,
-                  recoveryState.linkCount == 1
-            else {
-                return .swapped(warning: warning)
-            }
-            do {
-                try fileOperations.unlink(recoveryURL)
-                return .swapped(warning: nil)
-            } catch {
-                return .swapped(
-                    warning: "修改已提交，但旧文件恢复副本 \(recoveryURL.lastPathComponent) 未能清理（\(cleanupFailureDetail(error))），已保留供恢复"
-                )
-            }
-        } catch {
-            return .swapped(warning: warning)
-        }
-    }
-
-    private func preCommitResult(
-        for url: URL,
+    private func finishBeforeCommit(
+        url: URL,
         status: BatchFileStatus,
         message: String,
-        temporary: OwnedTemporaryFile
-    ) -> BatchFileResult {
-        let cleanup = cleanupOwnedTemporaryFile(temporary)
+        ownedWork: OwnedWorkFile
+    ) async -> BatchFileResult {
+        let cleanup = await cleanupWorkspace(
+            ownedWork.workspace,
+            expectedFileIdentity: ownedWork.identity
+        )
         return result(
             for: url,
             status: status,
-            message: appendCleanupMessage(message, cleanup)
+            message: appendCleanupWarning(message, cleanup.warning)
         )
     }
 
-    private func cleanupCandidateWithoutOwnership(at url: URL) -> CleanupOutcome {
-        do {
-            _ = try fileOperations.nodeState(url)
-            return .ownershipUnknown
-        } catch let error as SafeMetadataFileSystemError where error.code == ENOENT {
-            return .notNeeded
-        } catch {
-            return .failed("无法确认临时路径状态")
+    private func cleanupWorkspace(
+        _ workspace: SafeMetadataWorkspace,
+        expectedFileIdentity: SafeMetadataFileIdentity?
+    ) async -> WorkspaceCleanupReport {
+        let operations = fileOperations
+        return await (try? Self.runBlocking {
+            Self.cleanupWorkspaceSynchronously(
+                workspace,
+                expectedFileIdentity: expectedFileIdentity,
+                operations: operations
+            )
+        }) ?? WorkspaceCleanupReport(
+            warning: "私有工作区清理失败，已保守保留：\(workspace.directoryURL.path)"
+        )
+    }
+
+    private nonisolated static func cleanupWorkspaceSynchronously(
+        _ workspace: SafeMetadataWorkspace,
+        expectedFileIdentity: SafeMetadataFileIdentity?,
+        operations: SafeMetadataFileOperations
+    ) -> WorkspaceCleanupReport {
+        defer { workspace.closeDescriptors() }
+
+        if let expectedFileIdentity {
+            switch operations.removeWorkspaceFileIfOwned(workspace, expectedFileIdentity) {
+            case .removed, .missing:
+                break
+            case let .identityMismatch(preservedURL):
+                return WorkspaceCleanupReport(
+                    warning: "私有工作文件身份已变化，为避免误删已保守保留：\(preservedURL.path)"
+                )
+            case let .failed(error, preservedURL):
+                let path = preservedURL ?? workspace.fileURL
+                return WorkspaceCleanupReport(
+                    warning: "私有工作文件未能清理（\(cleanupFailureDetail(error))），恢复文件路径：\(path.path)"
+                )
+            }
+        }
+
+        switch operations.removeWorkspaceDirectoryIfOwned(workspace) {
+        case .removed, .missing:
+            return WorkspaceCleanupReport(warning: nil)
+        case let .identityMismatch(preservedURL):
+            return WorkspaceCleanupReport(
+                warning: "私有工作目录路径身份已变化，为避免误删已保守保留：\(preservedURL.path)"
+            )
+        case let .failed(error, preservedURL):
+            let path = preservedURL ?? workspace.directoryURL
+            return WorkspaceCleanupReport(
+                warning: "私有工作目录未能清理（\(cleanupFailureDetail(error))），已保留：\(path.path)"
+            )
         }
     }
 
-    private func cleanupOwnedTemporaryFile(
-        _ temporary: OwnedTemporaryFile
-    ) -> CleanupOutcome {
-        let state: SafeMetadataFileNodeState
+    private nonisolated static func executeCommit(
+        originalURL: URL,
+        initialSnapshot: SafeMetadataFileSnapshot,
+        editedExpected: SafeMetadataFileSnapshot,
+        ownedWork: OwnedWorkFile,
+        operations: SafeMetadataFileOperations,
+        cancellationFlag: SafeMetadataCancellationFlag,
+        commitGate: @Sendable () -> Bool
+    ) throws -> CommitExecutionResult {
+        let uncancellableFlag = try SafeMetadataCancellationFlag()
+        var observed = ObservedCommitState.notStarted
+
         do {
-            state = try fileOperations.nodeState(temporary.url)
-        } catch let error as SafeMetadataFileSystemError where error.code == ENOENT {
-            return .notNeeded
+            try operations.coordinateReplacing(
+                originalURL,
+                ownedWork.workspace.fileURL
+            ) { coordinatedOriginal, coordinatedWork in
+                let commitOriginal = try operations.snapshotURL(
+                    coordinatedOriginal,
+                    cancellationFlag
+                )
+                guard commitOriginal == initialSnapshot else {
+                    observed = .preSwapFailed("原文件在编辑期间发生变化，已取消替换")
+                    return
+                }
+
+                try operations.validateWorkspacePath(
+                    ownedWork.workspace,
+                    editedExpected.nodeState.identity
+                )
+                let coordinatedWorkSnapshot = try operations.snapshotURL(
+                    coordinatedWork,
+                    cancellationFlag
+                )
+                let workspaceSnapshot = try operations.snapshotWorkspace(
+                    ownedWork.workspace,
+                    cancellationFlag
+                )
+                guard coordinatedWorkSnapshot == editedExpected,
+                      workspaceSnapshot == editedExpected
+                else {
+                    observed = .preSwapFailed("已验证工作副本在提交前发生变化，已取消替换")
+                    return
+                }
+
+                guard !cancellationFlag.isCancelled,
+                      commitGate()
+                else {
+                    observed = .cancelled
+                    return
+                }
+
+                do {
+                    try operations.swap(coordinatedOriginal, coordinatedWork)
+                } catch {
+                    observed = Self.inspectAfterSwapError(
+                        originalURL: coordinatedOriginal,
+                        workURL: coordinatedWork,
+                        commitOriginal: commitOriginal,
+                        editedExpected: editedExpected,
+                        ownedWork: ownedWork,
+                        operations: operations,
+                        uncancellableFlag: uncancellableFlag
+                    )
+                    if case .notStarted = observed {
+                        observed = .preSwapFailed(swapFailureMessage(error))
+                    }
+                    return
+                }
+
+                observed = Self.resolvePostSwapState(
+                    originalURL: coordinatedOriginal,
+                    workURL: coordinatedWork,
+                    commitOriginal: commitOriginal,
+                    editedExpected: editedExpected,
+                    ownedWork: ownedWork,
+                    operations: operations,
+                    uncancellableFlag: uncancellableFlag
+                )
+            }
         } catch {
-            return .failed("无法确认临时文件身份")
+            if case .notStarted = observed,
+               error is CancellationError || cancellationFlag.isCancelled
+            {
+                observed = .cancelled
+            }
+            return Self.resultAfterCoordinatorError(
+                observed: observed,
+                fallbackError: error,
+                editedExpected: editedExpected
+            )
         }
 
-        guard state.identity == temporary.identity else {
-            return .identityMismatch
-        }
+        return Self.executionResult(
+            observed: observed,
+            coordinatorTailWarning: false,
+            editedExpected: editedExpected
+        )
+    }
+
+    private nonisolated static func resolvePostSwapState(
+        originalURL: URL,
+        workURL: URL,
+        commitOriginal: SafeMetadataFileSnapshot,
+        editedExpected: SafeMetadataFileSnapshot,
+        ownedWork: OwnedWorkFile,
+        operations: SafeMetadataFileOperations,
+        uncancellableFlag: SafeMetadataCancellationFlag
+    ) -> ObservedCommitState {
+        let originalAfter: SafeMetadataFileSnapshot
+        let recoveryAfter: SafeMetadataFileSnapshot
         do {
-            try fileOperations.unlink(temporary.url)
-            return .removed
+            originalAfter = try operations.snapshotURL(originalURL, uncancellableFlag)
+            recoveryAfter = try operations.snapshotWorkspace(
+                ownedWork.workspace,
+                uncancellableFlag
+            )
         } catch {
-            return .failed(cleanupFailureDetail(error))
+            return .uncertain("swap 后无法确认 original 或 recovery 的完整状态")
         }
+
+        if originalAfter.matchesAfterRename(editedExpected),
+           recoveryAfter.matchesAfterRename(commitOriginal)
+        {
+            return .committed(cleanupIdentity: recoveryAfter.nodeState.identity)
+        }
+
+        do {
+            try operations.swap(originalURL, workURL)
+            let restoredOriginal = try operations.snapshotURL(
+                originalURL,
+                uncancellableFlag
+            )
+            let restoredWork = try operations.snapshotWorkspace(
+                ownedWork.workspace,
+                uncancellableFlag
+            )
+            guard restoredOriginal.matchesAfterRename(recoveryAfter),
+                  restoredWork.matchesAfterRename(editedExpected)
+            else {
+                return .uncertain("回滚后文件状态无法验证")
+            }
+            return .rolledBack
+        } catch {
+            return .uncertain("检测到提交状态异常且自动回滚失败")
+        }
+    }
+
+    private nonisolated static func inspectAfterSwapError(
+        originalURL: URL,
+        workURL: URL,
+        commitOriginal: SafeMetadataFileSnapshot,
+        editedExpected: SafeMetadataFileSnapshot,
+        ownedWork: OwnedWorkFile,
+        operations: SafeMetadataFileOperations,
+        uncancellableFlag: SafeMetadataCancellationFlag
+    ) -> ObservedCommitState {
+        guard let original = try? operations.snapshotURL(originalURL, uncancellableFlag),
+              let coordinatedWork = try? operations.snapshotURL(workURL, uncancellableFlag),
+              let work = try? operations.snapshotWorkspace(
+                ownedWork.workspace,
+                uncancellableFlag
+              ),
+              coordinatedWork.matchesAfterRename(work)
+        else {
+            return .uncertain("原子交换报告失败且文件状态无法确认")
+        }
+        if original.matchesAfterRename(commitOriginal),
+           work.matchesAfterRename(editedExpected)
+        {
+            return .notStarted
+        }
+        if original.matchesAfterRename(editedExpected),
+           work.matchesAfterRename(commitOriginal)
+        {
+            return .committed(cleanupIdentity: work.nodeState.identity)
+        }
+        return .uncertain("原子交换报告失败且文件状态不一致")
+    }
+
+    private nonisolated static func resultAfterCoordinatorError(
+        observed: ObservedCommitState,
+        fallbackError: Error,
+        editedExpected: SafeMetadataFileSnapshot
+    ) -> CommitExecutionResult {
+        switch observed {
+        case .committed, .rolledBack, .cancelled, .preSwapFailed, .uncertain:
+            return executionResult(
+                observed: observed,
+                coordinatorTailWarning: true,
+                editedExpected: editedExpected
+            )
+        case .notStarted:
+            return CommitExecutionResult(
+                disposition: .preSwapFailed(
+                    commitFailureMessage(fallbackError),
+                    coordinatorTailWarning: false
+                ),
+                cleanupIdentity: editedExpected.nodeState.identity
+            )
+        }
+    }
+
+    private nonisolated static func executionResult(
+        observed: ObservedCommitState,
+        coordinatorTailWarning: Bool,
+        editedExpected: SafeMetadataFileSnapshot
+    ) -> CommitExecutionResult {
+        switch observed {
+        case let .committed(cleanupIdentity):
+            return CommitExecutionResult(
+                disposition: .committed(
+                    coordinatorTailWarning: coordinatorTailWarning
+                ),
+                cleanupIdentity: cleanupIdentity
+            )
+        case .rolledBack:
+            return CommitExecutionResult(
+                disposition: .rolledBack(
+                    coordinatorTailWarning: coordinatorTailWarning
+                ),
+                cleanupIdentity: editedExpected.nodeState.identity
+            )
+        case .cancelled:
+            return CommitExecutionResult(
+                disposition: .cancelled(
+                    coordinatorTailWarning: coordinatorTailWarning
+                ),
+                cleanupIdentity: editedExpected.nodeState.identity
+            )
+        case let .preSwapFailed(message):
+            return CommitExecutionResult(
+                disposition: .preSwapFailed(
+                    message,
+                    coordinatorTailWarning: coordinatorTailWarning
+                ),
+                cleanupIdentity: editedExpected.nodeState.identity
+            )
+        case let .uncertain(message):
+            return CommitExecutionResult(
+                disposition: .uncertain(message),
+                cleanupIdentity: nil
+            )
+        case .notStarted:
+            return CommitExecutionResult(
+                disposition: .preSwapFailed(
+                    "未进入原子提交阶段",
+                    coordinatorTailWarning: coordinatorTailWarning
+                ),
+                cleanupIdentity: editedExpected.nodeState.identity
+            )
+        }
+    }
+
+    private nonisolated static func runBlocking<T: Sendable>(
+        _ operation: @escaping @Sendable () throws -> T
+    ) async throws -> T {
+        try await Task.detached(priority: .utility, operation: operation).value
     }
 
     private func verificationFailureMessage(
@@ -518,38 +846,6 @@ public actor SafeMetadataWriter: SafeMetadataWriting {
         return nil
     }
 
-    private func appendCleanupMessage(
-        _ message: String,
-        _ cleanup: CleanupOutcome
-    ) -> String {
-        switch cleanup {
-        case .removed, .notNeeded:
-            return message
-        case .identityMismatch:
-            return "\(message)；临时路径已被其他文件占用，为避免误删未删除该隐藏文件"
-        case .ownershipUnknown:
-            return "\(message)；临时路径存在但无法确认所有权，为避免误删未删除该隐藏文件"
-        case let .failed(detail):
-            return "\(message)；临时工作文件清理失败：\(detail)，隐藏文件已保留"
-        }
-    }
-
-    private func cleanupFailureDetail(_ error: Error) -> String {
-        guard let error = error as? SafeMetadataFileSystemError else {
-            return "文件系统拒绝删除"
-        }
-        switch error.code {
-        case EACCES, EPERM:
-            return "没有删除权限"
-        case EBUSY:
-            return "文件正被占用"
-        case EROFS:
-            return "所在文件系统为只读"
-        default:
-            return "删除操作失败"
-        }
-    }
-
     private func initialFailureMessage(_ error: Error) -> String {
         if let error = error as? InitialValidationError {
             switch error {
@@ -563,10 +859,9 @@ public actor SafeMetadataWriter: SafeMetadataWriting {
                 return "文件不可读"
             case .notWritable:
                 return "文件不可写"
-            case .changedDuringInspection:
-                return "文件在安全检查期间发生变化"
             }
         }
+        if error is CancellationError { return "操作已取消" }
         if let error = error as? SafeMetadataFileSystemError {
             switch error.code {
             case ENOENT:
@@ -582,7 +877,11 @@ public actor SafeMetadataWriter: SafeMetadataWriting {
         return "无法完成文件安全检查"
     }
 
-    private func copyFailureDetail(_ error: Error) -> String {
+    private func copyFailureMessage(_ error: Error) -> String {
+        "无法创建安全工作副本：\(Self.copyFailureDetail(error))"
+    }
+
+    private nonisolated static func copyFailureDetail(_ error: Error) -> String {
         guard let error = error as? SafeMetadataFileSystemError else {
             return "文件复制失败"
         }
@@ -591,19 +890,29 @@ public actor SafeMetadataWriter: SafeMetadataWriting {
             return "磁盘空间不足"
         case EACCES, EPERM:
             return "没有创建副本的权限"
-        case ELOOP:
-            return "源文件或目标路径包含符号链接"
-        case EXDEV:
-            return "无法在同一文件系统中创建副本"
+        case ECANCELED:
+            return "操作已取消"
         default:
             return "文件复制失败"
         }
     }
 
-    private func swapFailureMessage(_ error: Error) -> String {
-        if error is SafeMetadataCoordinationError {
-            return "无法协调原文件替换"
+    private nonisolated static func commitFailureMessage(_ error: Error) -> String {
+        if error is CancellationError { return "操作已取消" }
+        guard let error = error as? SafeMetadataFileSystemError else {
+            return "无法完成原子提交"
         }
+        switch error.operation {
+        case .coordinate:
+            return "无法协调原文件替换"
+        case .swap:
+            return swapFailureMessage(error)
+        default:
+            return "提交前文件状态验证失败"
+        }
+    }
+
+    private nonisolated static func swapFailureMessage(_ error: Error) -> String {
         guard let error = error as? SafeMetadataFileSystemError else {
             return "无法原子提交修改"
         }
@@ -621,6 +930,38 @@ public actor SafeMetadataWriter: SafeMetadataWriting {
         }
     }
 
+    private nonisolated static func cleanupFailureDetail(
+        _ error: SafeMetadataFileSystemError
+    ) -> String {
+        switch error.code {
+        case EACCES, EPERM:
+            return "没有删除权限"
+        case EBUSY:
+            return "文件正被占用"
+        case EROFS:
+            return "所在文件系统为只读"
+        case ENOTEMPTY:
+            return "目录中存在未识别对象"
+        default:
+            return "删除操作失败"
+        }
+    }
+
+    private func appendCleanupWarning(
+        _ message: String,
+        _ warning: String?
+    ) -> String {
+        Self.appendCleanupWarning(message, warning)
+    }
+
+    private nonisolated static func appendCleanupWarning(
+        _ message: String,
+        _ warning: String?
+    ) -> String {
+        guard let warning else { return message }
+        return "\(message)；\(warning)"
+    }
+
     private func result(
         for url: URL,
         status: BatchFileStatus,
@@ -630,45 +971,48 @@ public actor SafeMetadataWriter: SafeMetadataWriting {
     }
 }
 
-private struct OriginalFileSnapshot: Sendable {
-    let nodeState: SafeMetadataFileNodeState
-    let digest: Data
-}
-
-private struct OwnedTemporaryFile: Sendable {
-    let url: URL
+private struct OwnedWorkFile: Sendable {
+    let workspace: SafeMetadataWorkspace
     let identity: SafeMetadataFileIdentity
 }
 
-private enum CleanupOutcome {
-    case removed
-    case notNeeded
-    case identityMismatch
-    case ownershipUnknown
-    case failed(String)
+private struct WorkspaceCleanupReport: Sendable {
+    let warning: String?
 }
 
-private struct CoordinatedCommitResult {
-    let outcome: CommitOutcome
-    let temporary: OwnedTemporaryFile
-}
-
-private struct CoordinatedCommitFailure: Error {
-    let cause: Error
-    let temporary: OwnedTemporaryFile
-}
-
-private enum CommitOutcome {
+private enum ObservedCommitState: Sendable {
+    case notStarted
     case cancelled
-    case swapped(warning: String?)
+    case preSwapFailed(String)
+    case committed(cleanupIdentity: SafeMetadataFileIdentity)
+    case rolledBack
+    case uncertain(String)
 }
 
-private struct CommitValidationError: Error {
+private struct CommitExecutionResult: Sendable {
+    let disposition: CommitDisposition
+    let cleanupIdentity: SafeMetadataFileIdentity?
+}
+
+private enum CommitDisposition: Sendable {
+    case committed(coordinatorTailWarning: Bool)
+    case rolledBack(coordinatorTailWarning: Bool)
+    case cancelled(coordinatorTailWarning: Bool)
+    case preSwapFailed(String, coordinatorTailWarning: Bool)
+    case uncertain(String)
+}
+
+private struct WorkspaceCreationError: Error, Sendable {
     let message: String
 }
 
-private struct TemporaryCreationError: Error {
+private struct WorkspaceCancellationError: Error, Sendable {
     let message: String
+}
+
+private enum WorkValidationError: Error {
+    case identityChanged
+    case changedAfterVerification
 }
 
 private enum InitialValidationError: Error {
@@ -677,5 +1021,4 @@ private enum InitialValidationError: Error {
     case hardLinked
     case notReadable
     case notWritable
-    case changedDuringInspection
 }

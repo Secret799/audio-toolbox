@@ -9,5 +9,8 @@ public enum AudioFileCandidate {
         values.isHidden == true
             || values.isSymbolicLink == true
             || url.lastPathComponent.hasPrefix(".audio-toolbox-")
+            || url.pathComponents.contains { component in
+                component.hasPrefix(".audio-toolbox-") && component.hasSuffix(".work")
+            }
     }
 }
