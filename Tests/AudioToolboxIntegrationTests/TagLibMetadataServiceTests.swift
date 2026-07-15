@@ -242,6 +242,16 @@ struct TagLibMetadataServiceTests {
         }
     }
 
+    @Test("rejects a valid footer-bearing MP3 without changing bytes")
+    func rejectsFooterBearingMP3() async throws {
+        let service = TagLibMetadataService()
+        let contents = try makeFooterBearingMP3()
+
+        try await withTemporaryFile(named: "footer-bearing.mp3", contents: contents) { copy in
+            try await expectRejectedWritePreservingBytes(copy, service: service)
+        }
+    }
+
     @Test("rejects text disguised as MP3 without changing bytes")
     func rejectsTextDisguisedAsMP3() async throws {
         let service = TagLibMetadataService()
@@ -342,6 +352,65 @@ struct TagLibMetadataServiceTests {
         return try await operation(file)
     }
 
+    private func makeFooterBearingMP3() throws -> Data {
+        var frames = Data()
+        frames.append(id3v24TextFrame(identifier: "TPE1", value: "Footer Artist"))
+        frames.append(id3v24TextFrame(identifier: "TALB", value: "Footer Album"))
+        frames.append(id3v24TextFrame(identifier: "TIT2", value: "X"))
+
+        let size = synchsafe(frames.count)
+        var result = Data(id3Header(major: 4, revision: 0, flags: 0x10, size: size))
+        result.append(frames)
+        result.append(contentsOf: id3Footer(major: 4, revision: 0, flags: 0x10, size: size))
+
+        let fixture = try Data(contentsOf: fixtureURL("sample.mp3"))
+        result.append(try mpegAudioPayload(from: fixture))
+        return result
+    }
+
+    private func id3v24TextFrame(identifier: String, value: String) -> Data {
+        precondition(identifier.utf8.count == 4)
+        var payload = Data([0x03])
+        payload.append(contentsOf: value.utf8)
+
+        var frame = Data(identifier.utf8)
+        frame.append(contentsOf: synchsafe(payload.count))
+        frame.append(contentsOf: [0x00, 0x00])
+        frame.append(payload)
+        return frame
+    }
+
+    private func mpegAudioPayload(from data: Data) throws -> Data {
+        guard data.count >= 10,
+              data[0] == 0x49, data[1] == 0x44, data[2] == 0x33,
+              (6...9).allSatisfy({ (data[$0] & 0x80) == 0 }) else {
+            throw FixtureError.invalid("sample.mp3 ID3 header")
+        }
+
+        let declaredSize = (Int(data[6]) << 21)
+            | (Int(data[7]) << 14)
+            | (Int(data[8]) << 7)
+            | Int(data[9])
+        var payloadOffset = 10 + declaredSize
+        if data[3] == 4 && (data[5] & 0x10) != 0 {
+            payloadOffset += 10
+        }
+        guard payloadOffset < data.count else {
+            throw FixtureError.invalid("sample.mp3 MPEG payload")
+        }
+        return data.subdata(in: payloadOffset..<data.count)
+    }
+
+    private func synchsafe(_ value: Int) -> [UInt8] {
+        precondition((0...0x0FFF_FFFF).contains(value))
+        return [
+            UInt8((value >> 21) & 0x7F),
+            UInt8((value >> 14) & 0x7F),
+            UInt8((value >> 7) & 0x7F),
+            UInt8(value & 0x7F)
+        ]
+    }
+
     private func id3Header(
         major: UInt8,
         revision: UInt8,
@@ -374,4 +443,5 @@ struct TagLibMetadataServiceTests {
 
 private enum FixtureError: Error {
     case missing(String)
+    case invalid(String)
 }

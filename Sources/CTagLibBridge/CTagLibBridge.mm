@@ -102,6 +102,7 @@ struct ATFileProbe {
     uint64_t file_size = 0;
     uint64_t file_offset = 0;
     bool has_leading_id3 = false;
+    bool has_v24_footer = false;
 };
 
 bool AddWithinFile(uint64_t base, uint64_t addition, uint64_t file_size, uint64_t &sum) {
@@ -118,6 +119,7 @@ bool ReadProbeAt(
     uint64_t file_size,
     uint64_t file_offset,
     bool has_leading_id3,
+    bool has_v24_footer,
     ATFileProbe &probe
 ) {
     if(file_offset > file_size
@@ -142,6 +144,7 @@ bool ReadProbeAt(
     probe.file_size = file_size;
     probe.file_offset = file_offset;
     probe.has_leading_id3 = has_leading_id3;
+    probe.has_v24_footer = has_v24_footer;
     return probe.size == requested;
 }
 
@@ -175,7 +178,7 @@ bool ReadFileProbe(const char *path, ATFileProbe &probe) {
     const bool has_id3 = prefix_size >= 3
         && std::memcmp(prefix.data(), "ID3", 3) == 0;
     if(!has_id3) {
-        return ReadProbeAt(stream, file_size, 0, false, probe);
+        return ReadProbeAt(stream, file_size, 0, false, false, probe);
     }
 
     if(prefix_size < prefix.size()) {
@@ -217,7 +220,8 @@ bool ReadFileProbe(const char *path, ATFileProbe &probe) {
         return false;
     }
 
-    if(major_version == 4 && (prefix[5] & 0x10) != 0) {
+    const bool has_v24_footer = major_version == 4 && (prefix[5] & 0x10) != 0;
+    if(has_v24_footer) {
         const uint64_t footer_start = payload_offset;
         if(!AddWithinFile(footer_start, 10, file_size, payload_offset)
             || footer_start > static_cast<uint64_t>(
@@ -252,7 +256,7 @@ bool ReadFileProbe(const char *path, ATFileProbe &probe) {
         }
     }
 
-    return ReadProbeAt(stream, file_size, payload_offset, true, probe);
+    return ReadProbeAt(stream, file_size, payload_offset, true, has_v24_footer, probe);
 }
 
 bool StartsWith(const ATFileProbe &probe, const char *value, size_t length) {
@@ -448,18 +452,32 @@ ATContainer ContainerForExtension(const char *path) {
     return ATContainer::Unknown;
 }
 
-bool ContentMatchesExtension(const char *path, bool require_writable_container) {
+struct ATContentProbeResult {
+    ATContainer container = ATContainer::Unknown;
+    bool has_v24_footer = false;
+};
+
+bool ContentMatchesExtension(
+    const char *path,
+    bool require_writable_container,
+    ATContentProbeResult &result
+) {
     ATFileProbe probe;
     if(!ReadFileProbe(path, probe)) {
         return false;
     }
 
-    const ATContainer detected = DetectContainer(probe);
+    result.container = DetectContainer(probe);
+    result.has_v24_footer = probe.has_v24_footer;
     const ATContainer expected = ContainerForExtension(path);
-    if(detected == ATContainer::Unknown || detected != expected) {
+    if(result.container == ATContainer::Unknown || result.container != expected) {
         return false;
     }
-    return !require_writable_container || detected != ATContainer::RawADTS;
+    return !require_writable_container || result.container != ATContainer::RawADTS;
+}
+
+bool IsFooterBearingMPEG(const ATContentProbeResult &result) {
+    return result.container == ATContainer::MPEGAudio && result.has_v24_footer;
 }
 
 bool HasSaneAudioProperties(const TagLib::FileRef &file) {
@@ -498,8 +516,13 @@ ATReadResult ATReadMetadata(const char *path) {
             SetError(result, ATStatusUnreadable, "无法打开或识别音频文件");
             return result;
         }
-        if(!ContentMatchesExtension(path, false)) {
+        ATContentProbeResult content;
+        if(!ContentMatchesExtension(path, false, content)) {
             SetError(result, ATStatusUnreadable, "音频内容与扩展名不匹配或格式不受支持");
+            return result;
+        }
+        if(IsFooterBearingMPEG(content)) {
+            SetError(result, ATStatusUnreadable, "不支持读取带 ID3v2.4 footer 的 MP3");
             return result;
         }
 
@@ -555,8 +578,12 @@ void ATFreeReadResult(ATReadResult *result) {
 
 bool ATCanWriteMetadata(const char *path) {
     try {
-        if(path == nullptr || path[0] == '\0' || ::access(path, W_OK) != 0
-            || !ContentMatchesExtension(path, true)) {
+        if(path == nullptr || path[0] == '\0' || ::access(path, W_OK) != 0) {
+            return false;
+        }
+
+        ATContentProbeResult content;
+        if(!ContentMatchesExtension(path, true, content) || IsFooterBearingMPEG(content)) {
             return false;
         }
 
@@ -584,8 +611,13 @@ ATWriteResult ATWriteMetadata(
             SetError(result, ATStatusNotWritable, "音频文件不可写");
             return result;
         }
-        if(!ContentMatchesExtension(path, true)) {
+        ATContentProbeResult content;
+        if(!ContentMatchesExtension(path, true, content)) {
             SetError(result, ATStatusNotWritable, "音频内容与扩展名不匹配或格式不支持写入");
+            return result;
+        }
+        if(IsFooterBearingMPEG(content)) {
+            SetError(result, ATStatusNotWritable, "不支持写入带 ID3v2.4 footer 的 MP3");
             return result;
         }
 
