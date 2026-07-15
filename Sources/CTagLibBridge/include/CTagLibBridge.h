@@ -37,12 +37,14 @@ ATReadResult ATReadMetadata(const char * _Nullable path);
 /// Passing null is allowed.
 void ATFreeReadResult(ATReadResult * _Nullable result);
 
-/// Returns whether path is a writable, valid TagLib file with an accessible tag.
-/// This probe never saves or changes the file.
+/// Returns whether path contains a supported audio container matching its
+/// extension, has sane audio properties, and is a writable, valid TagLib file
+/// with an accessible tag. This probe never saves or changes the file.
 bool ATCanWriteMetadata(const char * _Nullable path);
 
-/// Writes only the fields whose pointers are non-null. A zero status indicates
-/// that TagLib saved the file successfully.
+/// Validates the actual container against the extension, then writes only the
+/// fields whose pointers are non-null. A zero status indicates that TagLib
+/// saved the file successfully.
 ATWriteResult ATWriteMetadata(
     const char * _Nullable path,
     const char * _Nullable artist_or_null,

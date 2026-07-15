@@ -148,8 +148,69 @@ struct TagLibMetadataServiceTests {
         }
     }
 
+    @Test("rejects text disguised as MP3 without changing bytes")
+    func rejectsTextDisguisedAsMP3() async throws {
+        let service = TagLibMetadataService()
+        let contents = Data("This is plain text, not MPEG audio.".utf8)
+
+        try await withTemporaryFile(named: "disguised.mp3", contents: contents) { copy in
+            try await expectRejectedWritePreservingBytes(copy, service: service)
+        }
+    }
+
+    @Test("rejects an MPEG frame header without real audio")
+    func rejectsMPEGHeaderWithoutAudio() async throws {
+        let service = TagLibMetadataService()
+        var contents = Data([0xFF, 0xFB, 0x90, 0x64])
+        contents.append(Data(repeating: 0, count: 512))
+
+        try await withTemporaryFile(named: "header-only.mp3", contents: contents) { copy in
+            try await expectRejectedWritePreservingBytes(copy, service: service)
+        }
+    }
+
+    @Test("rejects raw AAC renamed as MP3 without changing bytes")
+    func rejectsRawAACRenamedAsMP3() async throws {
+        let service = TagLibMetadataService()
+
+        try await withFixtureCopy("sample.aac", named: "disguised.mp3") { copy in
+            try await expectRejectedWritePreservingBytes(copy, service: service)
+        }
+    }
+
+    @Test("rejects valid MP3 renamed as AAC without changing bytes")
+    func rejectsMP3RenamedAsAAC() async throws {
+        let service = TagLibMetadataService()
+
+        try await withFixtureCopy("sample.mp3", named: "renamed.aac") { copy in
+            try await expectRejectedWritePreservingBytes(copy, service: service)
+        }
+    }
+
+    private func expectRejectedWritePreservingBytes(
+        _ url: URL,
+        service: TagLibMetadataService
+    ) async throws {
+        let before = try Data(contentsOf: url)
+        await #expect(throws: MetadataServiceError.self) {
+            _ = try await service.read(url: url)
+        }
+        #expect(await !service.canWrite(url: url))
+
+        await #expect(
+            throws: MetadataServiceError.notWritable("文件不可写或格式不支持标签写入")
+        ) {
+            try await service.write(
+                url: url,
+                patch: MetadataPatch(artist: "New Artist", album: nil)
+            )
+        }
+        #expect(try Data(contentsOf: url) == before)
+    }
+
     private func withFixtureCopy<T>(
         _ name: String,
+        named copyName: String? = nil,
         operation: (URL) async throws -> T
     ) async throws -> T {
         let directory = FileManager.default.temporaryDirectory
@@ -162,9 +223,29 @@ struct TagLibMetadataServiceTests {
             try? FileManager.default.removeItem(at: directory)
         }
 
-        let copy = directory.appendingPathComponent(name)
+        let copy = directory.appendingPathComponent(copyName ?? name)
         try FileManager.default.copyItem(at: try fixtureURL(name), to: copy)
         return try await operation(copy)
+    }
+
+    private func withTemporaryFile<T>(
+        named name: String,
+        contents: Data,
+        operation: (URL) async throws -> T
+    ) async throws -> T {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AudioToolboxTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true
+        )
+        defer {
+            try? FileManager.default.removeItem(at: directory)
+        }
+
+        let file = directory.appendingPathComponent(name)
+        try contents.write(to: file)
+        return try await operation(file)
     }
 
     private func fixtureURL(_ name: String) throws -> URL {
