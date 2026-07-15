@@ -98,6 +98,7 @@ public final class LibraryViewModel: ObservableObject {
     private var selectionState = SelectionState()
     private var accessLease: SecurityScopedAccessLease?
     private var scanTask: Task<Void, Never>?
+    private var batchProgressTask: Task<Void, Never>?
     private var scanGeneration: UInt64 = 0
     private var batchGeneration: UInt64 = 0
     private var isRefreshingAfterBatch = false
@@ -118,6 +119,11 @@ public final class LibraryViewModel: ObservableObject {
         self.makeAccessLease = makeAccessLease
     }
 
+    deinit {
+        scanTask?.cancel()
+        batchProgressTask?.cancel()
+    }
+
     public static func live(
         bookmarkStore: SecurityScopedDirectoryStore = SecurityScopedDirectoryStore()
     ) -> LibraryViewModel {
@@ -134,7 +140,13 @@ public final class LibraryViewModel: ObservableObject {
 
     public func loadDirectory(_ url: URL) async {
         guard !isBatchActive else { return }
-        await startDirectoryLoad(url.standardizedFileURL, persistBookmark: true)
+        guard startDirectoryLoad(
+            url.standardizedFileURL,
+            persistBookmark: true
+        ) != nil else {
+            return
+        }
+        await Task.yield()
     }
 
     public func restoreLastDirectory() async {
@@ -148,7 +160,13 @@ public final class LibraryViewModel: ObservableObject {
                 scanState = .idle
                 return
             }
-            await startDirectoryLoad(restoredURL.standardizedFileURL, persistBookmark: false)
+            guard startDirectoryLoad(
+                restoredURL.standardizedFileURL,
+                persistBookmark: false
+            ) != nil else {
+                return
+            }
+            await Task.yield()
         } catch {
             scanState = .failed("无法恢复上次目录授权：\(error.localizedDescription)")
         }
@@ -206,6 +224,9 @@ public final class LibraryViewModel: ObservableObject {
             }
         }
 
+        batchProgressTask?.cancel()
+        batchProgressTask = progressTask
+
         let summary = await batchEditor.run(
             BatchEditRequest(files: selectedTracks.map(\.url), patch: patch)
         ) { progress in
@@ -213,6 +234,9 @@ public final class LibraryViewModel: ObservableObject {
         }
         progressContinuation.finish()
         await progressTask.value
+        if batchGeneration == generation {
+            batchProgressTask = nil
+        }
 
         guard batchGeneration == generation else {
             withExtendedLifetime(retainedLease) {}
@@ -257,36 +281,51 @@ public final class LibraryViewModel: ObservableObject {
         }
     }
 
-    private func startDirectoryLoad(_ url: URL, persistBookmark: Bool) async {
+    @discardableResult
+    private func startDirectoryLoad(
+        _ url: URL,
+        persistBookmark: Bool
+    ) -> Task<Void, Never>? {
         let isSameDirectory = currentDirectoryURL == url
-
-        invalidateScan()
-        let generation = scanGeneration
-
-        if !isSameDirectory {
-            let newLease = makeAccessLease(url)
-            accessLease = newLease
-            currentDirectoryURL = url
-            selectionState.removeAll()
-            publishSelection()
-        }
+        let preservedGroupID = isSameDirectory ? selectedGroupID : nil
+        let candidateLease = isSameDirectory ? nil : makeAccessLease(url)
 
         if persistBookmark {
             do {
                 try bookmarkStore.save(url: url)
             } catch {
                 scanState = .failed("无法保存目录授权：\(error.localizedDescription)")
-                return
+                return nil
             }
         }
 
-        await runScan(root: url, generation: generation)
+        invalidateScan()
+        let generation = scanGeneration
+
+        if let candidateLease {
+            accessLease = candidateLease
+            currentDirectoryURL = url
+            selectedGroupID = nil
+            selectionState.removeAll()
+            publishSelection()
+        }
+
+        return beginScan(
+            root: url,
+            generation: generation,
+            preservingGroupID: preservedGroupID
+        )
     }
 
     private func refreshCurrentDirectory(_ url: URL) async {
         invalidateScan()
         let generation = scanGeneration
-        await runScan(root: url, generation: generation)
+        let task = beginScan(
+            root: url,
+            generation: generation,
+            preservingGroupID: selectedGroupID
+        )
+        await task.value
     }
 
     private func invalidateScan() {
@@ -295,22 +334,26 @@ public final class LibraryViewModel: ObservableObject {
         scanTask = nil
     }
 
-    private func runScan(root: URL, generation: UInt64) async {
+    private func beginScan(
+        root: URL,
+        generation: UInt64,
+        preservingGroupID: String?
+    ) -> Task<Void, Never> {
         tracks = []
         groups = []
-        selectedGroupID = nil
+        selectedGroupID = preservingGroupID
         discoveredCount = 0
         scanFailureValues = []
         scanState = .scanning(discovered: 0, loaded: 0, failures: [])
 
-        let scanner = self.scanner
+        let stream = scanner.scan(root: root)
         let task = Task { @MainActor [weak self] in
-            guard let self else { return }
-
             var receivedFinished = false
-            for await event in scanner.scan(root: root) {
-                guard !Task.isCancelled,
-                      self.scanGeneration == generation,
+
+            eventLoop: for await event in stream {
+                guard !Task.isCancelled else { break }
+                guard let self else { break }
+                guard self.scanGeneration == generation,
                       self.currentDirectoryURL == root else {
                     break
                 }
@@ -320,7 +363,10 @@ public final class LibraryViewModel: ObservableObject {
                     self.discoveredCount = count
                     self.publishScanningState()
                 case let .loaded(track):
-                    self.upsert(track)
+                    self.upsert(
+                        track,
+                        preservingMissingGroupID: preservingGroupID
+                    )
                     self.publishScanningState()
                 case let .failed(url, message):
                     self.scanFailureValues.append(
@@ -330,44 +376,51 @@ public final class LibraryViewModel: ObservableObject {
                 case .finished:
                     receivedFinished = true
                     self.finishScan()
+                    break eventLoop
                 }
             }
 
-            guard !Task.isCancelled,
-                  self.scanGeneration == generation,
+            guard !Task.isCancelled else { return }
+            guard let self else { return }
+            guard self.scanGeneration == generation,
                   self.currentDirectoryURL == root else {
                 return
             }
             if !receivedFinished {
                 self.finishScan()
             }
+            self.scanTask = nil
         }
 
         scanTask = task
-        await task.value
-        if scanGeneration == generation {
-            scanTask = nil
-        }
+        return task
     }
 
-    private func upsert(_ track: AudioTrack) {
+    private func upsert(
+        _ track: AudioTrack,
+        preservingMissingGroupID: String?
+    ) {
         if let index = tracks.firstIndex(where: { $0.id == track.id }) {
             tracks[index] = track
         } else {
             tracks.append(track)
         }
         tracks = LibraryProjection.sortedTracks(tracks)
-        rebuildGroups()
+        rebuildGroups(preservingMissingGroupID: preservingMissingGroupID)
     }
 
-    private func rebuildGroups() {
+    private func rebuildGroups(preservingMissingGroupID: String? = nil) {
         groups = LibraryProjection.groups(tracks: tracks, mode: groupingMode)
-        repairSelectedGroup()
+        repairSelectedGroup(preservingMissingGroupID: preservingMissingGroupID)
     }
 
-    private func repairSelectedGroup() {
+    private func repairSelectedGroup(preservingMissingGroupID: String? = nil) {
         if let selectedGroupID,
            groups.contains(where: { $0.id == selectedGroupID }) {
+            return
+        }
+        if let preservingMissingGroupID,
+           selectedGroupID == preservingMissingGroupID {
             return
         }
         selectedGroupID = groups.first?.id

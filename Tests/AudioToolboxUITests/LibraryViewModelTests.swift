@@ -8,6 +8,30 @@ struct LibraryViewModelTests {
     private let firstRoot = URL(fileURLWithPath: "/virtual/library-one", isDirectory: true)
     private let secondRoot = URL(fileURLWithPath: "/virtual/library-two", isDirectory: true)
 
+    @Test("释放 ViewModel 会取消悬挂扫描、终止 producer 并释放 lease 一次")
+    @MainActor
+    func releasingViewModelCancelsSuspendedScanAndLease() async {
+        let scanner = TerminationTrackingScanner()
+        let accessLog = AccessLog()
+        var viewModel: LibraryViewModel? = makeViewModel(
+            scanner: scanner,
+            accessLog: accessLog
+        )
+        let weakViewModel = WeakBox(viewModel)
+        await viewModel?.loadDirectory(firstRoot)
+        await scanner.waitUntilStarted()
+
+        viewModel = nil
+
+        await waitUntil { weakViewModel.value == nil }
+        await waitUntil { scanner.cancelledTerminationCount == 1 }
+        #expect(weakViewModel.value == nil)
+        #expect(scanner.cancelledTerminationCount == 1)
+        #expect(accessLog.events == [.start(firstRoot), .stop(firstRoot)])
+
+        scanner.finish()
+    }
+
     @Test("扫描事件增量更新曲目、分组和进度")
     @MainActor
     func scanEventsUpdateLibraryIncrementally() async {
@@ -27,6 +51,7 @@ struct LibraryViewModelTests {
         scanner.yield(.loaded(Self.secondTrack), toScan: 0)
         scanner.finish(scan: 0)
         await load.value
+        await waitUntil { viewModel.scanState == .loaded(failures: []) }
 
         #expect(viewModel.tracks == LibraryProjection.sortedTracks([Self.firstTrack, Self.secondTrack]))
         #expect(viewModel.groups.map(\.displayName) == ["Artist One", "Artist Two"])
@@ -44,6 +69,7 @@ struct LibraryViewModelTests {
         let viewModel = makeViewModel(scanner: scanner)
 
         await viewModel.loadDirectory(firstRoot)
+        await waitUntil { viewModel.scanState == .loaded(failures: []) }
         viewModel.toggleSelection(Self.firstTrack.id)
         viewModel.groupingMode = .album
 
@@ -51,6 +77,56 @@ struct LibraryViewModelTests {
         #expect(viewModel.selectedCount == 1)
         #expect(viewModel.groups.map(\.displayName) == ["Album Two", "Special Album"])
         #expect(viewModel.selectedGroupID == "album:Album Two")
+    }
+
+    @Test("bookmark 保存失败时目录切换不提交且只释放新 lease")
+    @MainActor
+    func failedBookmarkSaveKeepsPreviousDirectoryState() async {
+        let scanner = TerminationTrackingScanner()
+        let accessLog = AccessLog()
+        let defaults = makeDefaults()
+        let store = SecurityScopedDirectoryStore(
+            defaults: defaults,
+            resolver: FailingSecondSaveBookmarkResolver()
+        )
+        let viewModel = LibraryViewModel(
+            scanner: scanner,
+            batchEditor: FakeBatchEditor(summary: BatchEditSummary(results: [])),
+            bookmarkStore: store,
+            makeAccessLease: {
+                SecurityScopedAccessLease(url: $0, accessor: accessLog)
+            }
+        )
+        await viewModel.loadDirectory(firstRoot)
+        await scanner.waitUntilStarted()
+        scanner.yield(.loaded(Self.firstTrack))
+        await waitUntil { viewModel.tracks == [Self.firstTrack] }
+        viewModel.toggleSelection(Self.firstTrack.id)
+        let previousTracks = viewModel.tracks
+        let previousGroups = viewModel.groups
+        let previousSelection = viewModel.selectedTrackIDs
+        let previousGroupID = viewModel.selectedGroupID
+
+        await viewModel.loadDirectory(secondRoot)
+
+        #expect(viewModel.currentDirectoryURL == firstRoot)
+        #expect(viewModel.tracks == previousTracks)
+        #expect(viewModel.groups == previousGroups)
+        #expect(viewModel.selectedTrackIDs == previousSelection)
+        #expect(viewModel.selectedGroupID == previousGroupID)
+        #expect(scanner.scanCount == 1)
+        #expect(scanner.cancelledTerminationCount == 0)
+        #expect(accessLog.events == [
+            .start(firstRoot),
+            .start(secondRoot),
+            .stop(secondRoot),
+        ])
+        guard case let .failed(message) = viewModel.scanState else {
+            Issue.record("Expected bookmark save failure state")
+            return
+        }
+        #expect(message.contains("保存"))
+        scanner.finish()
     }
 
     @Test("切换根目录先建立新 lease、取消旧扫描、清空选择并拒绝旧事件")
@@ -75,6 +151,10 @@ struct LibraryViewModelTests {
         scanner.yield(.loaded(Self.lateTrack), toScan: 0)
         scanner.finish(scan: 0)
         await firstLoad.value
+        await waitUntil {
+            viewModel.currentDirectoryURL == secondRoot
+                && viewModel.scanState == .loaded(failures: [])
+        }
 
         #expect(viewModel.currentDirectoryURL == secondRoot)
         #expect(viewModel.tracks == [Self.secondTrack])
@@ -96,11 +176,31 @@ struct LibraryViewModelTests {
         let viewModel = makeViewModel(scanner: scanner)
 
         await viewModel.loadDirectory(firstRoot)
+        await waitUntil { viewModel.scanState == .loaded(failures: []) }
         viewModel.toggleSelection(Self.firstTrack.id)
         viewModel.toggleSelection(Self.secondTrack.id)
         await viewModel.loadDirectory(firstRoot)
+        await waitUntil { scanner.scanCount == 2 && viewModel.scanState == .loaded(failures: []) }
 
         #expect(viewModel.selectedTrackIDs == [Self.secondTrack.id])
+    }
+
+    @Test("同目录刷新时即使原分组较晚出现也保留 selectedGroupID")
+    @MainActor
+    func sameRootRefreshPreservesSelectedGroupWhenItStillExists() async {
+        let scanner = ScriptedScanner(scripts: [
+            [.loaded(Self.firstTrack), .loaded(Self.secondTrack), .finished],
+            [.loaded(Self.firstTrack), .loaded(Self.secondTrack), .finished],
+        ])
+        let viewModel = makeViewModel(scanner: scanner)
+        await viewModel.loadDirectory(firstRoot)
+        await waitUntil { viewModel.scanState == .loaded(failures: []) }
+        viewModel.selectedGroupID = "artist:Artist Two"
+
+        await viewModel.loadDirectory(firstRoot)
+        await waitUntil { scanner.scanCount == 2 && viewModel.scanState == .loaded(failures: []) }
+
+        #expect(viewModel.selectedGroupID == "artist:Artist Two")
     }
 
     @Test("当前分组在首次加载时合理默认，并在分组消失后修复")
@@ -113,8 +213,10 @@ struct LibraryViewModelTests {
         let viewModel = makeViewModel(scanner: scanner)
 
         await viewModel.loadDirectory(firstRoot)
+        await waitUntil { viewModel.scanState == .loaded(failures: []) }
         viewModel.selectedGroupID = "artist:Artist One"
         await viewModel.loadDirectory(firstRoot)
+        await waitUntil { scanner.scanCount == 2 && viewModel.scanState == .loaded(failures: []) }
 
         #expect(viewModel.selectedGroupID == "artist:Artist Two")
     }
@@ -130,6 +232,7 @@ struct LibraryViewModelTests {
         ]])
         let viewModel = makeViewModel(scanner: scanner)
         await viewModel.loadDirectory(firstRoot)
+        await waitUntil { viewModel.scanState == .loaded(failures: []) }
         viewModel.selectedGroupID = "artist:Artist One"
 
         for query in ["first title", "filename-match", "special album"] {
@@ -158,6 +261,7 @@ struct LibraryViewModelTests {
         let viewModel = makeViewModel(scanner: scanner)
 
         await viewModel.loadDirectory(firstRoot)
+        await waitUntil { viewModel.scanState == .loaded(failures: [failure]) }
 
         #expect(viewModel.scanState == .loaded(failures: [failure]))
         #expect(viewModel.scanFailures == [failure])
@@ -180,6 +284,7 @@ struct LibraryViewModelTests {
         ])
         let viewModel = makeViewModel(scanner: scanner, batchEditor: editor)
         await viewModel.loadDirectory(firstRoot)
+        await waitUntil { viewModel.scanState == .loaded(failures: []) }
         viewModel.toggleSelection(Self.firstTrack.id)
 
         viewModel.openBatchEditor()
@@ -209,6 +314,7 @@ struct LibraryViewModelTests {
         scanner.yield(.loaded(Self.firstTrack), toScan: 0)
         scanner.finish(scan: 0)
         await initialLoad.value
+        await waitUntil { viewModel.scanState == .loaded(failures: []) }
         viewModel.toggleSelection(Self.firstTrack.id)
 
         let batch = Task {
@@ -234,6 +340,7 @@ struct LibraryViewModelTests {
         let editor = SuspendedBatchEditor()
         let viewModel = makeViewModel(scanner: scanner, batchEditor: editor)
         await viewModel.loadDirectory(firstRoot)
+        await waitUntil { viewModel.scanState == .loaded(failures: []) }
         viewModel.toggleSelection(Self.firstTrack.id)
         viewModel.openBatchEditor()
         let run = Task {
@@ -375,6 +482,61 @@ struct LibraryViewModelTests {
             isWritable: true,
             issue: nil
         )
+    }
+}
+
+private final class WeakBox<Value: AnyObject> {
+    weak var value: Value?
+
+    init(_ value: Value?) {
+        self.value = value
+    }
+}
+
+private final class TerminationTrackingScanner: DirectoryScanning, @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: AsyncStream<ScanEvent>.Continuation?
+    private var storedCancelledTerminationCount = 0
+    private var storedScanCount = 0
+
+    var scanCount: Int {
+        lock.withLock { storedScanCount }
+    }
+
+    var cancelledTerminationCount: Int {
+        lock.withLock { storedCancelledTerminationCount }
+    }
+
+    func scan(root: URL) -> AsyncStream<ScanEvent> {
+        lock.withLock { storedScanCount += 1 }
+        return AsyncStream { continuation in
+            continuation.onTermination = { [weak self] termination in
+                guard case .cancelled = termination else { return }
+                self?.lock.withLock {
+                    self?.storedCancelledTerminationCount += 1
+                    self?.continuation = nil
+                }
+            }
+            lock.withLock {
+                self.continuation = continuation
+            }
+        }
+    }
+
+    func yield(_ event: ScanEvent) {
+        lock.withLock { continuation }?.yield(event)
+    }
+
+    func finish() {
+        lock.withLock { continuation }?.finish()
+    }
+
+    func waitUntilStarted() async {
+        for _ in 0..<1_000 {
+            if lock.withLock({ continuation != nil }) { return }
+            try? await Task.sleep(for: .milliseconds(1))
+        }
+        Issue.record("Timed out waiting for suspended scan")
     }
 }
 
@@ -546,6 +708,26 @@ private struct IdentityBookmarkResolver: DirectoryBookmarkResolving {
 
 private enum BookmarkTestError: Error {
     case refreshFailed
+    case saveFailed
+}
+
+private final class FailingSecondSaveBookmarkResolver: DirectoryBookmarkResolving, @unchecked Sendable {
+    private let lock = NSLock()
+    private var saveCount = 0
+
+    func bookmarkData(for url: URL) throws -> Data {
+        try lock.withLock {
+            saveCount += 1
+            guard saveCount == 1 else {
+                throw BookmarkTestError.saveFailed
+            }
+            return Data(url.path.utf8)
+        }
+    }
+
+    func resolve(_ data: Data) throws -> (url: URL, isStale: Bool) {
+        (URL(fileURLWithPath: String(decoding: data, as: UTF8.self)), false)
+    }
 }
 
 private struct ThrowingRefreshBookmarkResolver: DirectoryBookmarkResolving {
