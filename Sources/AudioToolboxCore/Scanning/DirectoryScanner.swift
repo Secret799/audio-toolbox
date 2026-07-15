@@ -11,20 +11,70 @@ public protocol DirectoryScanning: Sendable {
     func scan(root: URL) -> AsyncStream<ScanEvent>
 }
 
+protocol ScanningDirectoryEnumerator: AnyObject {
+    func nextObject() -> Any?
+    func skipDescendants()
+}
+
+extension FileManager.DirectoryEnumerator: ScanningDirectoryEnumerator {}
+
+typealias DirectoryEnumeratorFactory = @Sendable (
+    _ root: URL,
+    _ prefetchedKeys: [URLResourceKey],
+    _ errorHandler: @escaping @Sendable (URL, Error) -> Bool
+) -> (any ScanningDirectoryEnumerator)?
+
+typealias ResourceValuesReader = @Sendable (
+    _ url: URL,
+    _ keys: Set<URLResourceKey>
+) throws -> URLResourceValues
+
 public struct DirectoryScanner: DirectoryScanning {
-    private static let resourceKeys: Set<URLResourceKey> = [
+    private static let traversalKeys: Set<URLResourceKey> = [
         .isRegularFileKey,
         .isDirectoryKey,
         .isHiddenKey,
         .isSymbolicLinkKey,
+    ]
+
+    private static let detailKeys: Set<URLResourceKey> = [
         .fileSizeKey,
         .fileResourceIdentifierKey,
+        .volumeIdentifierKey,
     ]
 
     private let metadataService: any MetadataService
+    private let makeEnumerator: DirectoryEnumeratorFactory
+    private let readResourceValues: ResourceValuesReader
+    private let iterationBoundary: @Sendable () -> Void
 
     public init(metadataService: any MetadataService) {
+        self.init(
+            metadataService: metadataService,
+            makeEnumerator: { root, keys, errorHandler in
+                FileManager.default.enumerator(
+                    at: root,
+                    includingPropertiesForKeys: keys,
+                    options: [],
+                    errorHandler: errorHandler
+                )
+            },
+            readResourceValues: { url, keys in
+                try url.resourceValues(forKeys: keys)
+            }
+        )
+    }
+
+    init(
+        metadataService: any MetadataService,
+        makeEnumerator: @escaping DirectoryEnumeratorFactory,
+        readResourceValues: @escaping ResourceValuesReader,
+        iterationBoundary: @escaping @Sendable () -> Void = {}
+    ) {
         self.metadataService = metadataService
+        self.makeEnumerator = makeEnumerator
+        self.readResourceValues = readResourceValues
+        self.iterationBoundary = iterationBoundary
     }
 
     public func scan(root: URL) -> AsyncStream<ScanEvent> {
@@ -47,12 +97,10 @@ public struct DirectoryScanner: DirectoryScanning {
             continuation.finish()
         }
 
-        let fileManager = FileManager.default
-        guard let enumerator = fileManager.enumerator(
-            at: root,
-            includingPropertiesForKeys: Array(Self.resourceKeys),
-            options: [],
-            errorHandler: { url, error in
+        guard let enumerator = makeEnumerator(
+            root,
+            Array(Self.traversalKeys),
+            { url, error in
                 continuation.yield(.failed(url, String(describing: error)))
                 return true
             }
@@ -64,32 +112,39 @@ public struct DirectoryScanner: DirectoryScanning {
         var discovered = 0
         var identities: Set<FileIdentity> = []
 
-        while let url = enumerator.nextObject() as? URL {
-            guard !Task.isCancelled else { return }
+        while !Task.isCancelled {
+            guard let url = enumerator.nextObject() as? URL else { break }
+            guard !Task.isCancelled else { break }
 
-            let values: URLResourceValues
+            let traversalValues: URLResourceValues
             do {
-                values = try url.resourceValues(forKeys: Self.resourceKeys)
+                traversalValues = try readResourceValues(url, Self.traversalKeys)
             } catch {
                 continuation.yield(.failed(url, String(describing: error)))
+                enumerator.skipDescendants()
                 continue
             }
 
-            if AudioFileCandidate.shouldSkip(url, values: values) {
-                if values.isDirectory == true || values.isSymbolicLink == true {
+            if AudioFileCandidate.shouldSkip(url, values: traversalValues) {
+                if traversalValues.isDirectory == true {
                     enumerator.skipDescendants()
                 }
                 continue
             }
 
-            guard values.isDirectory != true,
-                  values.isRegularFile == true,
+            guard traversalValues.isDirectory != true,
+                  traversalValues.isRegularFile == true,
                   let format = AudioFileCandidate.format(for: url)
             else {
                 continue
             }
 
-            let identity = Self.fileIdentity(for: url, values: values)
+            let detailValues = try? readResourceValues(url, Self.detailKeys)
+            let identity = Self.fileIdentity(
+                for: url,
+                fileResourceIdentifier: detailValues?.fileResourceIdentifier,
+                volumeIdentifier: detailValues?.volumeIdentifier
+            )
             guard identities.insert(identity).inserted else { continue }
 
             discovered += 1
@@ -109,7 +164,7 @@ public struct DirectoryScanner: DirectoryScanning {
                             url: url,
                             format: format,
                             metadata: metadata,
-                            fileSize: Int64(values.fileSize ?? 0),
+                            fileSize: Int64(detailValues?.fileSize ?? 0),
                             isWritable: isWritable,
                             issue: nil
                         )
@@ -120,14 +175,37 @@ public struct DirectoryScanner: DirectoryScanning {
             } catch {
                 continuation.yield(.failed(url, String(describing: error)))
             }
+
+            iterationBoundary()
         }
     }
 
-    private static func fileIdentity(for url: URL, values: URLResourceValues) -> FileIdentity {
-        if let resourceIdentifier = values.fileResourceIdentifier {
-            return FileIdentity(rawValue: "resource:\(String(describing: resourceIdentifier))")
+    static func fileIdentity(
+        for url: URL,
+        fileResourceIdentifier: Any?,
+        volumeIdentifier: Any?
+    ) -> FileIdentity {
+        if let volume = archivedIdentifier(volumeIdentifier),
+           let file = archivedIdentifier(fileResourceIdentifier)
+        {
+            return FileIdentity(rawValue: "resource:\(volume):\(file)")
         }
 
-        return FileIdentity(rawValue: "path:\(url.standardizedFileURL.path)")
+        let path = url.standardizedFileURL.resolvingSymlinksInPath().path
+        return FileIdentity(rawValue: "path:\(path)")
+    }
+
+    private static func archivedIdentifier(_ identifier: Any?) -> String? {
+        guard let identifier = identifier as? any NSSecureCoding else { return nil }
+
+        do {
+            let data = try NSKeyedArchiver.archivedData(
+                withRootObject: identifier,
+                requiringSecureCoding: true
+            )
+            return data.base64EncodedString()
+        } catch {
+            return nil
+        }
     }
 }
