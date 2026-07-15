@@ -183,9 +183,25 @@ bool ReadFileProbe(const char *path, ATFileProbe &probe) {
     }
 
     const unsigned int major_version = prefix[3];
-    if(major_version != 2 && major_version != 3 && major_version != 4) {
+    if((major_version != 2 && major_version != 3 && major_version != 4)
+        || prefix[4] == 0xFF) {
         return false;
     }
+
+    unsigned char allowed_flags = 0;
+    if(major_version == 2) {
+        allowed_flags = 0xC0;
+    }
+    else if(major_version == 3) {
+        allowed_flags = 0xE0;
+    }
+    else {
+        allowed_flags = 0xF0;
+    }
+    if((prefix[5] & static_cast<unsigned char>(~allowed_flags)) != 0) {
+        return false;
+    }
+
     for(size_t index = 6; index <= 9; ++index) {
         if((prefix[index] & 0x80) != 0) {
             return false;
@@ -200,9 +216,40 @@ bool ReadFileProbe(const char *path, ATFileProbe &probe) {
     if(!AddWithinFile(10, declared_size, file_size, payload_offset)) {
         return false;
     }
-    if(major_version == 4 && (prefix[5] & 0x10) != 0
-        && !AddWithinFile(payload_offset, 10, file_size, payload_offset)) {
-        return false;
+
+    if(major_version == 4 && (prefix[5] & 0x10) != 0) {
+        const uint64_t footer_start = payload_offset;
+        if(!AddWithinFile(footer_start, 10, file_size, payload_offset)
+            || footer_start > static_cast<uint64_t>(
+                std::numeric_limits<std::streamoff>::max()
+            )) {
+            return false;
+        }
+
+        std::array<unsigned char, 10> footer{};
+        stream.clear();
+        stream.seekg(static_cast<std::streamoff>(footer_start), std::ios::beg);
+        if(!stream) {
+            return false;
+        }
+        stream.read(reinterpret_cast<char *>(footer.data()),
+                    static_cast<std::streamsize>(footer.size()));
+        if(static_cast<size_t>(stream.gcount()) != footer.size()) {
+            return false;
+        }
+
+        for(size_t index = 6; index <= 9; ++index) {
+            if((footer[index] & 0x80) != 0) {
+                return false;
+            }
+        }
+        if(std::memcmp(footer.data(), "3DI", 3) != 0
+            || footer[3] != prefix[3]
+            || footer[4] != prefix[4]
+            || footer[5] != prefix[5]
+            || std::memcmp(footer.data() + 6, prefix.data() + 6, 4) != 0) {
+            return false;
+        }
     }
 
     return ReadProbeAt(stream, file_size, payload_offset, true, probe);

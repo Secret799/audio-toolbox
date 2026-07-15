@@ -199,6 +199,49 @@ struct TagLibMetadataServiceTests {
         }
     }
 
+    @Test("rejects malformed ID3 headers and v2.4 footers")
+    func rejectsMalformedID3HeadersAndFooters() async throws {
+        let service = TagLibMetadataService()
+        let flac = try Data(contentsOf: fixtureURL("sample.flac"))
+        let header = id3Header(major: 4, revision: 0, flags: 0x10)
+        let footer = id3Footer(major: 4, revision: 0, flags: 0x10)
+
+        var cases: [(String, Data)] = []
+        cases.append(("missing-footer.flac", Data(header) + flac))
+        cases.append(("truncated-footer.flac", Data(header) + Data(footer.prefix(5))))
+        cases.append(("wrong-footer-identifier.flac", Data(header) + Data([0x42, 0x41, 0x44] + footer.dropFirst(3)) + flac))
+        cases.append(("footer-version-mismatch.flac", Data(header) + Data(id3Footer(major: 3, revision: 0, flags: 0x10)) + flac))
+        cases.append(("footer-revision-mismatch.flac", Data(header) + Data(id3Footer(major: 4, revision: 1, flags: 0x10)) + flac))
+        cases.append(("footer-flags-mismatch.flac", Data(header) + Data(id3Footer(major: 4, revision: 0, flags: 0x00)) + flac))
+        cases.append(("footer-size-mismatch.flac", Data(header) + Data(id3Footer(major: 4, revision: 0, flags: 0x10, size: [0, 0, 0, 1])) + flac))
+        cases.append(("footer-non-synchsafe-size.flac", Data(header) + Data(id3Footer(major: 4, revision: 0, flags: 0x10, size: [0x80, 0, 0, 0])) + flac))
+        cases.append(("header-revision-ff.flac", Data(id3Header(major: 4, revision: 0xFF, flags: 0x00)) + flac))
+        cases.append(("v22-reserved-flags.flac", Data(id3Header(major: 2, revision: 0, flags: 0x20)) + flac))
+        cases.append(("v23-reserved-flags.flac", Data(id3Header(major: 3, revision: 0, flags: 0x01)) + flac))
+        cases.append(("v23-footer-flag.flac", Data(id3Header(major: 3, revision: 0, flags: 0x10)) + flac))
+        cases.append(("v24-reserved-flags.flac", Data(id3Header(major: 4, revision: 0, flags: 0x01)) + flac))
+
+        for (name, contents) in cases {
+            try await withTemporaryFile(named: name, contents: contents) { copy in
+                try await expectRejectedWritePreservingBytes(copy, service: service)
+            }
+        }
+    }
+
+    @Test("accepts a valid ID3v2.4 footer")
+    func acceptsValidID3v24Footer() async throws {
+        let service = TagLibMetadataService()
+        var contents = Data(id3Header(major: 4, revision: 0, flags: 0x10))
+        contents.append(contentsOf: id3Footer(major: 4, revision: 0, flags: 0x10))
+        contents.append(try Data(contentsOf: fixtureURL("sample.flac")))
+
+        try await withTemporaryFile(named: "valid-footer.flac", contents: contents) { copy in
+            let metadata = try await service.read(url: copy)
+            #expect(metadata.title == "Fixture Title")
+            #expect(await service.canWrite(url: copy))
+        }
+    }
+
     @Test("rejects text disguised as MP3 without changing bytes")
     func rejectsTextDisguisedAsMP3() async throws {
         let service = TagLibMetadataService()
@@ -297,6 +340,24 @@ struct TagLibMetadataServiceTests {
         let file = directory.appendingPathComponent(name)
         try contents.write(to: file)
         return try await operation(file)
+    }
+
+    private func id3Header(
+        major: UInt8,
+        revision: UInt8,
+        flags: UInt8,
+        size: [UInt8] = [0, 0, 0, 0]
+    ) -> [UInt8] {
+        [0x49, 0x44, 0x33, major, revision, flags] + size
+    }
+
+    private func id3Footer(
+        major: UInt8,
+        revision: UInt8,
+        flags: UInt8,
+        size: [UInt8] = [0, 0, 0, 0]
+    ) -> [UInt8] {
+        [0x33, 0x44, 0x49, major, revision, flags] + size
     }
 
     private func fixtureURL(_ name: String) throws -> URL {
