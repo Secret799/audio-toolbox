@@ -9,10 +9,23 @@ let package = Package(
         .library(name: "AudioToolboxUI", targets: ["AudioToolboxUI"]),
         .executable(name: "AudioToolbox", targets: ["AudioToolbox"])
     ],
+    dependencies: [
+        .package(url: "https://github.com/sbooth/CXXTagLib.git", exact: "2.3.0")
+    ],
     targets: [
-        .target(name: "AudioToolboxCore"),
+        .target(
+            name: "CTagLibBridge",
+            dependencies: [.product(name: "taglib", package: "CXXTagLib")],
+            publicHeadersPath: "include"
+        ),
+        .target(name: "AudioToolboxCore", dependencies: ["CTagLibBridge"]),
         .target(name: "AudioToolboxUI", dependencies: ["AudioToolboxCore"]),
         .executableTarget(name: "AudioToolbox", dependencies: ["AudioToolboxUI"]),
-        .testTarget(name: "AudioToolboxCoreTests", dependencies: ["AudioToolboxCore"])
+        .testTarget(name: "AudioToolboxCoreTests", dependencies: ["AudioToolboxCore"]),
+        .testTarget(
+            name: "AudioToolboxIntegrationTests",
+            dependencies: ["AudioToolboxCore"],
+            resources: [.copy("Fixtures")]
+        )
     ]
 )
