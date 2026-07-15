@@ -853,6 +853,157 @@ struct SafeMetadataWriterTests {
     }
 
     @Test
+    func copyThatDropsXattrAndChangesModeIsRejectedBeforeMetadataWrite() async throws {
+        let directory = try TemporaryAudioDirectory()
+        defer { directory.remove() }
+        let original = try directory.createAudioFile()
+        let originalBytes = try Data(contentsOf: original)
+        try FileManager.default.setAttributes([.posixPermissions: 0o640], ofItemAtPath: original.path)
+        let xattrName = "com.audio-toolbox.copy-baseline"
+        let xattrValue = Data("copy baseline metadata".utf8)
+        try setExtendedAttribute(xattrValue, named: xattrName, at: original)
+        let live = testFileOperations()
+        let operations = live.overriding(copyIntoWorkspace: { source, workspace, flag in
+            let copied = try live.copyIntoWorkspace(source, workspace, flag)
+            guard removexattr(workspace.fileURL.path, xattrName, 0) == 0 else {
+                throw POSIXError(POSIXErrorCode(rawValue: errno)!)
+            }
+            try FileManager.default.setAttributes(
+                [.posixPermissions: 0o600],
+                ofItemAtPath: workspace.fileURL.path
+            )
+            return copied
+        })
+        let service = FakeSafeMetadataService()
+        let writer = makeTestWriter(metadataService: service, operations: operations)
+
+        let result = await writer.apply(
+            to: original,
+            patch: MetadataPatch(artist: "新作者", album: nil)
+        )
+
+        #expect(result.status == .failed)
+        #expect(result.message?.contains("复制后的文件属性或内容不完整") == true)
+        #expect(await service.recordedWriteURLs().isEmpty)
+        #expect(try Data(contentsOf: original) == originalBytes)
+        #expect(try extendedAttribute(named: xattrName, at: original) == xattrValue)
+        let attributes = try FileManager.default.attributesOfItem(atPath: original.path)
+        #expect((attributes[.posixPermissions] as? NSNumber)?.uint16Value == 0o640)
+        #expect(try directory.workDirectories().isEmpty)
+    }
+
+    @Test(arguments: [UInt16(S_ISUID), UInt16(S_ISGID)])
+    func privilegedSourceModeIsRejectedBeforeWorkspaceCreation(privilegedBit: UInt16) async throws {
+        let directory = try TemporaryAudioDirectory()
+        defer { directory.remove() }
+        let original = try directory.createAudioFile()
+        let live = testFileOperations()
+        let operations = live.overriding(snapshotURL: { url, flag in
+            let snapshot = try live.snapshotURL(url, flag)
+            return SafeMetadataFileSnapshot(
+                nodeState: replacingNodeState(
+                    snapshot.nodeState,
+                    mode: snapshot.nodeState.mode | privilegedBit
+                ),
+                digest: snapshot.digest,
+                fileSystemMetadata: snapshot.fileSystemMetadata
+            )
+        })
+        let service = FakeSafeMetadataService()
+        let writer = makeTestWriter(metadataService: service, operations: operations)
+
+        let result = await writer.apply(
+            to: original,
+            patch: MetadataPatch(artist: "新作者", album: nil)
+        )
+
+        #expect(result.status == .failed)
+        #expect(result.message == "文件包含 setuid/setgid 特权位，已拒绝编辑")
+        #expect(await service.recordedWriteURLs().isEmpty)
+        #expect(try directory.workDirectories().isEmpty)
+    }
+
+    @Test
+    func copiedInputEquivalenceChecksEveryRequiredFieldAndIgnoresNewIdentityAndCtime() async throws {
+        let directory = try TemporaryAudioDirectory()
+        defer { directory.remove() }
+        let original = try directory.createAudioFile()
+        let operations = testFileOperations()
+        let flag = try SafeMetadataCancellationFlag()
+        let initial = try operations.snapshotURL(original, flag)
+        let copiedState = replacingNodeState(
+            initial.nodeState,
+            device: initial.nodeState.device + 1,
+            inode: initial.nodeState.inode + 1,
+            statusChangeSeconds: initial.nodeState.statusChangeSeconds + 1,
+            statusChangeNanoseconds: initial.nodeState.statusChangeNanoseconds + 1
+        )
+        let copied = SafeMetadataFileSnapshot(
+            nodeState: copiedState,
+            digest: initial.digest,
+            fileSystemMetadata: initial.fileSystemMetadata
+        )
+
+        #expect(copied.isEquivalentTransactionInput(to: initial))
+        #expect(!SafeMetadataFileSnapshot(
+            nodeState: replacingNodeState(copiedState, size: copiedState.size + 1),
+            digest: copied.digest,
+            fileSystemMetadata: copied.fileSystemMetadata
+        ).isEquivalentTransactionInput(to: initial))
+        #expect(!SafeMetadataFileSnapshot(
+            nodeState: replacingNodeState(
+                copiedState,
+                modificationSeconds: copiedState.modificationSeconds + 1
+            ),
+            digest: copied.digest,
+            fileSystemMetadata: copied.fileSystemMetadata
+        ).isEquivalentTransactionInput(to: initial))
+        #expect(!SafeMetadataFileSnapshot(
+            nodeState: replacingNodeState(
+                copiedState,
+                modificationNanoseconds: copiedState.modificationNanoseconds + 1
+            ),
+            digest: copied.digest,
+            fileSystemMetadata: copied.fileSystemMetadata
+        ).isEquivalentTransactionInput(to: initial))
+        #expect(!SafeMetadataFileSnapshot(
+            nodeState: replacingNodeState(copiedState, mode: copiedState.mode ^ 0o020),
+            digest: copied.digest,
+            fileSystemMetadata: copied.fileSystemMetadata
+        ).isEquivalentTransactionInput(to: initial))
+        #expect(!SafeMetadataFileSnapshot(
+            nodeState: replacingNodeState(copiedState, ownerID: copiedState.ownerID + 1),
+            digest: copied.digest,
+            fileSystemMetadata: copied.fileSystemMetadata
+        ).isEquivalentTransactionInput(to: initial))
+        #expect(!SafeMetadataFileSnapshot(
+            nodeState: replacingNodeState(copiedState, groupID: copiedState.groupID + 1),
+            digest: copied.digest,
+            fileSystemMetadata: copied.fileSystemMetadata
+        ).isEquivalentTransactionInput(to: initial))
+        #expect(!SafeMetadataFileSnapshot(
+            nodeState: replacingNodeState(copiedState, flags: copiedState.flags ^ 0x1),
+            digest: copied.digest,
+            fileSystemMetadata: copied.fileSystemMetadata
+        ).isEquivalentTransactionInput(to: initial))
+        #expect(!SafeMetadataFileSnapshot(
+            nodeState: copiedState,
+            digest: Data(repeating: 0xFF, count: copied.digest.count),
+            fileSystemMetadata: copied.fileSystemMetadata
+        ).isEquivalentTransactionInput(to: initial))
+        #expect(!SafeMetadataFileSnapshot(
+            nodeState: copiedState,
+            digest: copied.digest,
+            fileSystemMetadata: copied.fileSystemMetadata + Data([0x01])
+        ).isEquivalentTransactionInput(to: initial))
+        #expect(!SafeMetadataFileSnapshot(
+            nodeState: replacingNodeState(copiedState, linkCount: 2),
+            digest: copied.digest,
+            fileSystemMetadata: copied.fileSystemMetadata
+        ).isEquivalentTransactionInput(to: initial))
+    }
+
+    @Test
     func copyNoSpaceErrorUsesStableChineseMessage() async throws {
         let directory = try TemporaryAudioDirectory()
         defer { directory.remove() }
@@ -1175,6 +1326,37 @@ private func resultWorkspaceName(from message: String?) -> String {
     else { return "missing" }
     let suffix = message[range.lowerBound...]
     return String(suffix.split(separator: "/").first ?? "missing")
+}
+
+private func replacingNodeState(
+    _ state: SafeMetadataFileNodeState,
+    device: UInt64? = nil,
+    inode: UInt64? = nil,
+    size: Int64? = nil,
+    modificationSeconds: Int64? = nil,
+    modificationNanoseconds: Int64? = nil,
+    statusChangeSeconds: Int64? = nil,
+    statusChangeNanoseconds: Int64? = nil,
+    linkCount: UInt64? = nil,
+    mode: UInt16? = nil,
+    ownerID: UInt32? = nil,
+    groupID: UInt32? = nil,
+    flags: UInt32? = nil
+) -> SafeMetadataFileNodeState {
+    SafeMetadataFileNodeState(
+        device: device ?? state.device,
+        inode: inode ?? state.inode,
+        size: size ?? state.size,
+        modificationSeconds: modificationSeconds ?? state.modificationSeconds,
+        modificationNanoseconds: modificationNanoseconds ?? state.modificationNanoseconds,
+        statusChangeSeconds: statusChangeSeconds ?? state.statusChangeSeconds,
+        statusChangeNanoseconds: statusChangeNanoseconds ?? state.statusChangeNanoseconds,
+        linkCount: linkCount ?? state.linkCount,
+        mode: mode ?? state.mode,
+        ownerID: ownerID ?? state.ownerID,
+        groupID: groupID ?? state.groupID,
+        flags: flags ?? state.flags
+    )
 }
 
 private func waitUntilFileExists(_ url: URL) async throws {

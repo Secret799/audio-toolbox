@@ -44,6 +44,19 @@ struct SafeMetadataFileSnapshot: Equatable, Sendable {
     let digest: Data
     let fileSystemMetadata: Data
 
+    func isEquivalentTransactionInput(to source: Self) -> Bool {
+        nodeState.size == source.nodeState.size
+            && nodeState.modificationSeconds == source.nodeState.modificationSeconds
+            && nodeState.modificationNanoseconds == source.nodeState.modificationNanoseconds
+            && nodeState.mode == source.nodeState.mode
+            && nodeState.ownerID == source.nodeState.ownerID
+            && nodeState.groupID == source.nodeState.groupID
+            && nodeState.flags == source.nodeState.flags
+            && nodeState.linkCount == 1
+            && digest == source.digest
+            && fileSystemMetadata == source.fileSystemMetadata
+    }
+
     func preservesFileSystemMetadata(of expected: Self) -> Bool {
         nodeState.mode == expected.nodeState.mode
             && nodeState.ownerID == expected.nodeState.ownerID

@@ -94,6 +94,7 @@ public actor SafeMetadataWriter: SafeMetadataWriting {
         do {
             ownedWork = try await createOwnedWorkFile(
                 originalURL: url,
+                initialSnapshot: initialSnapshot,
                 cancellationFlag: cancellationFlag
             )
         } catch let error as WorkspaceCancellationError {
@@ -415,6 +416,9 @@ public actor SafeMetadataWriter: SafeMetadataWriting {
         guard snapshot.nodeState.linkCount == 1 else {
             throw InitialValidationError.hardLinked
         }
+        guard snapshot.nodeState.mode & UInt16(S_ISUID | S_ISGID) == 0 else {
+            throw InitialValidationError.privilegedMode
+        }
         guard operations.isReadable(url) else {
             throw InitialValidationError.notReadable
         }
@@ -425,6 +429,7 @@ public actor SafeMetadataWriter: SafeMetadataWriting {
 
     private func createOwnedWorkFile(
         originalURL: URL,
+        initialSnapshot: SafeMetadataFileSnapshot,
         cancellationFlag: SafeMetadataCancellationFlag
     ) async throws -> OwnedWorkFile {
         let operations = fileOperations
@@ -477,6 +482,11 @@ public actor SafeMetadataWriter: SafeMetadataWriting {
                 guard copiedExpected.nodeState.identity == copiedState.identity else {
                     throw WorkValidationError.identityChanged
                 }
+                guard copiedExpected.isEquivalentTransactionInput(
+                    to: initialSnapshot
+                ) else {
+                    throw WorkValidationError.copiedInputMismatch
+                }
                 return OwnedWorkFile(
                     workspace: workspace,
                     identity: copiedState.identity,
@@ -489,6 +499,17 @@ public actor SafeMetadataWriter: SafeMetadataWriting {
                 )
                 throw WorkspaceCancellationError(
                     message: appendCleanupWarning("操作已取消", cleanup.warning)
+                )
+            } catch WorkValidationError.copiedInputMismatch {
+                let cleanup = await cleanupWorkspace(
+                    workspace,
+                    expectedFileIdentity: copiedIdentity
+                )
+                throw WorkspaceCreationError(
+                    message: appendCleanupWarning(
+                        "复制后的文件属性或内容不完整，已拒绝编辑",
+                        cleanup.warning
+                    )
                 )
             } catch let error as SafeMetadataFileSystemError {
                 let cleanup = await cleanupWorkspace(
@@ -874,6 +895,8 @@ public actor SafeMetadataWriter: SafeMetadataWriting {
                 return "目标不是普通文件"
             case .hardLinked:
                 return "文件存在硬链接别名，为避免路径分叉已拒绝编辑"
+            case .privilegedMode:
+                return "文件包含 setuid/setgid 特权位，已拒绝编辑"
             case .notReadable:
                 return "文件不可读"
             case .notWritable:
@@ -1032,6 +1055,7 @@ private struct WorkspaceCancellationError: Error, Sendable {
 
 private enum WorkValidationError: Error {
     case identityChanged
+    case copiedInputMismatch
     case preservedMetadataChanged
     case changedAfterVerification
 }
@@ -1040,6 +1064,7 @@ private enum InitialValidationError: Error {
     case symbolicLink
     case notRegularFile
     case hardLinked
+    case privilegedMode
     case notReadable
     case notWritable
 }
