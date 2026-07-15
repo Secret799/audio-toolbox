@@ -45,6 +45,7 @@ public final class LibraryViewModel: ObservableObject {
     @Published public var selectedGroupID: String?
     @Published public private(set) var selectedTrackIDs: Set<FileIdentity> = []
     @Published public private(set) var scanState: LibraryScreenState = .idle
+    @Published public private(set) var directoryOperationError: String?
     @Published public var searchText = ""
     @Published public private(set) var batchState: BatchSheetState = .closed
 
@@ -140,18 +141,19 @@ public final class LibraryViewModel: ObservableObject {
 
     public func loadDirectory(_ url: URL) async {
         guard !isBatchActive else { return }
-        guard startDirectoryLoad(
+        guard let task = startDirectoryLoad(
             url.standardizedFileURL,
             persistBookmark: true
-        ) != nil else {
+        ) else {
             return
         }
-        await Task.yield()
+        await Self.waitForScanTask(task)
     }
 
     public func restoreLastDirectory() async {
         guard !isBatchActive else { return }
 
+        directoryOperationError = nil
         invalidateScan()
         scanState = .restoring
 
@@ -160,15 +162,25 @@ public final class LibraryViewModel: ObservableObject {
                 scanState = .idle
                 return
             }
-            guard startDirectoryLoad(
+            guard let task = startDirectoryLoad(
                 restoredURL.standardizedFileURL,
                 persistBookmark: false
-            ) != nil else {
+            ) else {
                 return
             }
-            await Task.yield()
+            await Self.waitForScanTask(task)
         } catch {
             scanState = .failed("无法恢复上次目录授权：\(error.localizedDescription)")
+        }
+    }
+
+    private nonisolated static func waitForScanTask(
+        _ task: Task<Void, Never>
+    ) async {
+        await withTaskCancellationHandler {
+            await task.value
+        } onCancel: {
+            task.cancel()
         }
     }
 
@@ -286,6 +298,7 @@ public final class LibraryViewModel: ObservableObject {
         _ url: URL,
         persistBookmark: Bool
     ) -> Task<Void, Never>? {
+        directoryOperationError = nil
         let isSameDirectory = currentDirectoryURL == url
         let preservedGroupID = isSameDirectory ? selectedGroupID : nil
         let candidateLease = isSameDirectory ? nil : makeAccessLease(url)
@@ -294,7 +307,7 @@ public final class LibraryViewModel: ObservableObject {
             do {
                 try bookmarkStore.save(url: url)
             } catch {
-                scanState = .failed("无法保存目录授权：\(error.localizedDescription)")
+                directoryOperationError = "无法保存目录授权：\(error.localizedDescription)"
                 return nil
             }
         }
