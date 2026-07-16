@@ -81,7 +81,9 @@ struct SafeMetadataFileSnapshot: Equatable, Sendable {
             && nodeState.groupID == expected.nodeState.groupID
             && nodeState.flags == expected.nodeState.flags
             && digest == expected.digest
-            && fileSystemMetadata == expected.fileSystemMetadata
+            && fileSystemMetadata.isEquivalentRenameMetadata(
+                to: expected.fileSystemMetadata
+            )
     }
 }
 
@@ -144,6 +146,56 @@ private extension Data {
         return true
     }
 
+    func isEquivalentRenameMetadata(to expected: Data) -> Bool {
+        if self == expected { return true }
+        guard let actualMetadata = SafeMetadataFileSystemMetadata(self),
+              let expectedMetadata = SafeMetadataFileSystemMetadata(expected),
+              actualMetadata.acl == expectedMetadata.acl,
+              actualMetadata.extendedAttributes.keys
+                == expectedMetadata.extendedAttributes.keys else {
+            return false
+        }
+
+        for (name, expectedValue) in expectedMetadata.extendedAttributes {
+            guard let actualValue = actualMetadata.extendedAttributes[name] else {
+                return false
+            }
+            if name == "com.apple.quarantine" {
+                guard actualValue.isPermittedQuarantineRename(of: expectedValue) else {
+                    return false
+                }
+            } else if actualValue != expectedValue {
+                return false
+            }
+        }
+        return true
+    }
+
+    func isPermittedQuarantineRename(of expected: Data) -> Bool {
+        if self == expected { return true }
+        guard let actualText = String(data: self, encoding: .utf8),
+              let expectedText = String(data: expected, encoding: .utf8) else {
+            return false
+        }
+        let actualFields = actualText.split(
+            separator: ";",
+            omittingEmptySubsequences: false
+        )
+        let expectedFields = expectedText.split(
+            separator: ";",
+            omittingEmptySubsequences: false
+        )
+        guard actualFields.count == expectedFields.count,
+              actualFields.count >= 3,
+              actualFields[0].isPermittedQuarantineRenameFlag(
+                of: expectedFields[0]
+              ),
+              actualFields.dropFirst().elementsEqual(expectedFields.dropFirst()) else {
+            return false
+        }
+        return true
+    }
+
     func isPermittedQuarantineCopy(of source: Data) -> Bool {
         if self == source { return true }
         guard let copiedText = String(data: self, encoding: .utf8),
@@ -173,6 +225,18 @@ private extension Data {
 }
 
 private extension Substring {
+    func isPermittedQuarantineRenameFlag(of expected: Substring) -> Bool {
+        guard count == 4,
+              expected.count == 4,
+              let actualFlags = UInt16(self, radix: 16),
+              let expectedFlags = UInt16(expected, radix: 16) else {
+            return false
+        }
+        let sandboxManagedFlag: UInt16 = 0x0200
+        return actualFlags == expectedFlags
+            || (actualFlags ^ expectedFlags) == sandboxManagedFlag
+    }
+
     func isPermittedQuarantineFlagCopy(of source: Substring) -> Bool {
         guard count == 4,
               source.count == 4,
@@ -182,7 +246,7 @@ private extension Substring {
         }
         let sandboxManagedFlag: UInt16 = 0x0200
         return copiedFlags == sourceFlags
-            || copiedFlags == sourceFlags | sandboxManagedFlag
+            || copiedFlags == (sourceFlags | sandboxManagedFlag)
     }
 }
 

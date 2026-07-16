@@ -1563,6 +1563,68 @@ struct SafeMetadataWriterTests {
     }
 
     @Test
+    func renameEquivalenceAllowsOnlySandboxQuarantineFlagToggle() async throws {
+        let directory = try TemporaryAudioDirectory()
+        defer { directory.remove() }
+        let original = try directory.createAudioFile()
+        let quarantine = Data("0082;6a583fb6;AudioToolbox;".utf8)
+        try setExtendedAttribute(
+            quarantine,
+            named: "com.apple.quarantine",
+            at: original
+        )
+        let operations = testFileOperations()
+        let flag = try SafeMetadataCancellationFlag()
+        let expected = try operations.snapshotURL(original, flag)
+        let quarantineRange = try #require(
+            expected.fileSystemMetadata.range(of: quarantine)
+        )
+        let renamedState = replacingNodeState(
+            expected.nodeState,
+            statusChangeSeconds: expected.nodeState.statusChangeSeconds + 1
+        )
+
+        var sandboxMetadata = expected.fileSystemMetadata
+        sandboxMetadata.replaceSubrange(
+            quarantineRange,
+            with: Data("0282;6a583fb6;AudioToolbox;".utf8)
+        )
+        let sandboxSnapshot = SafeMetadataFileSnapshot(
+            nodeState: renamedState,
+            digest: expected.digest,
+            fileSystemMetadata: sandboxMetadata
+        )
+        #expect(sandboxSnapshot.matchesAfterRename(expected))
+        #expect(SafeMetadataFileSnapshot(
+            nodeState: renamedState,
+            digest: expected.digest,
+            fileSystemMetadata: expected.fileSystemMetadata
+        ).matchesAfterRename(sandboxSnapshot))
+
+        var changedTimestampMetadata = expected.fileSystemMetadata
+        changedTimestampMetadata.replaceSubrange(
+            quarantineRange,
+            with: Data("0082;6a5878f9;AudioToolbox;".utf8)
+        )
+        #expect(!SafeMetadataFileSnapshot(
+            nodeState: renamedState,
+            digest: expected.digest,
+            fileSystemMetadata: changedTimestampMetadata
+        ).matchesAfterRename(expected))
+
+        var changedFlagsMetadata = expected.fileSystemMetadata
+        changedFlagsMetadata.replaceSubrange(
+            quarantineRange,
+            with: Data("0182;6a583fb6;AudioToolbox;".utf8)
+        )
+        #expect(!SafeMetadataFileSnapshot(
+            nodeState: renamedState,
+            digest: expected.digest,
+            fileSystemMetadata: changedFlagsMetadata
+        ).matchesAfterRename(expected))
+    }
+
+    @Test
     func copyNoSpaceErrorUsesStableChineseMessage() async throws {
         let directory = try TemporaryAudioDirectory()
         defer { directory.remove() }
