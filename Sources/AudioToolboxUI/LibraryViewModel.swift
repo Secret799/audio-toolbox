@@ -74,6 +74,12 @@ public final class LibraryViewModel: ObservableObject {
             rebuildGroups()
         }
     }
+    @Published public var groupSearchText = "" {
+        didSet {
+            guard groupSearchText != oldValue else { return }
+            repairSelectedGroup()
+        }
+    }
     @Published public var selectedGroupID: String?
     @Published public private(set) var selectedTrackIDs: Set<FileIdentity> = []
     @Published public private(set) var scanState: LibraryScreenState = .idle
@@ -173,6 +179,22 @@ public final class LibraryViewModel: ObservableObject {
             failed: summary.failedCount,
             notProcessed: summary.notProcessedCount
         )
+    }
+
+    public var filteredGroups: [AudioGroup] {
+        let query = groupSearchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { return groups }
+        return groups.filter { group in
+            group.displayName.localizedStandardContains(query)
+        }
+    }
+
+    public var groupSearchPrompt: String {
+        groupingMode == .artist ? "搜索作者" : "搜索专辑"
+    }
+
+    public var groupSearchEmptyMessage: String {
+        groupingMode == .artist ? "没有匹配的作者" : "没有匹配的专辑"
     }
 
     public var currentGroup: AudioGroup? {
@@ -732,14 +754,18 @@ public final class LibraryViewModel: ObservableObject {
 
     private func repairSelectedGroup(preservingMissingGroupID: String? = nil) {
         if let selectedGroupID,
-           groups.contains(where: { $0.id == selectedGroupID }) {
+           filteredGroups.contains(where: { $0.id == selectedGroupID }) {
             return
         }
-        if let preservingMissingGroupID,
-           selectedGroupID == preservingMissingGroupID {
+        let groupQuery = groupSearchText
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if groupQuery.isEmpty,
+           let preservingMissingGroupID,
+           selectedGroupID == preservingMissingGroupID,
+           !groups.contains(where: { $0.id == preservingMissingGroupID }) {
             return
         }
-        selectedGroupID = groups.first?.id
+        selectedGroupID = filteredGroups.first?.id
     }
 
     private func publishScanningState() {

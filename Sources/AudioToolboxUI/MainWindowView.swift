@@ -34,12 +34,12 @@ public struct MainWindowView: View {
     private var sidebar: some View {
         List(selection: $viewModel.selectedGroupID) {
             Section(groupingSectionTitle) {
-                if viewModel.groups.isEmpty {
+                if viewModel.filteredGroups.isEmpty {
                     Text(sidebarPlaceholder)
                         .foregroundStyle(.secondary)
                         .font(.callout)
                 } else {
-                    ForEach(viewModel.groups) { group in
+                    ForEach(viewModel.filteredGroups) { group in
                         HStack(spacing: 8) {
                             Text(group.displayName)
                                 .lineLimit(1)
@@ -59,6 +59,11 @@ public struct MainWindowView: View {
             }
         }
         .listStyle(.sidebar)
+        .searchable(
+            text: $viewModel.groupSearchText,
+            placement: .sidebar,
+            prompt: Text(viewModel.groupSearchPrompt)
+        )
         .disabled(viewModel.isLibraryInteractionLocked)
         .accessibilityLabel("音频分组")
     }
@@ -294,7 +299,12 @@ public struct MainWindowView: View {
     }
 
     private var sidebarPlaceholder: String {
-        switch viewModel.scanState {
+        let groupQuery = viewModel.groupSearchText
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if !groupQuery.isEmpty, !viewModel.groups.isEmpty {
+            return viewModel.groupSearchEmptyMessage
+        }
+        return switch viewModel.scanState {
         case .restoring, .scanning:
             "正在扫描…"
         case .idle:

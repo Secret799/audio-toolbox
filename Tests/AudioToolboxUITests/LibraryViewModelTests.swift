@@ -375,6 +375,32 @@ struct LibraryViewModelTests {
         #expect(viewModel.selectedGroupID == "artist:Artist Two")
     }
 
+    @Test("同目录刷新且左侧搜索生效时立即选择首个可见分组")
+    @MainActor
+    func activeSidebarSearchDoesNotPreserveMissingGroupDuringRefresh() async {
+        let scanner = ControllableScanner()
+        let viewModel = makeViewModel(scanner: scanner)
+        let initialLoad = Task { await viewModel.loadDirectory(firstRoot) }
+        await scanner.waitForScanCount(1)
+        scanner.yield(.loaded(Self.firstTrack), toScan: 0)
+        scanner.yield(.loaded(Self.secondTrack), toScan: 0)
+        scanner.finish(scan: 0)
+        await initialLoad.value
+        viewModel.selectedGroupID = "artist:Artist Two"
+        viewModel.groupSearchText = "Artist"
+
+        let refresh = Task { await viewModel.loadDirectory(firstRoot) }
+        await scanner.waitForScanCount(2)
+        scanner.yield(.loaded(Self.firstTrack), toScan: 1)
+        await waitUntil { viewModel.groups.map(\.displayName) == ["Artist One"] }
+
+        #expect(viewModel.filteredGroups.map(\.displayName) == ["Artist One"])
+        #expect(viewModel.selectedGroupID == "artist:Artist One")
+
+        scanner.finish(scan: 1)
+        await refresh.value
+    }
+
     @Test("当前分组在首次加载时合理默认，并在分组消失后修复")
     @MainActor
     func selectedGroupDefaultsAndRepairsWhenGroupDisappears() async {
@@ -391,6 +417,58 @@ struct LibraryViewModelTests {
         await waitUntil { scanner.scanCount == 2 && viewModel.scanState == .loaded(failures: []) }
 
         #expect(viewModel.selectedGroupID == "artist:Artist Two")
+    }
+
+    @Test("左侧搜索按当前分组名称过滤并修复分组选择")
+    @MainActor
+    func sidebarSearchFiltersGroupNamesAndRepairsSelection() async {
+        let scanner = ScriptedScanner(scripts: [[
+            .loaded(Self.firstTrack),
+            .loaded(Self.secondTrack),
+            .finished,
+        ]])
+        let viewModel = makeViewModel(scanner: scanner)
+        await viewModel.loadDirectory(firstRoot)
+        viewModel.toggleSelection(Self.firstTrack.id)
+
+        viewModel.groupSearchText = "ARTIST two"
+
+        #expect(viewModel.filteredGroups.map(\.displayName) == ["Artist Two"])
+        #expect(viewModel.selectedGroupID == "artist:Artist Two")
+        #expect(viewModel.selectedTrackIDs == [Self.firstTrack.id])
+        #expect(viewModel.groupSearchPrompt == "搜索作者")
+
+        viewModel.groupSearchText = "missing"
+
+        #expect(viewModel.filteredGroups.isEmpty)
+        #expect(viewModel.selectedGroupID == nil)
+        #expect(viewModel.groupSearchEmptyMessage == "没有匹配的作者")
+
+        viewModel.groupSearchText = ""
+
+        #expect(viewModel.filteredGroups == viewModel.groups)
+        #expect(viewModel.selectedGroupID == "artist:Artist One")
+        #expect(viewModel.selectedTrackIDs == [Self.firstTrack.id])
+    }
+
+    @Test("切换专辑分组后左侧搜索自动匹配专辑名称")
+    @MainActor
+    func sidebarSearchAdaptsToAlbumGrouping() async {
+        let scanner = ScriptedScanner(scripts: [[
+            .loaded(Self.firstTrack),
+            .loaded(Self.secondTrack),
+            .finished,
+        ]])
+        let viewModel = makeViewModel(scanner: scanner)
+        await viewModel.loadDirectory(firstRoot)
+
+        viewModel.groupingMode = .album
+        viewModel.groupSearchText = "special"
+
+        #expect(viewModel.groupSearchPrompt == "搜索专辑")
+        #expect(viewModel.groupSearchEmptyMessage == "没有匹配的专辑")
+        #expect(viewModel.filteredGroups.map(\.displayName) == ["Special Album"])
+        #expect(viewModel.selectedGroupID == "album:Special Album")
     }
 
     @Test("搜索匹配标题、文件名、作者和专辑且限定当前组")
