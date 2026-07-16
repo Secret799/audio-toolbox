@@ -1,5 +1,37 @@
 import Foundation
 
+public enum TrackTitleSortDirection: Sendable {
+    case ascending
+    case descending
+}
+
+public struct AudioTrackTitleComparator: SortComparator, Sendable {
+    public var order: SortOrder
+    private let localeIdentifier: String
+
+    public init(order: SortOrder = .forward, locale: Locale = .current) {
+        self.order = order
+        localeIdentifier = locale.identifier
+    }
+
+    public func compare(_ lhs: AudioTrack, _ rhs: AudioTrack) -> ComparisonResult {
+        let result = LibraryProjection.compareTracks(
+            lhs,
+            rhs,
+            locale: Locale(identifier: localeIdentifier)
+        )
+        guard order == .reverse else { return result }
+        switch result {
+        case .orderedAscending:
+            return .orderedDescending
+        case .orderedDescending:
+            return .orderedAscending
+        case .orderedSame:
+            return .orderedSame
+        }
+    }
+}
+
 public enum LibraryProjection {
     public static func groups(
         tracks: [AudioTrack],
@@ -28,24 +60,44 @@ public enum LibraryProjection {
 
     public static func sortedTracks(
         _ tracks: [AudioTrack],
+        direction: TrackTitleSortDirection = .ascending,
         locale: Locale = .current
     ) -> [AudioTrack] {
         tracks.sorted { left, right in
-            let leftDisplayName = displayName(for: left)
-            let rightDisplayName = displayName(for: right)
-
-            switch compare(leftDisplayName, rightDisplayName, locale: locale) {
-            case .orderedAscending:
-                return true
-            case .orderedDescending:
-                return false
-            case .orderedSame:
-                if leftDisplayName != rightDisplayName {
-                    return leftDisplayName < rightDisplayName
-                }
-                return left.id.rawValue < right.id.rawValue
+            let result = compareTracks(left, right, locale: locale)
+            switch direction {
+            case .ascending:
+                return result == .orderedAscending
+            case .descending:
+                return result == .orderedDescending
             }
         }
+    }
+
+    fileprivate static func compareTracks(
+        _ left: AudioTrack,
+        _ right: AudioTrack,
+        locale: Locale
+    ) -> ComparisonResult {
+        let leftDisplayName = displayName(for: left)
+        let rightDisplayName = displayName(for: right)
+
+        let localizedResult = compare(leftDisplayName, rightDisplayName, locale: locale)
+        if localizedResult != .orderedSame {
+            return localizedResult
+        }
+        if leftDisplayName != rightDisplayName {
+            return leftDisplayName < rightDisplayName ? .orderedAscending : .orderedDescending
+        }
+        if left.url.lastPathComponent != right.url.lastPathComponent {
+            return left.url.lastPathComponent < right.url.lastPathComponent
+                ? .orderedAscending
+                : .orderedDescending
+        }
+        if left.id.rawValue == right.id.rawValue {
+            return .orderedSame
+        }
+        return left.id.rawValue < right.id.rawValue ? .orderedAscending : .orderedDescending
     }
 
     private static func displayName(for track: AudioTrack) -> String {

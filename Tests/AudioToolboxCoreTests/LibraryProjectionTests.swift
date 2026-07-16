@@ -129,6 +129,23 @@ struct LibraryProjectionTests {
     }
 
     @Test
+    func sortsTracksDescendingWithStableTieBreakers() {
+        let tracks = [
+            fixture(id: "2", title: "alpha"),
+            fixture(id: "1", title: "Alpha"),
+            fixture(id: "3", title: "Zulu")
+        ]
+
+        let sorted = LibraryProjection.sortedTracks(
+            tracks,
+            direction: .descending,
+            locale: Locale(identifier: "en_US")
+        )
+
+        #expect(sorted.map(\.id) == ["3", "2", "1"].map(FileIdentity.init(rawValue:)))
+    }
+
+    @Test
     func ordersEquivalentTrackNamesDeterministically() {
         let tracks = [
             fixture(id: "2", title: "alpha"),

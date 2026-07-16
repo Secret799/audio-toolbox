@@ -30,6 +30,10 @@ void ATSFCancellationFlagSetCallbackDelayForTesting(
     ATSFCancellationFlag * _Nullable flag,
     uint32_t microseconds
 );
+void ATSFCancellationFlagSetQuarantineSynchronizationErrorForTesting(
+    ATSFCancellationFlag * _Nullable flag,
+    int32_t error_code
+);
 void ATSFCancellationFlagRelease(ATSFCancellationFlag * _Nullable flag);
 
 /// Uses F_FULLFSYNC when supported and falls back to fsync. Returns 0 or errno.
@@ -37,9 +41,11 @@ int32_t ATSFFullSyncFD(int32_t fd);
 
 /// Opens source with O_NOFOLLOW, creates destination with openat(O_EXCL |
 /// O_NOFOLLOW) relative to directory_fd, then copies all data and metadata with
-/// fcopyfile(COPYFILE_ALL), then restores the exact source quarantine xattr
-/// because macOS may rewrite it while copying. The returned destination fd uses
-/// F_DUPFD_CLOEXEC and is owned by the caller, including on partial-copy failure.
+/// fcopyfile(COPYFILE_ALL), then attempts to restore the exact source quarantine
+/// xattr. App Sandbox may deny that restoration; Swift snapshot validation then
+/// permits only the system-managed timestamp rewrite and 0x0200 flag addition.
+/// The returned destination fd uses F_DUPFD_CLOEXEC and is owned by the caller,
+/// including on partial-copy failure.
 ATSFCopyResult ATSFCopyFileToDirectory(
     const char * _Nullable source_path,
     int32_t directory_fd,

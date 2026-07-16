@@ -54,7 +54,9 @@ struct SafeMetadataFileSnapshot: Equatable, Sendable {
             && nodeState.flags == source.nodeState.flags
             && nodeState.linkCount == 1
             && digest == source.digest
-            && fileSystemMetadata == source.fileSystemMetadata
+            && fileSystemMetadata.isEquivalentCopyMetadata(
+                to: source.fileSystemMetadata
+            )
     }
 
     func preservesFileSystemMetadata(of expected: Self) -> Bool {
@@ -116,6 +118,133 @@ struct SafeMetadataFileSystemError: Error, Sendable {
     }
 }
 
+private extension Data {
+    func isEquivalentCopyMetadata(to source: Data) -> Bool {
+        if self == source { return true }
+        guard let copiedMetadata = SafeMetadataFileSystemMetadata(self),
+              let sourceMetadata = SafeMetadataFileSystemMetadata(source),
+              copiedMetadata.acl == sourceMetadata.acl,
+              copiedMetadata.extendedAttributes.keys
+                == sourceMetadata.extendedAttributes.keys else {
+            return false
+        }
+
+        for (name, sourceValue) in sourceMetadata.extendedAttributes {
+            guard let copiedValue = copiedMetadata.extendedAttributes[name] else {
+                return false
+            }
+            if name == "com.apple.quarantine" {
+                guard copiedValue.isPermittedQuarantineCopy(of: sourceValue) else {
+                    return false
+                }
+            } else if copiedValue != sourceValue {
+                return false
+            }
+        }
+        return true
+    }
+
+    func isPermittedQuarantineCopy(of source: Data) -> Bool {
+        if self == source { return true }
+        guard let copiedText = String(data: self, encoding: .utf8),
+              let sourceText = String(data: source, encoding: .utf8) else {
+            return false
+        }
+        let copiedFields = copiedText.split(
+            separator: ";",
+            omittingEmptySubsequences: false
+        )
+        let sourceFields = sourceText.split(
+            separator: ";",
+            omittingEmptySubsequences: false
+        )
+        guard copiedFields.count == sourceFields.count,
+              copiedFields.count >= 3,
+              copiedFields[0].isPermittedQuarantineFlagCopy(of: sourceFields[0]),
+              copiedFields.dropFirst(2).elementsEqual(sourceFields.dropFirst(2)),
+              copiedFields[1].count == 8,
+              sourceFields[1].count == 8,
+              copiedFields[1].allSatisfy(\.isHexDigit),
+              sourceFields[1].allSatisfy(\.isHexDigit) else {
+            return false
+        }
+        return true
+    }
+}
+
+private extension Substring {
+    func isPermittedQuarantineFlagCopy(of source: Substring) -> Bool {
+        guard count == 4,
+              source.count == 4,
+              let copiedFlags = UInt16(self, radix: 16),
+              let sourceFlags = UInt16(source, radix: 16) else {
+            return false
+        }
+        let sandboxManagedFlag: UInt16 = 0x0200
+        return copiedFlags == sourceFlags
+            || copiedFlags == sourceFlags | sandboxManagedFlag
+    }
+}
+
+private struct SafeMetadataFileSystemMetadata {
+    let acl: Data
+    let extendedAttributes: [String: Data]
+
+    init?(_ data: Data) {
+        var reader = SafeMetadataBlobReader(data: data)
+        guard let acl = reader.readLengthPrefixedData(),
+              let attributeCount = reader.readUInt64(),
+              attributeCount <= UInt64(reader.remainingCount / 16),
+              attributeCount <= UInt64(Int.max) else {
+            return nil
+        }
+
+        var attributes: [String: Data] = [:]
+        attributes.reserveCapacity(Int(attributeCount))
+        for _ in 0..<Int(attributeCount) {
+            guard let nameData = reader.readLengthPrefixedData(),
+                  let name = String(data: nameData, encoding: .utf8),
+                  attributes[name] == nil,
+                  let value = reader.readLengthPrefixedData() else {
+                return nil
+            }
+            attributes[name] = value
+        }
+        guard reader.isAtEnd else { return nil }
+        self.acl = acl
+        extendedAttributes = attributes
+    }
+}
+
+private struct SafeMetadataBlobReader {
+    let data: Data
+    private(set) var offset = 0
+
+    var isAtEnd: Bool { offset == data.count }
+    var remainingCount: Int { data.count - offset }
+
+    mutating func readUInt64() -> UInt64? {
+        guard offset <= data.count - MemoryLayout<UInt64>.size else { return nil }
+        var value: UInt64 = 0
+        for byteOffset in 0..<MemoryLayout<UInt64>.size {
+            value |= UInt64(data[offset + byteOffset]) << UInt64(byteOffset * 8)
+        }
+        offset += MemoryLayout<UInt64>.size
+        return value
+    }
+
+    mutating func readLengthPrefixedData() -> Data? {
+        guard let encodedLength = readUInt64(),
+              encodedLength <= UInt64(Int.max) else {
+            return nil
+        }
+        let length = Int(encodedLength)
+        guard length <= data.count - offset else { return nil }
+        defer { offset += length }
+        return data.subdata(in: offset..<(offset + length))
+    }
+}
+
 final class SafeMetadataCancellationFlag: @unchecked Sendable {
     private let rawFlag: OpaquePointer
 
@@ -144,6 +273,13 @@ final class SafeMetadataCancellationFlag: @unchecked Sendable {
 
     func setCopyCallbackDelayForTesting(microseconds: UInt32) {
         ATSFCancellationFlagSetCallbackDelayForTesting(rawFlag, microseconds)
+    }
+
+    func setQuarantineSynchronizationErrorForTesting(_ errorCode: Int32) {
+        ATSFCancellationFlagSetQuarantineSynchronizationErrorForTesting(
+            rawFlag,
+            errorCode
+        )
     }
 }
 

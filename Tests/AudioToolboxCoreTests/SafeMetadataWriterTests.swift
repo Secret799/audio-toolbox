@@ -1054,6 +1054,40 @@ struct SafeMetadataWriterTests {
 
 
     @Test
+    func liveCopyfileBridgeReturnsOwnedCopyWhenQuarantineSynchronizationIsDenied() async throws {
+        let directory = try TemporaryAudioDirectory()
+        defer { directory.remove() }
+        let original = try directory.createAudioFile()
+        let quarantine = Data("0082;6a583fb6;AudioToolbox;".utf8)
+        try setExtendedAttribute(
+            quarantine,
+            named: "com.apple.quarantine",
+            at: original
+        )
+        let operations = testFileOperations()
+        let workspace = try operations.createWorkspace(original, "clone-fallback")
+        let flag = try SafeMetadataCancellationFlag()
+        flag.setQuarantineSynchronizationErrorForTesting(EACCES)
+        let copied = try operations.copyIntoWorkspace(original, workspace, flag)
+
+        #expect(copied.isRegularFile)
+        #expect(try Data(contentsOf: workspace.fileURL) == Data(contentsOf: original))
+        let fileRemoval = operations.removeWorkspaceFileIfOwned(workspace, copied.identity)
+        if case .removed = fileRemoval {
+            // expected
+        } else {
+            Issue.record("quarantine 同步受限后的工作副本应可按 owned inode 清理")
+        }
+        let directoryRemoval = operations.removeWorkspaceDirectoryIfOwned(workspace)
+        workspace.closeDescriptors()
+        if case .removed = directoryRemoval {
+            // expected
+        } else {
+            Issue.record("清理受限同步工作副本后私有目录应可删除")
+        }
+    }
+
+    @Test
     func liveCopyfileBridgeHonorsCancellationFlagBeforeCopy() async throws {
         let directory = try TemporaryAudioDirectory()
         defer { directory.remove() }
@@ -1389,6 +1423,12 @@ struct SafeMetadataWriterTests {
         let directory = try TemporaryAudioDirectory()
         defer { directory.remove() }
         let original = try directory.createAudioFile()
+        let sourceQuarantine = Data("0082;6a583fb6;AudioToolbox;".utf8)
+        try setExtendedAttribute(
+            sourceQuarantine,
+            named: "com.apple.quarantine",
+            at: original
+        )
         let operations = testFileOperations()
         let flag = try SafeMetadataCancellationFlag()
         let initial = try operations.snapshotURL(original, flag)
@@ -1406,6 +1446,64 @@ struct SafeMetadataWriterTests {
         )
 
         #expect(copied.isEquivalentTransactionInput(to: initial))
+
+        let rewrittenQuarantine = Data("0082;6a5878f9;AudioToolbox;".utf8)
+        var rewrittenMetadata = initial.fileSystemMetadata
+        let quarantineRange = try #require(rewrittenMetadata.range(of: sourceQuarantine))
+        rewrittenMetadata.replaceSubrange(quarantineRange, with: rewrittenQuarantine)
+        #expect(SafeMetadataFileSnapshot(
+            nodeState: copiedState,
+            digest: copied.digest,
+            fileSystemMetadata: rewrittenMetadata
+        ).isEquivalentTransactionInput(to: initial))
+
+        var sandboxRewrittenMetadata = initial.fileSystemMetadata
+        let sandboxRewrittenQuarantine = Data("0282;6a5878f9;AudioToolbox;".utf8)
+        sandboxRewrittenMetadata.replaceSubrange(
+            quarantineRange,
+            with: sandboxRewrittenQuarantine
+        )
+        #expect(SafeMetadataFileSnapshot(
+            nodeState: copiedState,
+            digest: copied.digest,
+            fileSystemMetadata: sandboxRewrittenMetadata
+        ).isEquivalentTransactionInput(to: initial))
+
+        var sourceWithSandboxFlagMetadata = initial.fileSystemMetadata
+        let sourceWithSandboxFlag = Data("0282;6a583fb6;AudioToolbox;".utf8)
+        sourceWithSandboxFlagMetadata.replaceSubrange(
+            quarantineRange,
+            with: sourceWithSandboxFlag
+        )
+        let sourceWithSandboxFlagSnapshot = SafeMetadataFileSnapshot(
+            nodeState: initial.nodeState,
+            digest: initial.digest,
+            fileSystemMetadata: sourceWithSandboxFlagMetadata
+        )
+        #expect(!SafeMetadataFileSnapshot(
+            nodeState: copiedState,
+            digest: copied.digest,
+            fileSystemMetadata: rewrittenMetadata
+        ).isEquivalentTransactionInput(to: sourceWithSandboxFlagSnapshot))
+
+        var changedFlagsMetadata = initial.fileSystemMetadata
+        let changedFlagsQuarantine = Data("0083;6a5878f9;AudioToolbox;".utf8)
+        changedFlagsMetadata.replaceSubrange(quarantineRange, with: changedFlagsQuarantine)
+        #expect(!SafeMetadataFileSnapshot(
+            nodeState: copiedState,
+            digest: copied.digest,
+            fileSystemMetadata: changedFlagsMetadata
+        ).isEquivalentTransactionInput(to: initial))
+
+        var changedAgentMetadata = initial.fileSystemMetadata
+        let changedAgentQuarantine = Data("0082;6a5878f9;AudioToolb0x;".utf8)
+        changedAgentMetadata.replaceSubrange(quarantineRange, with: changedAgentQuarantine)
+        #expect(!SafeMetadataFileSnapshot(
+            nodeState: copiedState,
+            digest: copied.digest,
+            fileSystemMetadata: changedAgentMetadata
+        ).isEquivalentTransactionInput(to: initial))
+
         #expect(!SafeMetadataFileSnapshot(
             nodeState: replacingNodeState(copiedState, size: copiedState.size + 1),
             digest: copied.digest,

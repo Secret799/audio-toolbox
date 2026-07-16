@@ -14,6 +14,7 @@
 struct ATSFCancellationFlag {
     atomic_bool cancelled;
     atomic_uint callback_delay_microseconds;
+    atomic_int quarantine_synchronization_error_for_testing;
 };
 
 typedef struct {
@@ -163,6 +164,7 @@ ATSFCancellationFlag *ATSFCancellationFlagCreate(void) {
     }
     atomic_init(&flag->cancelled, false);
     atomic_init(&flag->callback_delay_microseconds, 0);
+    atomic_init(&flag->quarantine_synchronization_error_for_testing, 0);
     return flag;
 }
 
@@ -185,6 +187,19 @@ void ATSFCancellationFlagSetCallbackDelayForTesting(
         atomic_store_explicit(
             &flag->callback_delay_microseconds,
             microseconds,
+            memory_order_relaxed
+        );
+    }
+}
+
+void ATSFCancellationFlagSetQuarantineSynchronizationErrorForTesting(
+    ATSFCancellationFlag *flag,
+    int32_t error_code
+) {
+    if(flag != NULL) {
+        atomic_store_explicit(
+            &flag->quarantine_synchronization_error_for_testing,
+            error_code,
             memory_order_relaxed
         );
     }
@@ -279,18 +294,35 @@ ATSFCopyResult ATSFCopyFileToDirectory(
     int copy_result = fcopyfile(source_fd, destination_fd, state, COPYFILE_ALL);
     int copy_error = copy_result == 0 ? 0 : errno;
     if(copy_result == 0 && !ATSFCancellationFlagIsCancelled(cancellation_flag)) {
-        copy_error = ATSFSynchronizeExtendedAttribute(
-            source_fd,
-            destination_fd,
-            "com.apple.quarantine"
-        );
-        if(copy_error != 0) {
+        int forced_error = cancellation_flag == NULL
+            ? 0
+            : atomic_load_explicit(
+                &cancellation_flag->quarantine_synchronization_error_for_testing,
+                memory_order_relaxed
+            );
+        copy_error = forced_error != 0
+            ? forced_error
+            : ATSFSynchronizeExtendedAttribute(
+                source_fd,
+                destination_fd,
+                "com.apple.quarantine"
+            );
+        if(copy_error == EACCES || copy_error == EPERM) {
+            // App Sandbox may preserve quarantine semantics while rewriting its
+            // timestamp and adding the system-managed 0x0200 flag. Swift snapshot
+            // validation permits only those changes and rejects every other one.
+            copy_error = 0;
+        } else if(copy_error != 0) {
             copy_result = -1;
         }
     }
-    result.destination_fd = fcntl(destination_fd, F_DUPFD_CLOEXEC, 0);
+    result.destination_fd = destination_fd < 0
+        ? -1
+        : fcntl(destination_fd, F_DUPFD_CLOEXEC, 0);
     copyfile_state_free(state);
-    close(destination_fd);
+    if(destination_fd >= 0) {
+        close(destination_fd);
+    }
     close(source_fd);
 
     if(ATSFCancellationFlagIsCancelled(cancellation_flag)) {

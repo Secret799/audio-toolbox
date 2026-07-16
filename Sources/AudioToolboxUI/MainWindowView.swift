@@ -174,6 +174,23 @@ public struct MainWindowView: View {
             }
             .accessibilityLabel("选择或取消选择当前组全部文件")
 
+            Toggle(isOn: $viewModel.showsSuspectedDuplicatesOnly) {
+                Label(
+                    "疑似重复 \(viewModel.suspectedDuplicateTrackCount)",
+                    systemImage: "doc.on.doc"
+                )
+            }
+            .toggleStyle(.button)
+            .help(viewModel.showsSuspectedDuplicatesOnly
+                ? "当前只显示本分组中的疑似重复文件"
+                : "只显示标题相似度不低于 85% 且时长接近的文件")
+            .disabled(
+                viewModel.isLibraryInteractionLocked
+                    || (viewModel.suspectedDuplicateTrackCount == 0
+                        && !viewModel.showsSuspectedDuplicatesOnly)
+            )
+            .accessibilityLabel("筛选当前分组疑似重复文件")
+
             TextField("搜索当前组", text: $viewModel.searchText)
                 .textFieldStyle(.roundedBorder)
                 .frame(minWidth: 180, idealWidth: 240, maxWidth: 320)

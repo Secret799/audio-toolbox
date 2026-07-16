@@ -497,6 +497,137 @@ struct LibraryViewModelTests {
         #expect(viewModel.filteredTracks.isEmpty)
     }
 
+    @Test("标题排序支持升序和降序并在当前组内稳定生效")
+    @MainActor
+    func titleSortOrderControlsFilteredTracks() async {
+        let alpha = Self.suspectedDuplicateTrack(
+            id: "alpha",
+            fileName: "alpha.mp3",
+            title: "Alpha",
+            artist: "排序作者",
+            duration: 100
+        )
+        let zulu = Self.suspectedDuplicateTrack(
+            id: "zulu",
+            fileName: "zulu.mp3",
+            title: "Zulu",
+            artist: "排序作者",
+            duration: 100
+        )
+        let scanner = ScriptedScanner(scripts: [[.loaded(zulu), .loaded(alpha), .finished]])
+        let viewModel = makeViewModel(scanner: scanner)
+        await viewModel.loadDirectory(firstRoot)
+        viewModel.selectedGroupID = "artist:排序作者"
+
+        #expect(viewModel.filteredTracks.map(\.id) == [alpha.id, zulu.id])
+
+        viewModel.titleSortOrder = [AudioTrackTitleComparator(order: .reverse)]
+
+        #expect(viewModel.filteredTracks.map(\.id) == [zulu.id, alpha.id])
+    }
+
+    @Test("疑似重复开关只显示当前分组重复文件且保留已有选择")
+    @MainActor
+    func suspectedDuplicateFilterPreservesSelection() async throws {
+        let original = Self.suspectedDuplicateTrack(
+            id: "duplicate-original",
+            fileName: "故事.mp3",
+            title: "故事",
+            artist: "重复作者",
+            duration: 300
+        )
+        let copy = Self.suspectedDuplicateTrack(
+            id: "duplicate-copy",
+            fileName: "故事 copy.mp3",
+            title: "故事 copy",
+            artist: "重复作者",
+            duration: 301
+        )
+        let other = Self.suspectedDuplicateTrack(
+            id: "other",
+            fileName: "其他.mp3",
+            title: "其他",
+            artist: "重复作者",
+            duration: 300
+        )
+        let scanner = ScriptedScanner(scripts: [[
+            .loaded(original), .loaded(copy), .loaded(other), .finished,
+        ]])
+        let viewModel = makeViewModel(scanner: scanner)
+        await viewModel.loadDirectory(firstRoot)
+        viewModel.selectedGroupID = "artist:重复作者"
+        viewModel.toggleSelection(other.id)
+
+        let originalMembership = try #require(viewModel.suspectedDuplicateMembership(for: original.id))
+        let copyMembership = try #require(viewModel.suspectedDuplicateMembership(for: copy.id))
+        #expect(originalMembership.groupNumber == copyMembership.groupNumber)
+        #expect(viewModel.suspectedDuplicateTrackCount == 2)
+        #expect(viewModel.suspectedDuplicateStatusText(for: original.id)
+            == "疑似重复 1 · 100% · 相差 1.0 秒")
+
+        viewModel.showsSuspectedDuplicatesOnly = true
+
+        #expect(viewModel.filteredTracks.map(\.id) == [original.id, copy.id])
+        #expect(viewModel.selectedTrackIDs == [other.id])
+    }
+
+    @Test("疑似重复检测不跨作者分组")
+    @MainActor
+    func suspectedDuplicateDetectionDoesNotCrossGroups() async {
+        let first = Self.suspectedDuplicateTrack(
+            id: "group-a",
+            fileName: "同名.mp3",
+            title: "同名",
+            artist: "作者 A",
+            duration: 100
+        )
+        let second = Self.suspectedDuplicateTrack(
+            id: "group-b",
+            fileName: "同名 copy.mp3",
+            title: "同名 copy",
+            artist: "作者 B",
+            duration: 100
+        )
+        let scanner = ScriptedScanner(scripts: [[.loaded(first), .loaded(second), .finished]])
+        let viewModel = makeViewModel(scanner: scanner)
+        await viewModel.loadDirectory(firstRoot)
+
+        viewModel.selectedGroupID = "artist:作者 A"
+        #expect(viewModel.suspectedDuplicateTrackCount == 0)
+        #expect(viewModel.suspectedDuplicateMembership(for: first.id) == nil)
+
+        viewModel.selectedGroupID = "artist:作者 B"
+        #expect(viewModel.suspectedDuplicateTrackCount == 0)
+        #expect(viewModel.suspectedDuplicateMembership(for: second.id) == nil)
+    }
+
+    @Test("搜索与疑似重复筛选取交集")
+    @MainActor
+    func searchIntersectsSuspectedDuplicateFilter() async {
+        let first = Self.suspectedDuplicateTrack(
+            id: "search-a",
+            fileName: "故事.mp3",
+            title: "故事",
+            artist: "交集作者",
+            duration: 100
+        )
+        let second = Self.suspectedDuplicateTrack(
+            id: "search-b",
+            fileName: "故事 copy.mp3",
+            title: "故事 copy",
+            artist: "交集作者",
+            duration: 101
+        )
+        let scanner = ScriptedScanner(scripts: [[.loaded(first), .loaded(second), .finished]])
+        let viewModel = makeViewModel(scanner: scanner)
+        await viewModel.loadDirectory(firstRoot)
+        viewModel.selectedGroupID = "artist:交集作者"
+        viewModel.showsSuspectedDuplicatesOnly = true
+        viewModel.searchText = "copy"
+
+        #expect(viewModel.filteredTracks.map(\.id) == [second.id])
+    }
+
     @Test("搜索后全选仍选择当前完整分组")
     @MainActor
     func selectingGroupAfterSearchSelectsEntireGroup() async {
@@ -1138,6 +1269,31 @@ struct LibraryViewModelTests {
         artist: "Edited Artist",
         album: "Special Album"
     )
+
+    private static func suspectedDuplicateTrack(
+        id: String,
+        fileName: String,
+        title: String?,
+        artist: String,
+        album: String = "重复专辑",
+        duration: TimeInterval?
+    ) -> AudioTrack {
+        AudioTrack(
+            id: FileIdentity(rawValue: id),
+            url: URL(fileURLWithPath: "/virtual/\(fileName)"),
+            format: .mp3,
+            metadata: AudioMetadata(
+                title: title,
+                artists: [artist],
+                albums: [album],
+                duration: duration
+            ),
+            fileSize: 1_024,
+            modificationDate: Date(timeIntervalSince1970: 1_700_000_000),
+            isWritable: true,
+            issue: nil
+        )
+    }
 
     private static func track(
         id: String,

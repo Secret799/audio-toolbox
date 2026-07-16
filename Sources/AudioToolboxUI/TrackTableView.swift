@@ -9,7 +9,10 @@ public struct TrackTableView: View {
     }
 
     public var body: some View {
-        Table(viewModel.filteredTracks) {
+        Table(
+            viewModel.filteredTracks,
+            sortOrder: $viewModel.titleSortOrder
+        ) {
             TableColumn("选择") { track in
                 Toggle(
                     "选择 \(displayTitle(for: track))",
@@ -22,7 +25,10 @@ public struct TrackTableView: View {
             }
             .width(min: 42, ideal: 48, max: 56)
 
-            TableColumn("标题 / 文件名") { track in
+            TableColumn(
+                "标题 / 文件名",
+                sortUsing: AudioTrackTitleComparator()
+            ) { track in
                 VStack(alignment: .leading, spacing: 2) {
                     Text(displayTitle(for: track))
                         .lineLimit(1)
@@ -69,9 +75,21 @@ public struct TrackTableView: View {
             .width(min: 72, ideal: 86, max: 104)
 
             TableColumn("状态") { track in
-                TrackStatusView(track: track)
+                VStack(alignment: .leading, spacing: 3) {
+                    TrackStatusView(track: track)
+                    if let duplicateStatus = viewModel.suspectedDuplicateStatusText(
+                        for: track.id
+                    ) {
+                        Label(duplicateStatus, systemImage: "doc.on.doc.fill")
+                            .font(.caption2)
+                            .foregroundStyle(.orange)
+                            .lineLimit(1)
+                            .help(duplicateStatus)
+                            .accessibilityLabel(duplicateStatus)
+                    }
+                }
             }
-            .width(min: 88, ideal: 108, max: 140)
+            .width(min: 120, ideal: 190, max: 250)
         }
         .accessibilityLabel("当前分组文件表格")
     }

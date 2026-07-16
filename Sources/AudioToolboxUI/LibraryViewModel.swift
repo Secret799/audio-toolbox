@@ -80,11 +80,18 @@ public final class LibraryViewModel: ObservableObject {
             repairSelectedGroup()
         }
     }
-    @Published public var selectedGroupID: String?
+    @Published public var selectedGroupID: String? {
+        didSet {
+            guard selectedGroupID != oldValue else { return }
+            rebuildSuspectedDuplicateAnalysis()
+        }
+    }
     @Published public private(set) var selectedTrackIDs: Set<FileIdentity> = []
     @Published public private(set) var scanState: LibraryScreenState = .idle
     @Published public private(set) var directoryOperationError: String?
     @Published public var searchText = ""
+    @Published public var titleSortOrder = [AudioTrackTitleComparator()]
+    @Published public var showsSuspectedDuplicatesOnly = false
     @Published public var filtersInvalidAudioFiles = true {
         didSet {
             guard filtersInvalidAudioFiles != oldValue else { return }
@@ -202,6 +209,25 @@ public final class LibraryViewModel: ObservableObject {
         return groups.first { $0.id == selectedGroupID }
     }
 
+    public var suspectedDuplicateTrackCount: Int {
+        suspectedDuplicateMemberships.count
+    }
+
+    public func suspectedDuplicateMembership(
+        for trackID: FileIdentity
+    ) -> SuspectedDuplicateMembership? {
+        suspectedDuplicateMemberships[trackID]
+    }
+
+    public func suspectedDuplicateStatusText(for trackID: FileIdentity) -> String? {
+        guard let membership = suspectedDuplicateMemberships[trackID] else { return nil }
+        let percentage = Int((membership.similarity * 100).rounded())
+        let durationDifference = membership.durationDifference.formatted(
+            .number.precision(.fractionLength(1))
+        )
+        return "疑似重复 \(membership.groupNumber) · \(percentage)% · 相差 \(durationDifference) 秒"
+    }
+
     public var currentGroupHasEditableTracks: Bool {
         guard let currentGroup else { return false }
         let editableIDs = Set(tracks.lazy.filter(\.isEditable).map(\.id))
@@ -275,20 +301,33 @@ public final class LibraryViewModel: ObservableObject {
         }
 
         let visibleIDs = Set(group.trackIDs)
-        let tracksInGroup = tracks.filter { visibleIDs.contains($0.id) }
-        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !query.isEmpty else { return tracksInGroup }
+        var tracksInGroup = tracks.filter { visibleIDs.contains($0.id) }
+        if showsSuspectedDuplicatesOnly {
+            tracksInGroup.removeAll { suspectedDuplicateMemberships[$0.id] == nil }
+        }
 
-        return tracksInGroup.filter { track in
-            let values: [String] = [
-                track.metadata.title,
-                track.url.lastPathComponent,
-                track.metadata.artists.joined(separator: " "),
-                track.metadata.albums.joined(separator: " "),
-            ].compactMap { $0 }
-            return values.contains { $0.localizedStandardContains(query) }
+        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !query.isEmpty {
+            tracksInGroup.removeAll { track in
+                let values: [String] = [
+                    track.metadata.title,
+                    track.url.lastPathComponent,
+                    track.metadata.artists.joined(separator: " "),
+                    track.metadata.albums.joined(separator: " "),
+                ].compactMap { $0 }
+                return !values.contains { $0.localizedStandardContains(query) }
+            }
+        }
+
+        let comparator = titleSortOrder.first ?? AudioTrackTitleComparator()
+        return tracksInGroup.sorted {
+            comparator.compare($0, $1) == .orderedAscending
         }
     }
+
+    private var suspectedDuplicateMemberships: [
+        FileIdentity: SuspectedDuplicateMembership
+    ] = [:]
 
     private let scanner: any DirectoryScanning
     private let batchEditor: any BatchEditing
@@ -750,6 +789,18 @@ public final class LibraryViewModel: ObservableObject {
     private func rebuildGroups(preservingMissingGroupID: String? = nil) {
         groups = LibraryProjection.groups(tracks: visibleTracks, mode: groupingMode)
         repairSelectedGroup(preservingMissingGroupID: preservingMissingGroupID)
+        rebuildSuspectedDuplicateAnalysis()
+    }
+
+    private func rebuildSuspectedDuplicateAnalysis() {
+        guard let selectedGroupID,
+              let group = groups.first(where: { $0.id == selectedGroupID }) else {
+            suspectedDuplicateMemberships = [:]
+            return
+        }
+        let groupIDs = Set(group.trackIDs)
+        let groupTracks = tracks.filter { groupIDs.contains($0.id) }
+        suspectedDuplicateMemberships = SuspectedDuplicateDetector.analyze(groupTracks)
     }
 
     private func repairSelectedGroup(preservingMissingGroupID: String? = nil) {
