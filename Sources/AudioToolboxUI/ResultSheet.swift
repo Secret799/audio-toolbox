@@ -6,6 +6,7 @@ public struct ResultSheet: View {
     private enum Filter: String, CaseIterable, Identifiable {
         case all
         case succeeded
+        case warning
         case failed
         case notProcessed
 
@@ -15,6 +16,7 @@ public struct ResultSheet: View {
             switch self {
             case .all: "全部"
             case .succeeded: "成功"
+            case .warning: "有警告"
             case .failed: "失败"
             case .notProcessed: "未处理"
             }
@@ -57,7 +59,12 @@ public struct ResultSheet: View {
                     .foregroundStyle(.secondary)
             }
             Spacer()
-            resultCount(title: "成功", value: summary.succeededCount, color: .green)
+            resultCount(title: "成功", value: summary.cleanSucceededCount, color: .green)
+            resultCount(
+                title: "成功有警告",
+                value: summary.succeededWithWarningCount,
+                color: .orange
+            )
             resultCount(title: "失败", value: summary.failedCount, color: .red)
             resultCount(title: "未处理", value: summary.notProcessedCount, color: .orange)
         }
@@ -75,7 +82,7 @@ public struct ResultSheet: View {
                 }
             }
             .pickerStyle(.segmented)
-            .frame(width: 510)
+            .frame(width: 650)
             Spacer()
         }
         .padding(.horizontal, 20)
@@ -113,8 +120,8 @@ public struct ResultSheet: View {
 
     private func resultRow(_ result: BatchFileResult) -> some View {
         HStack(alignment: .top, spacing: 12) {
-            Image(systemName: statusIcon(result.status))
-                .foregroundStyle(statusColor(result.status))
+            Image(systemName: statusIcon(result))
+                .foregroundStyle(statusColor(result))
                 .frame(width: 20)
 
             VStack(alignment: .leading, spacing: 5) {
@@ -122,9 +129,9 @@ public struct ResultSheet: View {
                     Text(result.url.lastPathComponent)
                         .fontWeight(.medium)
                         .lineLimit(1)
-                    Text(statusTitle(result.status))
+                    Text(statusTitle(result))
                         .font(.caption.weight(.semibold))
-                        .foregroundStyle(statusColor(result.status))
+                        .foregroundStyle(statusColor(result))
                 }
                 Text(result.url.path)
                     .font(.caption)
@@ -140,17 +147,31 @@ public struct ResultSheet: View {
 
             Spacer(minLength: 12)
 
-            Button("在 Finder 中显示") {
-                NSWorkspace.shared.activateFileViewerSelecting([result.url])
+            VStack(alignment: .trailing, spacing: 8) {
+                Button("显示原文件") {
+                    NSWorkspace.shared.activateFileViewerSelecting([result.url])
+                }
+                .controlSize(.small)
+
+                if let recoveryURL = result.recoveryURL {
+                    Button("显示恢复文件") {
+                        NSWorkspace.shared.activateFileViewerSelecting([recoveryURL])
+                    }
+                    .controlSize(.small)
+                    .help(recoveryURL.path)
+                }
             }
-            .controlSize(.small)
         }
         .padding(.vertical, 11)
     }
 
     private var footer: some View {
         HStack {
-            if summary.failedCount > 0 {
+            if summary.succeededWithWarningCount > 0 {
+                Label("部分文件修改成功但有清理警告，请确认并保留需要的恢复文件。", systemImage: "exclamationmark.triangle")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            } else if summary.failedCount > 0 {
                 Label("失败文件保留原文件；可查看原因后重试。", systemImage: "info.circle")
                     .font(.callout)
                     .foregroundStyle(.secondary)
@@ -163,7 +184,9 @@ public struct ResultSheet: View {
     }
 
     private var hasWarnings: Bool {
-        summary.failedCount > 0 || summary.notProcessedCount > 0
+        summary.succeededWithWarningCount > 0
+            || summary.failedCount > 0
+            || summary.notProcessedCount > 0
     }
 
     private func resultCount(title: String, value: Int, color: Color) -> some View {
@@ -183,7 +206,9 @@ public struct ResultSheet: View {
         case .all:
             summary.results
         case .succeeded:
-            summary.results.filter { $0.status == .succeeded }
+            summary.cleanSucceededResults
+        case .warning:
+            summary.succeededWithWarnings
         case .failed:
             summary.results.filter { $0.status == .failed }
         case .notProcessed:
@@ -194,40 +219,44 @@ public struct ResultSheet: View {
     private func count(for filter: Filter) -> Int {
         switch filter {
         case .all: summary.results.count
-        case .succeeded: summary.succeededCount
+        case .succeeded: summary.cleanSucceededCount
+        case .warning: summary.succeededWithWarningCount
         case .failed: summary.failedCount
         case .notProcessed: summary.notProcessedCount
         }
     }
 
-    private func statusTitle(_ status: BatchFileStatus) -> String {
-        switch status {
-        case .succeeded: "成功"
-        case .failed: "失败"
-        case .notProcessed: "未处理"
+    private func statusTitle(_ result: BatchFileResult) -> String {
+        if result.isSucceededWithWarning { return "成功，有警告" }
+        switch result.status {
+        case .succeeded: return "成功"
+        case .failed: return "失败"
+        case .notProcessed: return "未处理"
         }
     }
 
-    private func statusIcon(_ status: BatchFileStatus) -> String {
-        switch status {
-        case .succeeded: "checkmark.circle.fill"
-        case .failed: "xmark.circle.fill"
-        case .notProcessed: "minus.circle.fill"
+    private func statusIcon(_ result: BatchFileResult) -> String {
+        if result.isSucceededWithWarning { return "exclamationmark.circle.fill" }
+        switch result.status {
+        case .succeeded: return "checkmark.circle.fill"
+        case .failed: return "xmark.circle.fill"
+        case .notProcessed: return "minus.circle.fill"
         }
     }
 
-    private func statusColor(_ status: BatchFileStatus) -> Color {
-        switch status {
-        case .succeeded: .green
-        case .failed: .red
-        case .notProcessed: .orange
+    private func statusColor(_ result: BatchFileResult) -> Color {
+        if result.isSucceededWithWarning { return .orange }
+        switch result.status {
+        case .succeeded: return .green
+        case .failed: return .red
+        case .notProcessed: return .orange
         }
     }
 
     private func resultReason(_ result: BatchFileResult) -> String? {
         switch result.status {
         case .succeeded:
-            nil
+            result.message.map { "警告：\($0)" }
         case .failed:
             "原因：\(result.message ?? "未知错误")"
         case .notProcessed:

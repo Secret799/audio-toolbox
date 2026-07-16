@@ -104,12 +104,16 @@ public struct MainWindowView: View {
                 message: "正在重新取得上次使用目录的访问权限…",
                 progress: nil
             )
-        case let .scanning(discovered, loaded, _):
-            if viewModel.tracks.isEmpty {
+        case let .scanning(discovered, processed, loaded, _):
+            if viewModel.visibleTracks.isEmpty {
                 ProgressLibraryState(
                     title: "正在扫描音频文件",
-                    message: scanProgressText(discovered: discovered, loaded: loaded),
-                    progress: scanProgress(discovered: discovered, loaded: loaded)
+                    message: scanProgressText(
+                        discovered: discovered,
+                        processed: processed,
+                        loaded: loaded
+                    ),
+                    progress: scanProgress(discovered: discovered, processed: processed)
                 )
             } else {
                 libraryTableContent
@@ -159,7 +163,7 @@ public struct MainWindowView: View {
 
             CurrentGroupSelectionToggle(
                 state: viewModel.currentGroupSelectionState,
-                isEnabled: viewModel.currentGroup != nil
+                isEnabled: viewModel.currentGroupHasEditableTracks
             ) { selected in
                 viewModel.setCurrentGroupSelected(selected)
             }
@@ -215,6 +219,16 @@ public struct MainWindowView: View {
             .frame(width: 150)
             .disabled(viewModel.isLibraryInteractionLocked)
             .accessibilityLabel("按作者或专辑分组")
+
+            Toggle(isOn: $viewModel.filtersInvalidAudioFiles) {
+                Label("过滤无效文件", systemImage: "line.3.horizontal.decrease.circle")
+            }
+            .toggleStyle(.button)
+            .help(viewModel.filtersInvalidAudioFiles
+                ? "当前隐藏无法读取或无法播放的音频文件"
+                : "当前显示无效文件；这些文件不能选择或编辑")
+            .disabled(viewModel.isLibraryInteractionLocked)
+            .accessibilityLabel("过滤无效音频文件")
 
             Button {
                 refreshDirectory()
@@ -307,12 +321,14 @@ public struct MainWindowView: View {
             "等待选择目录"
         case .restoring:
             "正在恢复目录权限"
-        case let .scanning(discovered, loaded, _):
-            discovered > 0 ? "已载入 \(loaded) / 已发现 \(discovered)" : "已载入 \(loaded)"
+        case let .scanning(discovered, processed, loaded, _):
+            discovered > 0
+                ? "已处理 \(processed) / 已发现 \(discovered)，有效 \(loaded)"
+                : "已处理 \(processed)，有效 \(loaded)"
         case .loaded:
-            "已载入 \(viewModel.tracks.count) 个文件"
+            libraryCountStatusText
         case .empty:
-            "已载入 0 个文件"
+            libraryCountStatusText
         case .failed:
             "扫描失败"
         }
@@ -342,14 +358,25 @@ public struct MainWindowView: View {
         Task { await viewModel.loadDirectory(url) }
     }
 
-    private func scanProgress(discovered: Int, loaded: Int) -> Double? {
-        guard discovered > 0 else { return nil }
-        return min(Double(loaded) / Double(discovered), 1)
+    private var libraryCountStatusText: String {
+        if viewModel.hiddenInvalidTrackCount > 0 {
+            return "显示 \(viewModel.visibleTrackCount) 个文件，已过滤 \(viewModel.hiddenInvalidTrackCount) 个无效文件"
+        }
+        return "显示 \(viewModel.visibleTrackCount) 个文件"
     }
 
-    private func scanProgressText(discovered: Int, loaded: Int) -> String {
+    private func scanProgress(discovered: Int, processed: Int) -> Double? {
+        guard discovered > 0 else { return nil }
+        return min(Double(processed) / Double(discovered), 1)
+    }
+
+    private func scanProgressText(
+        discovered: Int,
+        processed: Int,
+        loaded: Int
+    ) -> String {
         guard discovered > 0 else { return "正在查找支持的音频文件…" }
-        return "已载入 \(loaded) 个文件，共发现 \(discovered) 个候选文件。"
+        return "已处理 \(processed) / \(discovered) 个候选文件，其中 \(loaded) 个有效。"
     }
 }
 

@@ -1,3 +1,4 @@
+import Combine
 import Foundation
 import Testing
 @testable import AudioToolboxCore
@@ -138,7 +139,7 @@ struct LibraryViewModelTests {
 
         #expect(viewModel.groups.map(\.displayName) == ["Artist One"])
         #expect(viewModel.selectedGroupID == "artist:Artist One")
-        #expect(viewModel.scanState == .scanning(discovered: 2, loaded: 1, failures: []))
+        #expect(viewModel.scanState == .scanning(discovered: 2, processed: 1, loaded: 1, failures: []))
 
         scanner.yield(.loaded(Self.secondTrack), toScan: 0)
         scanner.finish(scan: 0)
@@ -569,9 +570,9 @@ struct LibraryViewModelTests {
         await firstRun.value
     }
 
-    @Test("不可读候选会进入表格未知分组且始终不可选择")
+    @Test("默认过滤不可读候选，关闭过滤后显示且始终不可选择")
     @MainActor
-    func unreadableCandidatesAreDisplayedButNotSelectable() async {
+    func invalidAudioFilteringDefaultsOnAndCanBeDisabled() async {
         let unreadableFailure = LibraryScanFailure(
             url: Self.unreadableTrack.url,
             message: "标签损坏"
@@ -599,12 +600,27 @@ struct LibraryViewModelTests {
             Self.unreadableTrack, Self.unsupportedTrack, Self.readOnlyTrack,
             Self.untaggedWritableTrack,
         ]))
+        #expect(viewModel.filtersInvalidAudioFiles)
+        #expect(viewModel.visibleTrackCount == 2)
+        #expect(viewModel.hiddenInvalidTrackCount == 2)
         #expect(viewModel.groups.map(\.displayName) == ["未知作者"])
-        #expect(viewModel.filteredTracks.count == 4)
+        #expect(viewModel.filteredTracks == LibraryProjection.sortedTracks([
+            Self.readOnlyTrack, Self.untaggedWritableTrack,
+        ]))
+        #expect(viewModel.filteredTracks.contains(Self.untaggedWritableTrack))
         #expect(viewModel.scanFailureCount == 2)
         #expect(viewModel.scanFailureMessage == "broken.mp3：标签损坏\nunsupported.ogg：标签结构不支持")
         #expect(Self.unreadableTrack.issue == .unreadable("标签损坏"))
         #expect(Self.unsupportedTrack.issue == .unsupportedTag("标签结构不支持"))
+
+        viewModel.filtersInvalidAudioFiles = false
+        #expect(viewModel.visibleTrackCount == 4)
+        #expect(viewModel.hiddenInvalidTrackCount == 0)
+        #expect(viewModel.filteredTracks.count == 4)
+
+        viewModel.searchText = "broken"
+        #expect(viewModel.filteredTracks == [Self.unreadableTrack])
+        viewModel.searchText = ""
 
         viewModel.toggleSelection(Self.unreadableTrack.id)
         viewModel.toggleSelection(Self.readOnlyTrack.id)
@@ -620,6 +636,83 @@ struct LibraryViewModelTests {
         viewModel.toggleSelection(Self.unreadableTrack.id)
         viewModel.openBatchEditor()
         #expect(viewModel.batchEditTracks == [Self.untaggedWritableTrack])
+    }
+
+    @Test("只有无效文件时默认显示空状态，关闭过滤后恢复文件列表")
+    @MainActor
+    func onlyInvalidAudioTracksFollowFilterState() async {
+        let failure = LibraryScanFailure(url: Self.unreadableTrack.url, message: "标签损坏")
+        let scanner = ScriptedScanner(scripts: [[
+            .discovered(1),
+            .unreadable(Self.unreadableTrack, "标签损坏"),
+            .finished,
+        ]])
+        let viewModel = makeViewModel(scanner: scanner)
+
+        await viewModel.loadDirectory(firstRoot)
+
+        #expect(viewModel.scanState == .empty(failures: [failure]))
+        #expect(viewModel.visibleTrackCount == 0)
+        #expect(viewModel.hiddenInvalidTrackCount == 1)
+        #expect(viewModel.groups.isEmpty)
+
+        viewModel.filtersInvalidAudioFiles = false
+
+        #expect(viewModel.scanState == .loaded(failures: [failure]))
+        #expect(viewModel.visibleTrackCount == 1)
+        #expect(viewModel.groups.map(\.displayName) == ["未知作者"])
+        #expect(viewModel.filteredTracks == [Self.unreadableTrack])
+        #expect(!viewModel.currentGroupHasEditableTracks)
+    }
+
+    @Test("大量扫描事件会节流曲目发布并准确统计已处理进度")
+    @MainActor
+    func largeScanBatchesTrackPublicationsAndExcludesTraversalFailuresFromProcessedCount() async {
+        let validTracks = (0..<2_000).map { index in
+            Self.track(
+                id: "bulk-\(index)",
+                fileName: "bulk-\(index).mp3",
+                title: "Bulk \(index)",
+                artist: "Artist \(index % 20)",
+                album: "Album \(index % 30)"
+            )
+        }
+        let events = [ScanEvent.discovered(validTracks.count)]
+            + validTracks.map(ScanEvent.loaded)
+            + [.failed(firstRoot.appendingPathComponent("inaccessible-subdirectory"), "无法访问目录")]
+        let scanner = ControllableScanner()
+        let viewModel = makeViewModel(scanner: scanner)
+        var trackPublicationCount = 0
+        let cancellable = viewModel.$tracks.dropFirst().sink { _ in
+            trackPublicationCount += 1
+        }
+        let load = Task { await viewModel.loadDirectory(firstRoot) }
+
+        await scanner.waitForScanCount(1)
+        for event in events {
+            scanner.yield(event, toScan: 0)
+        }
+        await waitUntil(attempts: 5_000) {
+            if case let .scanning(discovered, processed, loaded, failures) = viewModel.scanState {
+                return discovered == 2_000
+                    && processed == 2_000
+                    && loaded == 2_000
+                    && failures.count == 1
+            }
+            return false
+        }
+        scanner.finish(scan: 0)
+        await load.value
+        withExtendedLifetime(cancellable) {}
+
+        #expect(viewModel.tracks.count == 2_000)
+        #expect(trackPublicationCount < 80)
+        #expect(viewModel.scanState == .loaded(failures: [
+            LibraryScanFailure(
+                url: firstRoot.appendingPathComponent("inaccessible-subdirectory"),
+                message: "无法访问目录"
+            ),
+        ]))
     }
 
     @Test("打开、执行批量编辑会发布进度和结果，完成后刷新目录")
@@ -674,6 +767,12 @@ struct LibraryViewModelTests {
         ])
         let summary = BatchEditSummary(results: [
             BatchFileResult(url: Self.firstTrack.url, status: .succeeded, message: nil),
+            BatchFileResult(
+                url: Self.untaggedWritableTrack.url,
+                status: .succeeded,
+                message: "修改成功，但保留了恢复文件",
+                recoveryURL: URL(fileURLWithPath: "/tmp/recovery.flac")
+            ),
             BatchFileResult(url: Self.sameArtistTrack.url, status: .failed, message: "写入失败"),
             BatchFileResult(url: Self.secondTrack.url, status: .notProcessed, message: "已停止"),
         ])
@@ -688,7 +787,8 @@ struct LibraryViewModelTests {
         await viewModel.runBatchEdit()
 
         #expect(viewModel.batchResultCounts == BatchResultCounts(
-            succeeded: 1,
+            succeeded: 2,
+            warnings: 1,
             failed: 1,
             notProcessed: 1
         ))
@@ -761,6 +861,46 @@ struct LibraryViewModelTests {
         viewModel.closeBatchEditor()
         #expect(viewModel.batchState == .closed)
         #expect(!viewModel.isBatchSheetPresented)
+    }
+
+    @Test("恢复 bookmark 但安全作用域启动失败时清除授权并要求重新选择")
+    @MainActor
+    func bookmarkSecurityScopeFailureClearsAuthorizationWithoutScanning() async throws {
+        let defaults = makeDefaults()
+        let store = SecurityScopedDirectoryStore(
+            defaults: defaults,
+            resolver: IdentityBookmarkResolver()
+        )
+        try store.save(url: firstRoot)
+        let scanner = ScriptedScanner(scripts: [])
+        let accessLog = AccessLog(startResult: false)
+        let viewModel = LibraryViewModel(
+            scanner: scanner,
+            batchEditor: FakeBatchEditor(summary: BatchEditSummary(results: [])),
+            bookmarkStore: store,
+            makeAccessLease: {
+                SecurityScopedAccessLease(url: $0, accessor: accessLog)
+            }
+        )
+
+        await viewModel.restoreLastDirectory()
+
+        #expect(scanner.scanCount == 0)
+        #expect(defaults.data(forKey: "audioToolbox.lastDirectoryBookmark") == nil)
+        #expect(viewModel.currentDirectoryURL == nil)
+        let accessEvents = accessLog.events
+        guard accessEvents.count == 1,
+              case let .start(startedURL) = accessEvents[0] else {
+            Issue.record("Expected exactly one security-scope start attempt")
+            return
+        }
+        #expect(startedURL.path == firstRoot.path)
+        guard case let .failed(message) = viewModel.scanState else {
+            Issue.record("Expected authorization failure state")
+            return
+        }
+        #expect(message.contains("授权已失效"))
+        #expect(message.contains("重新选择"))
     }
 
     @Test("恢复 bookmark 抛错时进入失败状态")
@@ -1147,7 +1287,12 @@ private enum AccessEvent: Equatable {
 
 private final class AccessLog: SecurityScopedResourceAccessing, @unchecked Sendable {
     private let lock = NSLock()
+    private let startResult: Bool
     private var storedEvents: [AccessEvent] = []
+
+    init(startResult: Bool = true) {
+        self.startResult = startResult
+    }
 
     var events: [AccessEvent] {
         lock.withLock { storedEvents }
@@ -1155,7 +1300,7 @@ private final class AccessLog: SecurityScopedResourceAccessing, @unchecked Senda
 
     func start(_ url: URL) -> Bool {
         lock.withLock { storedEvents.append(.start(url)) }
-        return true
+        return startResult
     }
 
     func stop(_ url: URL) {

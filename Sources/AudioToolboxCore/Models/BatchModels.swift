@@ -58,6 +58,23 @@ public struct BatchFileResult: Equatable, Sendable {
     public let url: URL
     public let status: BatchFileStatus
     public let message: String?
+    public let recoveryURL: URL?
+
+    public init(
+        url: URL,
+        status: BatchFileStatus,
+        message: String?,
+        recoveryURL: URL? = nil
+    ) {
+        self.url = url
+        self.status = status
+        self.message = message
+        self.recoveryURL = recoveryURL
+    }
+
+    public var isSucceededWithWarning: Bool {
+        status == .succeeded && message?.trimmedNonEmpty != nil
+    }
 }
 
 public struct BatchEditSummary: Equatable, Sendable {
@@ -73,5 +90,21 @@ public struct BatchEditSummary: Equatable, Sendable {
 
     public var notProcessedCount: Int {
         results.count { $0.status == .notProcessed }
+    }
+
+    public var cleanSucceededResults: [BatchFileResult] {
+        results.filter { $0.status == .succeeded && !$0.isSucceededWithWarning }
+    }
+
+    public var cleanSucceededCount: Int {
+        cleanSucceededResults.count
+    }
+
+    public var succeededWithWarnings: [BatchFileResult] {
+        results.filter(\.isSucceededWithWarning)
+    }
+
+    public var succeededWithWarningCount: Int {
+        succeededWithWarnings.count
     }
 }

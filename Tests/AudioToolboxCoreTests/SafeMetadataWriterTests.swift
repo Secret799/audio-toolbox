@@ -478,6 +478,7 @@ struct SafeMetadataWriterTests {
         #expect(result.message?.contains("提交状态不确定") == true)
         #expect(!FileManager.default.fileExists(atPath: original.path))
         let recovery = try #require(try directory.firstWorkFile())
+        #expect(result.recoveryURL?.resolvingSymlinksInPath() == recovery.resolvingSymlinksInPath())
         #expect(try Data(contentsOf: recovery) == originalBytes)
     }
 
@@ -630,6 +631,7 @@ struct SafeMetadataWriterTests {
         #expect(result.message?.contains("恢复文件路径") == true)
         #expect(result.message?.contains("没有删除权限") == true)
         let recovery = try #require(try directory.firstWorkFile())
+        #expect(result.recoveryURL?.resolvingSymlinksInPath() == recovery.resolvingSymlinksInPath())
         #expect(try Data(contentsOf: recovery) == originalBytes)
     }
 
@@ -813,6 +815,73 @@ struct SafeMetadataWriterTests {
         #expect(FileManager.default.fileExists(atPath: original.path))
         #expect(try Data(contentsOf: original) == originalBytes)
         #expect(try directory.workDirectories().isEmpty)
+    }
+
+    @Test
+    func workspaceSetupFailureReturnsStructuredRecoveryDirectory() async throws {
+        let directory = try TemporaryAudioDirectory()
+        defer { directory.remove() }
+        let original = try directory.createAudioFile()
+        let preserved = directory.url.appendingPathComponent(
+            ".audio-toolbox-preserved-setup.work",
+            isDirectory: true
+        )
+        let operations = testFileOperations().overriding(createWorkspace: { _, _ in
+            try FileManager.default.createDirectory(
+                at: preserved,
+                withIntermediateDirectories: false
+            )
+            throw SafeMetadataWorkspaceSetupError(
+                underlying: SafeMetadataFileSystemError(operation: .mkdir, code: EACCES),
+                preservedURL: preserved
+            )
+        })
+        let writer = makeTestWriter(
+            metadataService: FakeSafeMetadataService(),
+            operations: operations
+        )
+
+        let result = await writer.apply(
+            to: original,
+            patch: MetadataPatch(artist: "新作者", album: nil)
+        )
+
+        #expect(result.status == .failed)
+        #expect(result.recoveryURL == preserved)
+        #expect(FileManager.default.fileExists(atPath: preserved.path))
+    }
+
+    @Test
+    func copyFailureWithCleanupFailureReturnsStructuredRecoveryDirectory() async throws {
+        let directory = try TemporaryAudioDirectory()
+        defer { directory.remove() }
+        let original = try directory.createAudioFile()
+        let live = testFileOperations()
+        let operations = live.overriding(
+            copyIntoWorkspace: { _, _, _ in
+                throw SafeMetadataFileSystemError(operation: .copy, code: EACCES)
+            },
+            removeWorkspaceDirectoryIfOwned: { workspace in
+                .failed(
+                    SafeMetadataFileSystemError(operation: .unlink, code: EACCES),
+                    preservedURL: workspace.directoryURL
+                )
+            }
+        )
+        let writer = makeTestWriter(
+            metadataService: FakeSafeMetadataService(),
+            operations: operations
+        )
+
+        let result = await writer.apply(
+            to: original,
+            patch: MetadataPatch(artist: "新作者", album: nil)
+        )
+
+        #expect(result.status == .failed)
+        let recoveryURL = try #require(result.recoveryURL)
+        #expect(FileManager.default.fileExists(atPath: recoveryURL.path))
+        #expect(result.message?.contains("已保留") == true)
     }
 
     @Test

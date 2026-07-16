@@ -19,6 +19,29 @@ struct BatchEditorTests {
         #expect(await writer.appliedURLs() == files)
     }
 
+    @Test("成功结果中的非空消息会单列为警告并保留恢复路径")
+    func successfulWarningsAreCountedSeparately() {
+        let recoveryURL = URL(fileURLWithPath: "/tmp/audio-toolbox-recovery/work.mp3")
+        let summary = BatchEditSummary(results: [
+            BatchFileResult(
+                url: URL(fileURLWithPath: "/tmp/original.mp3"),
+                status: .succeeded,
+                message: "修改已提交，但清理失败",
+                recoveryURL: recoveryURL
+            ),
+            BatchFileResult(
+                url: URL(fileURLWithPath: "/tmp/clean.mp3"),
+                status: .succeeded,
+                message: nil
+            ),
+        ])
+
+        #expect(summary.succeededCount == 2)
+        #expect(summary.cleanSucceededCount == 1)
+        #expect(summary.succeededWithWarningCount == 1)
+        #expect(summary.succeededWithWarnings.map(\.recoveryURL) == [recoveryURL])
+    }
+
     @Test("进度从初始状态开始，并在每个文件产生结果后递增")
     func progressStartsAtZeroAndAdvancesAfterEveryFile() async {
         let files = testURLs(count: 3, prefix: "progress")

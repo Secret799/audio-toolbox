@@ -15,7 +15,7 @@ public struct LibraryScanFailure: Equatable, Sendable {
 public enum LibraryScreenState: Equatable, Sendable {
     case idle
     case restoring
-    case scanning(discovered: Int, loaded: Int, failures: [LibraryScanFailure])
+    case scanning(discovered: Int, processed: Int, loaded: Int, failures: [LibraryScanFailure])
     case loaded(failures: [LibraryScanFailure])
     case empty(failures: [LibraryScanFailure])
     case failed(String)
@@ -37,17 +37,25 @@ public enum BatchSheetState: Equatable, Sendable {
 
 public struct BatchResultCounts: Equatable, Sendable {
     public let succeeded: Int
+    public let warnings: Int
     public let failed: Int
     public let notProcessed: Int
 
-    public init(succeeded: Int, failed: Int, notProcessed: Int) {
+    public init(
+        succeeded: Int,
+        warnings: Int = 0,
+        failed: Int,
+        notProcessed: Int
+    ) {
         self.succeeded = succeeded
+        self.warnings = warnings
         self.failed = failed
         self.notProcessed = notProcessed
     }
 
     public static let zero = BatchResultCounts(
         succeeded: 0,
+        warnings: 0,
         failed: 0,
         notProcessed: 0
     )
@@ -71,6 +79,13 @@ public final class LibraryViewModel: ObservableObject {
     @Published public private(set) var scanState: LibraryScreenState = .idle
     @Published public private(set) var directoryOperationError: String?
     @Published public var searchText = ""
+    @Published public var filtersInvalidAudioFiles = true {
+        didSet {
+            guard filtersInvalidAudioFiles != oldValue else { return }
+            rebuildGroups()
+            refreshTerminalScanState()
+        }
+    }
     @Published public private(set) var batchState: BatchSheetState = .closed
     @Published public var batchArtist = "" {
         didSet {
@@ -154,6 +169,7 @@ public final class LibraryViewModel: ObservableObject {
         guard case let .completed(summary) = batchState else { return .zero }
         return BatchResultCounts(
             succeeded: summary.succeededCount,
+            warnings: summary.succeededWithWarningCount,
             failed: summary.failedCount,
             notProcessed: summary.notProcessedCount
         )
@@ -162,6 +178,12 @@ public final class LibraryViewModel: ObservableObject {
     public var currentGroup: AudioGroup? {
         guard let selectedGroupID else { return nil }
         return groups.first { $0.id == selectedGroupID }
+    }
+
+    public var currentGroupHasEditableTracks: Bool {
+        guard let currentGroup else { return false }
+        let editableIDs = Set(tracks.lazy.filter(\.isEditable).map(\.id))
+        return currentGroup.trackIDs.contains(where: editableIDs.contains)
     }
 
     public var currentGroupSelectionState: CurrentGroupSelectionState {
@@ -178,6 +200,19 @@ public final class LibraryViewModel: ObservableObject {
         if selectedInGroup == 0 { return .none }
         if selectedInGroup == selectableIDs.count { return .all }
         return .mixed
+    }
+
+    public var visibleTracks: [AudioTrack] {
+        guard filtersInvalidAudioFiles else { return tracks }
+        return tracks.filter { $0.issue == nil }
+    }
+
+    public var visibleTrackCount: Int {
+        visibleTracks.count
+    }
+
+    public var hiddenInvalidTrackCount: Int {
+        filtersInvalidAudioFiles ? tracks.count(where: { $0.issue != nil }) : 0
     }
 
     public var emptyDirectoryMessage: String? {
@@ -197,7 +232,7 @@ public final class LibraryViewModel: ObservableObject {
 
     public var scanFailures: [LibraryScanFailure] {
         switch scanState {
-        case let .scanning(_, _, failures), let .loaded(failures), let .empty(failures):
+        case let .scanning(_, _, _, failures), let .loaded(failures), let .empty(failures):
             failures
         case .idle, .restoring, .failed:
             []
@@ -241,6 +276,7 @@ public final class LibraryViewModel: ObservableObject {
     private var selectionState = SelectionState()
     private var accessLease: SecurityScopedAccessLease?
     private var scanTask: Task<Void, Never>?
+    private var scanFlushTask: Task<Void, Never>?
     private var batchProgressTask: Task<Void, Never>?
     private var scanGeneration: UInt64 = 0
     private var batchGeneration: UInt64 = 0
@@ -248,6 +284,10 @@ public final class LibraryViewModel: ObservableObject {
     private var hasAttemptedDirectoryRestore = false
     private var isRefreshingAfterBatch = false
     private var discoveredCount = 0
+    private var processedCount = 0
+    private var loadedCount = 0
+    private var scannedTracksByID: [FileIdentity: AudioTrack] = [:]
+    private var pendingTracksByID: [FileIdentity: AudioTrack] = [:]
     private var scanFailureValues: [LibraryScanFailure] = []
 
     public init(
@@ -266,6 +306,7 @@ public final class LibraryViewModel: ObservableObject {
 
     deinit {
         scanTask?.cancel()
+        scanFlushTask?.cancel()
         batchProgressTask?.cancel()
     }
 
@@ -314,7 +355,8 @@ public final class LibraryViewModel: ObservableObject {
             }
             guard let task = startDirectoryLoad(
                 restoredURL.standardizedFileURL,
-                persistBookmark: false
+                persistBookmark: false,
+                requireSecurityScopeStarted: true
             ) else {
                 return
             }
@@ -493,12 +535,21 @@ public final class LibraryViewModel: ObservableObject {
     @discardableResult
     private func startDirectoryLoad(
         _ url: URL,
-        persistBookmark: Bool
+        persistBookmark: Bool,
+        requireSecurityScopeStarted: Bool = false
     ) -> Task<Void, Never>? {
         directoryOperationError = nil
         let isSameDirectory = currentDirectoryURL == url
         let preservedGroupID = isSameDirectory ? selectedGroupID : nil
         let candidateLease = isSameDirectory ? nil : makeAccessLease(url)
+
+        if requireSecurityScopeStarted,
+           (candidateLease ?? accessLease)?.didStart != true {
+            bookmarkStore.clear()
+            directoryOperationError = "目录授权已失效，请重新选择目录。"
+            scanState = .failed("上次目录授权已失效，请重新选择目录。")
+            return nil
+        }
 
         if persistBookmark {
             do {
@@ -542,6 +593,9 @@ public final class LibraryViewModel: ObservableObject {
         scanGeneration &+= 1
         scanTask?.cancel()
         scanTask = nil
+        scanFlushTask?.cancel()
+        scanFlushTask = nil
+        pendingTracksByID.removeAll(keepingCapacity: false)
     }
 
     private func beginScan(
@@ -553,8 +607,17 @@ public final class LibraryViewModel: ObservableObject {
         groups = []
         selectedGroupID = preservingGroupID
         discoveredCount = 0
+        processedCount = 0
+        loadedCount = 0
+        scannedTracksByID = [:]
+        pendingTracksByID = [:]
         scanFailureValues = []
-        scanState = .scanning(discovered: 0, loaded: 0, failures: [])
+        scanState = .scanning(
+            discovered: 0,
+            processed: 0,
+            loaded: 0,
+            failures: []
+        )
 
         let stream = scanner.scan(root: root)
         let task = Task { @MainActor [weak self] in
@@ -571,30 +634,43 @@ public final class LibraryViewModel: ObservableObject {
                 switch event {
                 case let .discovered(count):
                     self.discoveredCount = count
-                    self.publishScanningState()
-                case let .loaded(track):
-                    self.upsert(
-                        track,
-                        preservingMissingGroupID: preservingGroupID
+                    self.scheduleScanFlush(
+                        generation: generation,
+                        root: root,
+                        preservingGroupID: preservingGroupID
                     )
-                    self.publishScanningState()
+                case let .loaded(track):
+                    self.loadedCount += 1
+                    self.processedCount += 1
+                    self.pendingTracksByID[track.id] = track
+                    self.scheduleScanFlush(
+                        generation: generation,
+                        root: root,
+                        preservingGroupID: preservingGroupID
+                    )
                 case let .unreadable(track, message):
+                    self.processedCount += 1
                     self.scanFailureValues.append(
                         LibraryScanFailure(url: track.url, message: message)
                     )
-                    self.upsert(
-                        track,
-                        preservingMissingGroupID: preservingGroupID
+                    self.pendingTracksByID[track.id] = track
+                    self.scheduleScanFlush(
+                        generation: generation,
+                        root: root,
+                        preservingGroupID: preservingGroupID
                     )
-                    self.publishScanningState()
                 case let .failed(url, message):
                     self.scanFailureValues.append(
                         LibraryScanFailure(url: url, message: message)
                     )
-                    self.publishScanningState()
+                    self.scheduleScanFlush(
+                        generation: generation,
+                        root: root,
+                        preservingGroupID: preservingGroupID
+                    )
                 case .finished:
                     receivedFinished = true
-                    self.finishScan()
+                    self.finishScan(preservingGroupID: preservingGroupID)
                     break eventLoop
                 }
             }
@@ -606,7 +682,7 @@ public final class LibraryViewModel: ObservableObject {
                 return
             }
             if !receivedFinished {
-                self.finishScan()
+                self.finishScan(preservingGroupID: preservingGroupID)
             }
             self.scanTask = nil
         }
@@ -615,25 +691,42 @@ public final class LibraryViewModel: ObservableObject {
         return task
     }
 
-    private func upsert(
-        _ track: AudioTrack,
-        preservingMissingGroupID: String?
+    private func scheduleScanFlush(
+        generation: UInt64,
+        root: URL,
+        preservingGroupID: String?
     ) {
-        if let index = tracks.firstIndex(where: { $0.id == track.id }) {
-            tracks[index] = track
-        } else {
-            tracks.append(track)
+        guard scanFlushTask == nil else { return }
+        scanFlushTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(75))
+            guard !Task.isCancelled, let self else { return }
+            guard self.scanGeneration == generation,
+                  self.currentDirectoryURL == root else {
+                return
+            }
+            self.scanFlushTask = nil
+            self.flushScanUpdates(preservingGroupID: preservingGroupID)
         }
-        if !track.isEditable {
-            selectionState.setSelected([track.id], selected: false)
+    }
+
+    private func flushScanUpdates(preservingGroupID: String?) {
+        if !pendingTracksByID.isEmpty {
+            for (id, track) in pendingTracksByID {
+                scannedTracksByID[id] = track
+                if !track.isEditable {
+                    selectionState.setSelected([id], selected: false)
+                }
+            }
+            pendingTracksByID.removeAll(keepingCapacity: true)
+            tracks = LibraryProjection.sortedTracks(Array(scannedTracksByID.values))
             publishSelection()
+            rebuildGroups(preservingMissingGroupID: preservingGroupID)
         }
-        tracks = LibraryProjection.sortedTracks(tracks)
-        rebuildGroups(preservingMissingGroupID: preservingMissingGroupID)
+        publishScanningState()
     }
 
     private func rebuildGroups(preservingMissingGroupID: String? = nil) {
-        groups = LibraryProjection.groups(tracks: tracks, mode: groupingMode)
+        groups = LibraryProjection.groups(tracks: visibleTracks, mode: groupingMode)
         repairSelectedGroup(preservingMissingGroupID: preservingMissingGroupID)
     }
 
@@ -652,19 +745,32 @@ public final class LibraryViewModel: ObservableObject {
     private func publishScanningState() {
         scanState = .scanning(
             discovered: discoveredCount,
-            loaded: tracks.count,
+            processed: processedCount,
+            loaded: loadedCount,
             failures: scanFailureValues
         )
     }
 
-    private func finishScan() {
+    private func finishScan(preservingGroupID: String?) {
+        scanFlushTask?.cancel()
+        scanFlushTask = nil
+        flushScanUpdates(preservingGroupID: preservingGroupID)
         selectionState.retainOnly(Set(tracks.filter(\.isEditable).map(\.id)))
         publishSelection()
         rebuildGroups()
-        if tracks.isEmpty {
-            scanState = .empty(failures: scanFailureValues)
-        } else {
-            scanState = .loaded(failures: scanFailureValues)
+        scanState = visibleTracks.isEmpty
+            ? .empty(failures: scanFailureValues)
+            : .loaded(failures: scanFailureValues)
+    }
+
+    private func refreshTerminalScanState() {
+        switch scanState {
+        case .loaded, .empty:
+            scanState = visibleTracks.isEmpty
+                ? .empty(failures: scanFailureValues)
+                : .loaded(failures: scanFailureValues)
+        case .idle, .restoring, .scanning, .failed:
+            break
         }
     }
 

@@ -138,11 +138,21 @@ public actor SafeMetadataWriter: SafeMetadataWriting {
                 cancellationFlag: cancellationFlag
             )
         } catch let error as WorkspaceCancellationError {
-            return result(for: url, status: .notProcessed, message: error.message)
+            return result(
+                for: url,
+                status: .notProcessed,
+                message: error.message,
+                recoveryURL: error.recoveryURL
+            )
         } catch is CancellationError {
             return result(for: url, status: .notProcessed, message: "操作已取消")
         } catch let error as WorkspaceCreationError {
-            return result(for: url, status: .failed, message: error.message)
+            return result(
+                for: url,
+                status: .failed,
+                message: error.message,
+                recoveryURL: error.recoveryURL
+            )
         } catch {
             return result(for: url, status: .failed, message: copyFailureMessage(error))
         }
@@ -388,7 +398,8 @@ public actor SafeMetadataWriter: SafeMetadataWriting {
             return result(
                 for: url,
                 status: .succeeded,
-                message: messages.isEmpty ? nil : messages.joined(separator: "；")
+                message: messages.isEmpty ? nil : messages.joined(separator: "；"),
+                recoveryURL: cleanup.recoveryURL
             )
 
         case let .rolledBack(coordinatorTailWarning):
@@ -403,7 +414,12 @@ public actor SafeMetadataWriter: SafeMetadataWriting {
             if let warning = cleanup.warning {
                 message += "；\(warning)"
             }
-            return result(for: url, status: .failed, message: message)
+            return result(
+                for: url,
+                status: .failed,
+                message: message,
+                recoveryURL: cleanup.recoveryURL
+            )
 
         case let .cancelled(coordinatorTailWarning):
             let cleanup = await cleanupWorkspace(
@@ -417,7 +433,12 @@ public actor SafeMetadataWriter: SafeMetadataWriting {
             if let warning = cleanup.warning {
                 message += "；\(warning)"
             }
-            return result(for: url, status: .notProcessed, message: message)
+            return result(
+                for: url,
+                status: .notProcessed,
+                message: message,
+                recoveryURL: cleanup.recoveryURL
+            )
 
         case let .preSwapFailed(message, coordinatorTailWarning):
             let cleanup = await cleanupWorkspace(
@@ -431,14 +452,20 @@ public actor SafeMetadataWriter: SafeMetadataWriting {
             if let warning = cleanup.warning {
                 finalMessage += "；\(warning)"
             }
-            return result(for: url, status: .failed, message: finalMessage)
+            return result(
+                for: url,
+                status: .failed,
+                message: finalMessage,
+                recoveryURL: cleanup.recoveryURL
+            )
 
         case let .uncertain(message):
             ownedWork.workspace.closeDescriptors()
             return result(
                 for: url,
                 status: .failed,
-                message: "\(message)；提交状态不确定，恢复文件路径：\(ownedWork.workspace.fileURL.path)"
+                message: "\(message)；提交状态不确定，恢复文件路径：\(ownedWork.workspace.fileURL.path)",
+                recoveryURL: ownedWork.workspace.fileURL
             )
         }
     }
@@ -486,7 +513,8 @@ public actor SafeMetadataWriter: SafeMetadataWriting {
                 continue
             } catch let error as SafeMetadataWorkspaceSetupError {
                 throw WorkspaceCreationError(
-                    message: "无法完成私有工作目录初始化；为避免误删已保守保留：\(error.preservedURL.path)"
+                    message: "无法完成私有工作目录初始化；为避免误删已保守保留：\(error.preservedURL.path)",
+                    recoveryURL: error.preservedURL
                 )
             }
 
@@ -511,7 +539,8 @@ public actor SafeMetadataWriter: SafeMetadataWriting {
                         message: appendCleanupWarning(
                             "无法创建安全工作副本：副本类型不安全",
                             cleanup.warning
-                        )
+                        ),
+                        recoveryURL: cleanup.recoveryURL
                     )
                 }
                 let copiedExpected = try await Self.runBlocking {
@@ -539,7 +568,8 @@ public actor SafeMetadataWriter: SafeMetadataWriting {
                     expectedFileIdentity: copiedIdentity
                 )
                 throw WorkspaceCancellationError(
-                    message: appendCleanupWarning("操作已取消", cleanup.warning)
+                    message: appendCleanupWarning("操作已取消", cleanup.warning),
+                    recoveryURL: cleanup.recoveryURL
                 )
             } catch WorkValidationError.copiedInputMismatch {
                 let cleanup = await cleanupWorkspace(
@@ -550,7 +580,8 @@ public actor SafeMetadataWriter: SafeMetadataWriting {
                     message: appendCleanupWarning(
                         "复制后的文件属性或内容不完整，已拒绝编辑",
                         cleanup.warning
-                    )
+                    ),
+                    recoveryURL: cleanup.recoveryURL
                 )
             } catch let error as SafeMetadataFileSystemError {
                 let cleanup = await cleanupWorkspace(
@@ -559,15 +590,19 @@ public actor SafeMetadataWriter: SafeMetadataWriting {
                 )
                 if error.code == ECANCELED || cancellationFlag.isCancelled {
                     throw WorkspaceCancellationError(
-                        message: appendCleanupWarning("操作已取消", cleanup.warning)
+                        message: appendCleanupWarning("操作已取消", cleanup.warning),
+                        recoveryURL: cleanup.recoveryURL
                     )
                 }
                 throw WorkspaceCreationError(
                     message: appendCleanupWarning(
                         copyFailureMessage(error),
                         cleanup.warning
-                    )
+                    ),
+                    recoveryURL: cleanup.recoveryURL
                 )
+            } catch let error as WorkspaceCreationError {
+                throw error
             } catch {
                 let cleanup = await cleanupWorkspace(
                     workspace,
@@ -577,7 +612,8 @@ public actor SafeMetadataWriter: SafeMetadataWriting {
                     message: appendCleanupWarning(
                         "无法创建安全工作副本：文件复制失败",
                         cleanup.warning
-                    )
+                    ),
+                    recoveryURL: cleanup.recoveryURL
                 )
             }
         }
@@ -597,7 +633,8 @@ public actor SafeMetadataWriter: SafeMetadataWriting {
         return result(
             for: url,
             status: status,
-            message: appendCleanupWarning(message, cleanup.warning)
+            message: appendCleanupWarning(message, cleanup.warning),
+            recoveryURL: cleanup.recoveryURL
         )
     }
 
@@ -613,7 +650,8 @@ public actor SafeMetadataWriter: SafeMetadataWriting {
                 operations: operations
             )
         }) ?? WorkspaceCleanupReport(
-            warning: "私有工作区清理失败，已保守保留：\(workspace.directoryURL.path)"
+            warning: "私有工作区清理失败，已保守保留：\(workspace.directoryURL.path)",
+            recoveryURL: workspace.directoryURL
         )
     }
 
@@ -630,12 +668,14 @@ public actor SafeMetadataWriter: SafeMetadataWriting {
                 break
             case let .identityMismatch(preservedURL):
                 return WorkspaceCleanupReport(
-                    warning: "私有工作文件身份已变化，为避免误删已保守保留：\(preservedURL.path)"
+                    warning: "私有工作文件身份已变化，为避免误删已保守保留：\(preservedURL.path)",
+                    recoveryURL: preservedURL
                 )
             case let .failed(error, preservedURL):
                 let path = preservedURL ?? workspace.fileURL
                 return WorkspaceCleanupReport(
-                    warning: "私有工作文件未能清理（\(cleanupFailureDetail(error))），恢复文件路径：\(path.path)"
+                    warning: "私有工作文件未能清理（\(cleanupFailureDetail(error))），恢复文件路径：\(path.path)",
+                    recoveryURL: path
                 )
             }
         }
@@ -645,12 +685,14 @@ public actor SafeMetadataWriter: SafeMetadataWriting {
             return WorkspaceCleanupReport(warning: nil)
         case let .identityMismatch(preservedURL):
             return WorkspaceCleanupReport(
-                warning: "私有工作目录路径身份已变化，为避免误删已保守保留：\(preservedURL.path)"
+                warning: "私有工作目录路径身份已变化，为避免误删已保守保留：\(preservedURL.path)",
+                recoveryURL: preservedURL
             )
         case let .failed(error, preservedURL):
             let path = preservedURL ?? workspace.directoryURL
             return WorkspaceCleanupReport(
-                warning: "私有工作目录未能清理（\(cleanupFailureDetail(error))），已保留：\(path.path)"
+                warning: "私有工作目录未能清理（\(cleanupFailureDetail(error))），已保留：\(path.path)",
+                recoveryURL: path
             )
         }
     }
@@ -1197,9 +1239,15 @@ public actor SafeMetadataWriter: SafeMetadataWriting {
     private func result(
         for url: URL,
         status: BatchFileStatus,
-        message: String?
+        message: String?,
+        recoveryURL: URL? = nil
     ) -> BatchFileResult {
-        BatchFileResult(url: url, status: status, message: message)
+        BatchFileResult(
+            url: url,
+            status: status,
+            message: message,
+            recoveryURL: recoveryURL
+        )
     }
 }
 
@@ -1211,6 +1259,12 @@ private struct OwnedWorkFile: Sendable {
 
 private struct WorkspaceCleanupReport: Sendable {
     let warning: String?
+    let recoveryURL: URL?
+
+    init(warning: String?, recoveryURL: URL? = nil) {
+        self.warning = warning
+        self.recoveryURL = recoveryURL
+    }
 }
 
 private enum ObservedCommitState: Sendable {
@@ -1237,10 +1291,22 @@ private enum CommitDisposition: Sendable {
 
 private struct WorkspaceCreationError: Error, Sendable {
     let message: String
+    let recoveryURL: URL?
+
+    init(message: String, recoveryURL: URL? = nil) {
+        self.message = message
+        self.recoveryURL = recoveryURL
+    }
 }
 
 private struct WorkspaceCancellationError: Error, Sendable {
     let message: String
+    let recoveryURL: URL?
+
+    init(message: String, recoveryURL: URL? = nil) {
+        self.message = message
+        self.recoveryURL = recoveryURL
+    }
 }
 
 private enum WorkValidationError: Error {

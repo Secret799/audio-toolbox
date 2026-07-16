@@ -50,6 +50,12 @@ public final class SecurityScopedDirectoryStore: @unchecked Sendable {
         }
     }
 
+    public func clear() {
+        lock.withLock {
+            defaults.removeObject(forKey: Self.bookmarkKey)
+        }
+    }
+
     public func restore() throws -> URL? {
         try lock.withLock {
             guard let storedValue = defaults.object(forKey: Self.bookmarkKey) else {
@@ -99,7 +105,7 @@ public final class SecurityScopedAccessLease: @unchecked Sendable {
     public let url: URL
 
     private let accessor: any SecurityScopedResourceAccessing
-    private let didStart: Bool
+    public let didStart: Bool
 
     public init(
         url: URL,

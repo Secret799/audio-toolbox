@@ -116,6 +116,7 @@ struct SecurityScopedDirectoryStoreTests {
         )
 
         #expect(lease?.url == directoryURL)
+        #expect(lease?.didStart == true)
         #expect(accessor.startURLs == [directoryURL])
         #expect(accessor.stopURLs.isEmpty)
 
@@ -135,6 +136,7 @@ struct SecurityScopedDirectoryStoreTests {
         )
 
         #expect(lease?.url == directoryURL)
+        #expect(lease?.didStart == false)
         #expect(accessor.startURLs == [directoryURL])
 
         lease = nil
