@@ -73,6 +73,53 @@ static int ATSFCompareStrings(const void *left, const void *right) {
     return strcmp(*left_string, *right_string);
 }
 
+static int ATSFSynchronizeExtendedAttribute(
+    int source_fd,
+    int destination_fd,
+    const char *name
+) {
+    ssize_t value_size = fgetxattr(source_fd, name, NULL, 0, 0, 0);
+    if(value_size < 0) {
+        if(errno != ENOATTR) {
+            return errno;
+        }
+        if(fremovexattr(destination_fd, name, 0) == 0 || errno == ENOATTR) {
+            return 0;
+        }
+        return errno;
+    }
+
+    void *value = value_size == 0 ? NULL : malloc((size_t)value_size);
+    if(value_size > 0 && value == NULL) {
+        return ENOMEM;
+    }
+    if(value_size > 0
+        && fgetxattr(
+            source_fd,
+            name,
+            value,
+            (size_t)value_size,
+            0,
+            0
+        ) != value_size) {
+        int error_code = errno == 0 ? EIO : errno;
+        free(value);
+        return error_code;
+    }
+
+    int set_result = fsetxattr(
+        destination_fd,
+        name,
+        value,
+        (size_t)value_size,
+        0,
+        0
+    );
+    int error_code = set_result == 0 ? 0 : (errno == 0 ? EIO : errno);
+    free(value);
+    return error_code;
+}
+
 static int ATSFCopyStatusCallback(
     int what,
     int stage,
@@ -231,17 +278,27 @@ ATSFCopyResult ATSFCopyFileToDirectory(
 
     int copy_result = fcopyfile(source_fd, destination_fd, state, COPYFILE_ALL);
     int copy_error = copy_result == 0 ? 0 : errno;
+    if(copy_result == 0 && !ATSFCancellationFlagIsCancelled(cancellation_flag)) {
+        copy_error = ATSFSynchronizeExtendedAttribute(
+            source_fd,
+            destination_fd,
+            "com.apple.quarantine"
+        );
+        if(copy_error != 0) {
+            copy_result = -1;
+        }
+    }
     result.destination_fd = fcntl(destination_fd, F_DUPFD_CLOEXEC, 0);
     copyfile_state_free(state);
     close(destination_fd);
     close(source_fd);
 
-    if(copy_result != 0) {
-        result.error_code = copy_error == 0 ? EIO : copy_error;
-        return result;
-    }
     if(ATSFCancellationFlagIsCancelled(cancellation_flag)) {
         result.error_code = ECANCELED;
+        return result;
+    }
+    if(copy_result != 0) {
+        result.error_code = copy_error == 0 ? EIO : copy_error;
         return result;
     }
     if(result.destination_fd < 0) {

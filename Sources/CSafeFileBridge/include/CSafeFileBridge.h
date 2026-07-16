@@ -37,8 +37,9 @@ int32_t ATSFFullSyncFD(int32_t fd);
 
 /// Opens source with O_NOFOLLOW, creates destination with openat(O_EXCL |
 /// O_NOFOLLOW) relative to directory_fd, then copies all data and metadata with
-/// fcopyfile(COPYFILE_ALL). The returned destination fd uses F_DUPFD_CLOEXEC
-/// and is owned by the caller, including on partial-copy failure.
+/// fcopyfile(COPYFILE_ALL), then restores the exact source quarantine xattr
+/// because macOS may rewrite it while copying. The returned destination fd uses
+/// F_DUPFD_CLOEXEC and is owned by the caller, including on partial-copy failure.
 ATSFCopyResult ATSFCopyFileToDirectory(
     const char * _Nullable source_path,
     int32_t directory_fd,

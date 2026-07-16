@@ -46,6 +46,33 @@ struct SafeMetadataWriterTests {
     }
 
     @Test
+    func successfulCommitPreservesExactQuarantineAttribute() async throws {
+        let directory = try TemporaryAudioDirectory()
+        defer { directory.remove() }
+        let original = try directory.createAudioFile()
+        let quarantine = Data("0082;6a583fb6;AudioToolbox;".utf8)
+        try setExtendedAttribute(
+            quarantine,
+            named: "com.apple.quarantine",
+            at: original
+        )
+        let writer = makeTestWriter(metadataService: FakeSafeMetadataService())
+
+        let result = await writer.apply(
+            to: original,
+            patch: MetadataPatch(artist: "新作者", album: nil)
+        )
+
+        #expect(result.status == .succeeded)
+        #expect(result.message == nil)
+        #expect(try extendedAttribute(
+            named: "com.apple.quarantine",
+            at: original
+        ) == quarantine)
+        #expect(try directory.workDirectories().isEmpty)
+    }
+
+    @Test
     func scannedTargetPathReplacementIsRejectedBeforeCopyOrMetadataWrite() async throws {
         let directory = try TemporaryAudioDirectory()
         defer { directory.remove() }

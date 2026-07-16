@@ -2,6 +2,9 @@
 
 #include <taglib/audioproperties.h>
 #include <taglib/fileref.h>
+#include <taglib/id3v2header.h>
+#include <taglib/id3v2tag.h>
+#include <taglib/mpegfile.h>
 #include <taglib/tag.h>
 #include <taglib/tfile.h>
 #include <taglib/tpropertymap.h>
@@ -558,6 +561,48 @@ bool IsUsableFileRef(const TagLib::FileRef &file, bool require_writable) {
     }
     return !require_writable || !file.file()->readOnly();
 }
+bool SaveMetadataFile(TagLib::FileRef &file) {
+    auto *mpeg = dynamic_cast<TagLib::MPEG::File *>(file.file());
+    if(mpeg == nullptr) {
+        return file.save();
+    }
+
+    int tag_types = TagLib::MPEG::File::ID3v2;
+    if(mpeg->hasID3v2Tag()) {
+        tag_types = TagLib::MPEG::File::ID3v2;
+    } else if(mpeg->hasAPETag()) {
+        tag_types = TagLib::MPEG::File::APE;
+    } else if(mpeg->hasID3v1Tag()) {
+        tag_types = TagLib::MPEG::File::ID3v1;
+    }
+
+    TagLib::ID3v2::Version version = TagLib::ID3v2::v4;
+    if(TagLib::ID3v2::Tag *id3v2 = mpeg->ID3v2Tag(false)) {
+        const unsigned int major_version = id3v2->header()->majorVersion();
+        if(major_version == 2) {
+            return false;
+        }
+        if(major_version == 3) {
+            version = TagLib::ID3v2::v3;
+        }
+    }
+    return mpeg->save(
+        tag_types,
+        TagLib::File::StripNone,
+        version,
+        TagLib::File::DoNotDuplicate
+    );
+}
+
+bool HasUnsupportedID3v22(const TagLib::FileRef &file) {
+    auto *mpeg = dynamic_cast<TagLib::MPEG::File *>(file.file());
+    if(mpeg == nullptr) {
+        return false;
+    }
+    TagLib::ID3v2::Tag *id3v2 = mpeg->ID3v2Tag(false);
+    return id3v2 != nullptr && id3v2->header()->majorVersion() == 2;
+}
+
 }  // namespace
 
 ATReadResult ATReadMetadata(const char *path) {
@@ -648,7 +693,7 @@ bool ATCanWriteMetadata(const char *path) {
         }
 
         const TagLib::FileRef file(path, true, TagLib::AudioProperties::Accurate);
-        return IsUsableFileRef(file, true);
+        return IsUsableFileRef(file, true) && !HasUnsupportedID3v22(file);
     }
     catch(...) {
         return false;
@@ -686,6 +731,10 @@ ATWriteResult ATWriteMetadata(
             SetError(result, ATStatusNotWritable, "音频文件不可写或音频属性无效");
             return result;
         }
+        if(HasUnsupportedID3v22(file)) {
+            SetError(result, ATStatusNotWritable, "不支持写入 ID3v2.2 MP3");
+            return result;
+        }
 
         TagLib::Tag *tag = file.tag();
         if(tag == nullptr) {
@@ -705,25 +754,38 @@ ATWriteResult ATWriteMetadata(
             properties_before.unsupportedData()
         );
 
-        TagLib::PropertyMap updated_properties = properties_before;
-        if(changes_artist) {
-            updated_properties.replace(
-                "ARTIST",
-                TagLib::StringList(TagLib::String(artist_or_null, TagLib::String::UTF8))
-            );
-        }
-        if(changes_album) {
-            updated_properties.replace(
-                "ALBUM",
-                TagLib::StringList(TagLib::String(album_or_null, TagLib::String::UTF8))
-            );
-        }
-        if(!file.file()->setProperties(updated_properties).isEmpty()) {
-            SetError(result, ATStatusSaveFailed, "目标标签无法写入当前音频格式");
-            return result;
+        if(dynamic_cast<TagLib::MPEG::File *>(file.file()) != nullptr) {
+            if(changes_artist) {
+                tag->setArtist(TagLib::String(artist_or_null, TagLib::String::UTF8));
+            }
+            if(changes_album) {
+                tag->setAlbum(TagLib::String(album_or_null, TagLib::String::UTF8));
+            }
+        } else {
+            TagLib::PropertyMap updated_properties = properties_before;
+            if(changes_artist) {
+                updated_properties.replace(
+                    "ARTIST",
+                    TagLib::StringList(
+                        TagLib::String(artist_or_null, TagLib::String::UTF8)
+                    )
+                );
+            }
+            if(changes_album) {
+                updated_properties.replace(
+                    "ALBUM",
+                    TagLib::StringList(
+                        TagLib::String(album_or_null, TagLib::String::UTF8)
+                    )
+                );
+            }
+            if(!file.file()->setProperties(updated_properties).isEmpty()) {
+                SetError(result, ATStatusSaveFailed, "目标标签无法写入当前音频格式");
+                return result;
+            }
         }
 
-        if(!file.save()) {
+        if(!SaveMetadataFile(file)) {
             SetError(result, ATStatusSaveFailed, "TagLib 保存音频标签失败");
             return result;
         }

@@ -1,4 +1,5 @@
 import CTagLibTestSupport
+import Darwin
 import Foundation
 import Testing
 @testable import AudioToolboxCore
@@ -241,6 +242,119 @@ struct TagLibMetadataServiceTests {
         }
     }
 
+    @Test("MP3 writes leave secondary ID3v1 and APE tags byte-identical")
+    func mp3WritesLeaveSecondaryTagsUntouched() async throws {
+        let service = TagLibMetadataService()
+
+        try await withFixtureCopy("sample.mp3") { copy in
+            #expect(copy.path.withCString(ATTestSeedSecondaryMPEGTags))
+            let id3v1Before = try readTestString(url: copy, operation: ATTestMPEGID3v1Bytes)
+            let apeBefore = try readTestString(url: copy, operation: ATTestMPEGAPEBytes)
+
+            try await service.write(
+                url: copy,
+                patch: MetadataPatch(artist: "Changed Artist", album: nil)
+            )
+
+            #expect(try readTestString(url: copy, operation: ATTestMPEGID3v1Bytes) == id3v1Before)
+            #expect(try readTestString(url: copy, operation: ATTestMPEGAPEBytes) == apeBefore)
+            #expect(try await service.read(url: copy).artists.first == "Changed Artist")
+        }
+    }
+
+    @Test("artist-only writes preserve a non-numeric MP3 track frame")
+    func artistOnlyPreservesNonNumericMP3TrackFrame() async throws {
+        let service = TagLibMetadataService()
+
+        try await withFixtureCopy("sample.mp3") { copy in
+            #expect(setID3v2TextFrame(
+                copy,
+                identifier: "TRCK",
+                value: "TG@jingluoasmr001; ;"
+            ))
+            let beforeProperties = try canonicalProperties(
+                copy,
+                excludeArtist: true,
+                excludeAlbum: false
+            )
+            #expect(try propertyValues(copy, key: "TRACKNUMBER").contains("TG@jingluoasmr001"))
+
+            try await service.write(
+                url: copy,
+                patch: MetadataPatch(artist: "Changed Artist", album: nil)
+            )
+
+            #expect(try canonicalProperties(
+                copy,
+                excludeArtist: true,
+                excludeAlbum: false
+            ) == beforeProperties)
+            #expect(try propertyValues(copy, key: "TRACKNUMBER").contains("TG@jingluoasmr001"))
+        }
+    }
+
+    @Test("safe writer preserves quarantine and a non-numeric MP3 track frame")
+    func safeWriterPreservesQuarantineAndNonNumericMP3TrackFrame() async throws {
+        let service = TagLibMetadataService()
+
+        try await withFixtureCopy("sample.mp3") { copy in
+            #expect(setID3v2TextFrame(
+                copy,
+                identifier: "TRCK",
+                value: "TG@jingluoasmr001; ;"
+            ))
+            let quarantine = Data("0082;6a583fb6;AudioToolbox;".utf8)
+            try setExtendedAttribute(
+                quarantine,
+                named: "com.apple.quarantine",
+                at: copy
+            )
+            let beforeProperties = try canonicalProperties(
+                copy,
+                excludeArtist: true,
+                excludeAlbum: false
+            )
+            let beforeUnsupported = try unsupportedData(copy)
+            let fingerprint = try StableFileIdentityResolver.fingerprint(for: copy)
+            let target = BatchEditTarget(
+                url: copy,
+                fileIdentity: fingerprint.fileIdentity,
+                fileSize: fingerprint.fileSize,
+                modificationDate: fingerprint.modificationDate
+            )
+            let operations = SafeMetadataFileOperations.live().overriding(
+                coordinateReplacing: { original, work, accessor in
+                    try accessor(original, work)
+                }
+            )
+            let writer = SafeMetadataWriter(
+                metadataService: service,
+                fileOperations: operations,
+                commitGate: { true },
+                temporaryIdentifierProvider: { UUID().uuidString }
+            )
+
+            let result = await writer.apply(
+                to: target,
+                patch: MetadataPatch(artist: "Changed Artist", album: nil)
+            )
+
+            #expect(result.status == .succeeded)
+            #expect(result.message == nil)
+            #expect(try canonicalProperties(
+                copy,
+                excludeArtist: true,
+                excludeAlbum: false
+            ) == beforeProperties)
+            #expect(try unsupportedData(copy) == beforeUnsupported)
+            #expect(try extendedAttribute(
+                named: "com.apple.quarantine",
+                at: copy
+            ) == quarantine)
+            #expect(try await service.read(url: copy).artists.first == "Changed Artist")
+        }
+    }
+
     @Test("writes artist and album together while preserving title and duration in common formats")
     func writesArtistAndAlbumTogether() async throws {
         let service = TagLibMetadataService()
@@ -358,6 +472,31 @@ struct TagLibMetadataServiceTests {
         }
     }
 
+    @Test("ID3v2.2 MP3 remains readable but is conservatively not writable")
+    func id3v22MP3IsReadOnly() async throws {
+        let fixture = try Data(contentsOf: fixtureURL("sample.mp3"))
+        let payload = try mpegAudioPayload(from: fixture)
+        let contents = makeID3v22MP3(audioPayload: payload)
+
+        try await withTemporaryFile(named: "legacy-v22.mp3", contents: contents) { file in
+            let service = TagLibMetadataService()
+            let metadata = try await service.read(url: file)
+            #expect(metadata.title == "Legacy Title")
+            #expect(metadata.artists.first == "Legacy Artist")
+            #expect(!(await service.canWrite(url: file)))
+            await #expect(
+                throws: MetadataServiceError.notWritable(
+                    "文件不可写或格式不支持标签写入"
+                )
+            ) {
+                try await service.write(
+                    url: file,
+                    patch: MetadataPatch(artist: "Changed", album: nil)
+                )
+            }
+        }
+    }
+
     @Test("rejects a valid footer-bearing MP3 without changing bytes")
     func rejectsFooterBearingMP3() async throws {
         let service = TagLibMetadataService()
@@ -466,6 +605,20 @@ struct TagLibMetadataServiceTests {
         })
     }
 
+    private func setID3v2TextFrame(
+        _ url: URL,
+        identifier: String,
+        value: String
+    ) -> Bool {
+        url.path.withCString { path in
+            identifier.withCString { frameID in
+                value.withCString { frameValue in
+                    ATTestSetID3v2TextFrame(path, frameID, frameValue)
+                }
+            }
+        }
+    }
+
     private func hasID3v2Frame(_ url: URL, identifier: String) -> Bool {
         url.path.withCString { path in
             identifier.withCString { ATTestHasID3v2Frame(path, $0) }
@@ -521,6 +674,26 @@ struct TagLibMetadataServiceTests {
         let file = directory.appendingPathComponent(name)
         try contents.write(to: file)
         return try await operation(file)
+    }
+
+    private func makeID3v22MP3(audioPayload: Data) -> Data {
+        func frame(_ identifier: String, _ value: String) -> Data {
+            let payload = Data([0x00]) + Data(value.utf8)
+            let size = payload.count
+            return Data(identifier.utf8) + Data([
+                UInt8((size >> 16) & 0xFF),
+                UInt8((size >> 8) & 0xFF),
+                UInt8(size & 0xFF),
+            ]) + payload
+        }
+        let frames = frame("TT2", "Legacy Title")
+            + frame("TP1", "Legacy Artist")
+            + frame("TAL", "Legacy Album")
+        var result = Data([0x49, 0x44, 0x33, 0x02, 0x00, 0x00])
+        result.append(contentsOf: synchsafe(frames.count))
+        result.append(frames)
+        result.append(audioPayload)
+        return result
     }
 
     private func makeFooterBearingMP3() throws -> Data {
@@ -598,6 +771,34 @@ struct TagLibMetadataServiceTests {
         size: [UInt8] = [0, 0, 0, 0]
     ) -> [UInt8] {
         [0x33, 0x44, 0x49, major, revision, flags] + size
+    }
+
+    private func setExtendedAttribute(
+        _ data: Data,
+        named name: String,
+        at url: URL
+    ) throws {
+        let result = data.withUnsafeBytes { bytes in
+            setxattr(url.path, name, bytes.baseAddress, bytes.count, 0, 0)
+        }
+        guard result == 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno)!)
+        }
+    }
+
+    private func extendedAttribute(named name: String, at url: URL) throws -> Data {
+        let size = getxattr(url.path, name, nil, 0, 0, 0)
+        guard size >= 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno)!)
+        }
+        var data = Data(count: size)
+        let count = data.withUnsafeMutableBytes { bytes in
+            getxattr(url.path, name, bytes.baseAddress, bytes.count, 0, 0)
+        }
+        guard count == size else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno)!)
+        }
+        return data
     }
 
     private func fixtureURL(_ name: String) throws -> URL {

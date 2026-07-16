@@ -1,12 +1,16 @@
 #include "CTagLibTestSupport.h"
 
+#include <taglib/apeitem.h>
+#include <taglib/apetag.h>
 #include <taglib/fileref.h>
+#include <taglib/id3v1tag.h>
 #include <taglib/id3v2tag.h>
 #include <taglib/mpegfile.h>
 #include <taglib/tbytevector.h>
 #include <taglib/tpropertymap.h>
 #include <taglib/tstring.h>
 #include <taglib/tstringlist.h>
+#include <taglib/textidentificationframe.h>
 #include <taglib/tvariant.h>
 #include <taglib/unknownframe.h>
 
@@ -28,6 +32,18 @@ bool Usable(const TagLib::FileRef &file) {
 
 std::string UTF8(const TagLib::String &value) {
     return value.to8Bit(true);
+}
+
+std::string Hex(const TagLib::ByteVector &value) {
+    static constexpr char digits[] = "0123456789abcdef";
+    std::string result;
+    result.reserve(value.size() * 2);
+    for(char byte : value) {
+        const unsigned char encoded = static_cast<unsigned char>(byte);
+        result.push_back(digits[encoded >> 4]);
+        result.push_back(digits[encoded & 0x0F]);
+    }
+    return result;
 }
 
 void AppendLengthPrefixed(std::ostringstream &stream, const std::string &value) {
@@ -272,6 +288,108 @@ bool ATTestHasID3v2Frame(const char *path, const char *identifier) {
     }
     catch(...) {
         return false;
+    }
+}
+
+bool ATTestSetID3v2TextFrame(
+    const char *path,
+    const char *identifier,
+    const char *value
+) {
+    try {
+        if(path == nullptr || identifier == nullptr || value == nullptr
+            || std::strlen(identifier) != 4) {
+            return false;
+        }
+        TagLib::MPEG::File file(path, true, TagLib::AudioProperties::Accurate);
+        if(!file.isValid()) {
+            return false;
+        }
+        TagLib::ID3v2::Tag *tag = file.ID3v2Tag(true);
+        if(tag == nullptr) {
+            return false;
+        }
+        const TagLib::ByteVector frame_id(identifier, 4);
+        tag->removeFrames(frame_id);
+        auto *frame = new TagLib::ID3v2::TextIdentificationFrame(
+            frame_id,
+            TagLib::String::UTF8
+        );
+        frame->setText(TagLib::String(value, TagLib::String::UTF8));
+        tag->addFrame(frame);
+        return file.save(
+            TagLib::MPEG::File::ID3v2,
+            TagLib::File::StripOthers,
+            TagLib::ID3v2::v3,
+            TagLib::File::DoNotDuplicate
+        );
+    }
+    catch(...) {
+        return false;
+    }
+}
+
+bool ATTestSeedSecondaryMPEGTags(const char *path) {
+    try {
+        TagLib::MPEG::File file(path, true, TagLib::AudioProperties::Accurate);
+        if(!file.isValid()) {
+            return false;
+        }
+        TagLib::ID3v1::Tag *id3v1 = file.ID3v1Tag(true);
+        TagLib::APE::Tag *ape = file.APETag(true);
+        if(id3v1 == nullptr || ape == nullptr) {
+            return false;
+        }
+        id3v1->setTitle(TagLib::String("Legacy Title", TagLib::String::Latin1));
+        id3v1->setArtist(TagLib::String("Legacy Artist", TagLib::String::Latin1));
+        id3v1->setAlbum(TagLib::String("Legacy Album", TagLib::String::Latin1));
+        id3v1->setComment(TagLib::String("Legacy Comment", TagLib::String::Latin1));
+        id3v1->setYear(1999);
+        id3v1->setTrack(7);
+        id3v1->setGenre("Rock");
+
+        ape->setTitle(TagLib::String("APE Title", TagLib::String::UTF8));
+        ape->setArtist(TagLib::String("APE Artist", TagLib::String::UTF8));
+        ape->setAlbum(TagLib::String("APE Album", TagLib::String::UTF8));
+        ape->setItem(
+            "BINARY-REGRESSION",
+            TagLib::APE::Item(
+                "BINARY-REGRESSION",
+                TagLib::ByteVector("opaque-secondary-data", 21),
+                true
+            )
+        );
+        return file.save(
+            TagLib::MPEG::File::ID3v1 | TagLib::MPEG::File::APE,
+            TagLib::File::StripNone,
+            TagLib::ID3v2::v4,
+            TagLib::File::DoNotDuplicate
+        );
+    }
+    catch(...) {
+        return false;
+    }
+}
+
+char *ATTestMPEGID3v1Bytes(const char *path) {
+    try {
+        TagLib::MPEG::File file(path, false);
+        TagLib::ID3v1::Tag *tag = file.ID3v1Tag(false);
+        return tag == nullptr ? nullptr : Duplicate(Hex(tag->render()));
+    }
+    catch(...) {
+        return nullptr;
+    }
+}
+
+char *ATTestMPEGAPEBytes(const char *path) {
+    try {
+        TagLib::MPEG::File file(path, false);
+        TagLib::APE::Tag *tag = file.APETag(false);
+        return tag == nullptr ? nullptr : Duplicate(Hex(tag->render()));
+    }
+    catch(...) {
+        return nullptr;
     }
 }
 
