@@ -293,6 +293,78 @@ struct TagLibMetadataServiceTests {
         }
     }
 
+    @Test("MP3 writes flush large ID3v2.3 tags before preservation checks")
+    func mp3WritesFlushLargeID3v23TagsBeforePreservationChecks() async throws {
+        let service = TagLibMetadataService()
+        let source = try Data(contentsOf: fixtureURL("sample.mp3"))
+        let audioPayload = try mpegAudioPayload(from: source)
+        let genreFrame = id3v23UTF16TextFrame(
+            identifier: "TCON",
+            value: "TG@Jingluoasmr001",
+            nullTerminated: true
+        )
+        let contents = makeID3v23MP3(
+            frames: [
+                genreFrame,
+                id3v23UTF16TextFrame(
+                    identifier: "TPE1",
+                    value: "触触 / TG@Jingluoasmr001",
+                    nullTerminated: true
+                ),
+                id3v23APICFrame(payloadSize: 115_336)
+            ],
+            audioPayload: audioPayload
+        )
+
+        let cases: [(String, MetadataPatch, String, String?)] = [
+            (
+                "artist",
+                MetadataPatch(artist: "Changed Artist", album: nil),
+                "Changed Artist",
+                nil
+            ),
+            (
+                "album",
+                MetadataPatch(artist: nil, album: "Changed Album"),
+                "触触 / TG@Jingluoasmr001",
+                "Changed Album"
+            ),
+            (
+                "artist-album",
+                MetadataPatch(artist: "Changed Artist", album: "Changed Album"),
+                "Changed Artist",
+                "Changed Album"
+            )
+        ]
+
+        for (name, patch, expectedArtist, expectedAlbum) in cases {
+            try await withTemporaryFile(named: "protected-genre-\(name).mp3", contents: contents) { copy in
+                let propertiesBefore = try canonicalProperties(
+                    copy,
+                    excludeArtist: patch.artist != nil,
+                    excludeAlbum: patch.album != nil
+                )
+                let picturesBefore = complexPropertyCount(copy, key: "PICTURE")
+                #expect(try propertyValues(copy, key: "GENRE").contains("TG@Jingluoasmr001"))
+                #expect(picturesBefore == 1)
+
+                try await service.write(url: copy, patch: patch)
+
+                #expect(try canonicalProperties(
+                    copy,
+                    excludeArtist: patch.artist != nil,
+                    excludeAlbum: patch.album != nil
+                ) == propertiesBefore)
+                #expect(try propertyValues(copy, key: "GENRE").contains("TG@Jingluoasmr001"))
+                #expect(complexPropertyCount(copy, key: "PICTURE") == picturesBefore)
+                let saved = try await service.read(url: copy)
+                #expect(saved.artists.first == expectedArtist)
+                #expect(saved.albums.first == expectedAlbum)
+                #expect(try Data(contentsOf: copy)[3] == 3)
+            }
+        }
+    }
+
     @Test("safe writer preserves quarantine and a non-numeric MP3 track frame")
     func safeWriterPreservesQuarantineAndNonNumericMP3TrackFrame() async throws {
         let service = TagLibMetadataService()
@@ -694,6 +766,65 @@ struct TagLibMetadataServiceTests {
         result.append(frames)
         result.append(audioPayload)
         return result
+    }
+
+    private func makeID3v23MP3(frames: [Data], audioPayload: Data) -> Data {
+        let frameData = frames.reduce(into: Data()) { $0.append($1) }
+        var result = Data(id3Header(
+            major: 3,
+            revision: 0,
+            flags: 0,
+            size: synchsafe(frameData.count)
+        ))
+        result.append(frameData)
+        result.append(audioPayload)
+        return result
+    }
+
+    private func id3v23UTF16TextFrame(
+        identifier: String,
+        value: String,
+        nullTerminated: Bool
+    ) -> Data {
+        precondition(identifier.utf8.count == 4)
+        var payload = Data([0x01, 0xFF, 0xFE])
+        payload.append(value.data(using: .utf16LittleEndian)!)
+        if nullTerminated {
+            payload.append(contentsOf: [0x00, 0x00])
+        }
+
+        let size = payload.count
+        var frame = Data(identifier.utf8)
+        frame.append(contentsOf: [
+            UInt8((size >> 24) & 0xFF),
+            UInt8((size >> 16) & 0xFF),
+            UInt8((size >> 8) & 0xFF),
+            UInt8(size & 0xFF),
+            0x00,
+            0x00
+        ])
+        frame.append(payload)
+        return frame
+    }
+
+    private func id3v23APICFrame(payloadSize: Int) -> Data {
+        var payload = Data([0x00])
+        payload.append(contentsOf: "image/jpeg".utf8)
+        payload.append(contentsOf: [0x00, 0x03, 0x00])
+        precondition(payload.count <= payloadSize)
+        payload.append(Data(repeating: 0x41, count: payloadSize - payload.count))
+
+        var frame = Data("APIC".utf8)
+        frame.append(contentsOf: [
+            UInt8((payloadSize >> 24) & 0xFF),
+            UInt8((payloadSize >> 16) & 0xFF),
+            UInt8((payloadSize >> 8) & 0xFF),
+            UInt8(payloadSize & 0xFF),
+            0x00,
+            0x00
+        ])
+        frame.append(payload)
+        return frame
     }
 
     private func makeFooterBearingMP3() throws -> Data {

@@ -790,6 +790,10 @@ ATWriteResult ATWriteMetadata(
             return result;
         }
 
+        // TagLib writes through a buffered FILE*. Release the writer before reopening
+        // the path, otherwise large tags can be verified against partially flushed data.
+        file = TagLib::FileRef();
+
         const TagLib::FileRef saved_file(path, true, TagLib::AudioProperties::Accurate);
         if(saved_file.isNull() || saved_file.file() == nullptr) {
             SetError(result, ATStatusSaveFailed, "保存后无法重新打开音频文件");
