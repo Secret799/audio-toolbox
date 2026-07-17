@@ -293,6 +293,38 @@ struct TagLibMetadataServiceTests {
         }
     }
 
+    @Test("MP3 writes preserve legacy ID3v2.3 TIME frames")
+    func mp3WritesPreserveLegacyID3v23TimeFrames() async throws {
+        let service = TagLibMetadataService()
+        let source = try Data(contentsOf: fixtureURL("sample.mp3"))
+        let contents = makeID3v23MP3(
+            frames: [
+                id3v23Latin1TextFrame(identifier: "TIT2", value: "Legacy Time Fixture"),
+                id3v23Latin1TextFrame(identifier: "TPE1", value: "Original Artist"),
+                id3v23Latin1TextFrame(identifier: "TIME", value: "1730")
+            ],
+            audioPayload: try mpegAudioPayload(from: source)
+        )
+
+        try await withTemporaryFile(named: "legacy-time.mp3", contents: contents) { copy in
+            let unsupportedBefore = try unsupportedData(copy)
+            #expect(unsupportedBefore.contains("TIME"))
+            #expect(hasID3v2Frame(copy, identifier: "TIME"))
+
+            try await service.write(
+                url: copy,
+                patch: MetadataPatch(artist: "Changed Artist", album: "Changed Album")
+            )
+
+            #expect(try unsupportedData(copy) == unsupportedBefore)
+            #expect(hasID3v2Frame(copy, identifier: "TIME"))
+            let saved = try await service.read(url: copy)
+            #expect(saved.artists.first == "Changed Artist")
+            #expect(saved.albums.first == "Changed Album")
+            #expect(try Data(contentsOf: copy)[3] == 3)
+        }
+    }
+
     @Test("MP3 writes flush large ID3v2.3 tags before preservation checks")
     func mp3WritesFlushLargeID3v23TagsBeforePreservationChecks() async throws {
         let service = TagLibMetadataService()
@@ -779,6 +811,26 @@ struct TagLibMetadataServiceTests {
         result.append(frameData)
         result.append(audioPayload)
         return result
+    }
+
+    private func id3v23Latin1TextFrame(identifier: String, value: String) -> Data {
+        precondition(identifier.utf8.count == 4)
+        precondition(value.canBeConverted(to: .isoLatin1))
+        var payload = Data([0x00])
+        payload.append(value.data(using: .isoLatin1)!)
+
+        let size = payload.count
+        var frame = Data(identifier.utf8)
+        frame.append(contentsOf: [
+            UInt8((size >> 24) & 0xFF),
+            UInt8((size >> 16) & 0xFF),
+            UInt8((size >> 8) & 0xFF),
+            UInt8(size & 0xFF),
+            0x00,
+            0x00
+        ])
+        frame.append(payload)
+        return frame
     }
 
     private func id3v23UTF16TextFrame(

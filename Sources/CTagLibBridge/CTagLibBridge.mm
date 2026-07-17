@@ -2,6 +2,7 @@
 
 #include <taglib/audioproperties.h>
 #include <taglib/fileref.h>
+#include <taglib/id3v2frame.h>
 #include <taglib/id3v2header.h>
 #include <taglib/id3v2tag.h>
 #include <taglib/mpegfile.h>
@@ -561,6 +562,23 @@ bool IsUsableFileRef(const TagLib::FileRef &file, bool require_writable) {
     }
     return !require_writable || !file.file()->readOnly();
 }
+void RetainStandaloneLegacyID3v23TimeFrames(TagLib::MPEG::File &mpeg) {
+    TagLib::ID3v2::Tag *id3v2 = mpeg.ID3v2Tag(false);
+    if(id3v2 == nullptr
+        || id3v2->header()->majorVersion() != 3
+        || !id3v2->frameList("TDRC").isEmpty()) {
+        return;
+    }
+
+    for(TagLib::ID3v2::Frame *frame : id3v2->frameList("TIME")) {
+        if(frame != nullptr && frame->header() != nullptr) {
+            // TagLib marks legacy v2.3 TIME frames for removal while parsing them.
+            // The original frame is still valid in v2.3, so retain it unchanged.
+            frame->header()->setTagAlterPreservation(false);
+        }
+    }
+}
+
 bool SaveMetadataFile(TagLib::FileRef &file) {
     auto *mpeg = dynamic_cast<TagLib::MPEG::File *>(file.file());
     if(mpeg == nullptr) {
@@ -754,7 +772,8 @@ ATWriteResult ATWriteMetadata(
             properties_before.unsupportedData()
         );
 
-        if(dynamic_cast<TagLib::MPEG::File *>(file.file()) != nullptr) {
+        if(auto *mpeg = dynamic_cast<TagLib::MPEG::File *>(file.file())) {
+            RetainStandaloneLegacyID3v23TimeFrames(*mpeg);
             if(changes_artist) {
                 tag->setArtist(TagLib::String(artist_or_null, TagLib::String::UTF8));
             }
