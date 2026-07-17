@@ -293,6 +293,42 @@ struct TagLibMetadataServiceTests {
         }
     }
 
+    @Test("MP3 writes preserve nonstandard ID3v2.3 TYER values")
+    func mp3WritesPreserveNonstandardID3v23YearValues() async throws {
+        let service = TagLibMetadataService()
+        let source = try Data(contentsOf: fixtureURL("sample.mp3"))
+        let contents = makeID3v23MP3(
+            frames: [
+                id3v23Latin1TextFrame(identifier: "TIT2", value: "Legacy Year Fixture"),
+                id3v23Latin1TextFrame(identifier: "TPE1", value: "Original Artist"),
+                id3v23Latin1TextFrame(identifier: "TYER", value: "TG@jingluoasmr001")
+            ],
+            audioPayload: try mpegAudioPayload(from: source)
+        )
+
+        try await withTemporaryFile(named: "nonstandard-year.mp3", contents: contents) { copy in
+            let propertiesBefore = try canonicalProperties(
+                copy,
+                excludeArtist: true,
+                excludeAlbum: true
+            )
+            try await service.write(
+                url: copy,
+                patch: MetadataPatch(artist: "Changed Artist", album: "Changed Album")
+            )
+
+            #expect(try canonicalProperties(
+                copy,
+                excludeArtist: true,
+                excludeAlbum: true
+            ) == propertiesBefore)
+            let saved = try await service.read(url: copy)
+            #expect(saved.artists.first == "Changed Artist")
+            #expect(saved.albums.first == "Changed Album")
+            #expect(try Data(contentsOf: copy)[3] == 3)
+        }
+    }
+
     @Test("MP3 writes preserve legacy ID3v2.3 TIME frames")
     func mp3WritesPreserveLegacyID3v23TimeFrames() async throws {
         let service = TagLibMetadataService()

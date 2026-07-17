@@ -7,6 +7,7 @@
 #include <taglib/id3v2tag.h>
 #include <taglib/mpegfile.h>
 #include <taglib/tag.h>
+#include <taglib/textidentificationframe.h>
 #include <taglib/tfile.h>
 #include <taglib/tpropertymap.h>
 #include <taglib/tstring.h>
@@ -562,6 +563,47 @@ bool IsUsableFileRef(const TagLib::FileRef &file, bool require_writable) {
     }
     return !require_writable || !file.file()->readOnly();
 }
+bool IsLosslesslyDowngradableID3v23Date(const TagLib::String &value) {
+    if(value.size() == 4) {
+        return true;
+    }
+    if(value.size() == 10) {
+        return value[4] == '-' && value[7] == '-';
+    }
+    if(value.size() == 16) {
+        return value[4] == '-'
+            && value[7] == '-'
+            && value[10] == 'T'
+            && value[13] == ':';
+    }
+    return false;
+}
+
+void RetainNonstandardLegacyID3v23YearFrames(TagLib::MPEG::File &mpeg) {
+    TagLib::ID3v2::Tag *id3v2 = mpeg.ID3v2Tag(false);
+    if(id3v2 == nullptr || id3v2->header()->majorVersion() != 3) {
+        return;
+    }
+
+    const TagLib::ID3v2::FrameList date_frames = id3v2->frameList("TDRC");
+    for(TagLib::ID3v2::Frame *frame : date_frames) {
+        auto *date = dynamic_cast<TagLib::ID3v2::TextIdentificationFrame *>(frame);
+        if(date == nullptr
+            || date->fieldList().size() != 1
+            || IsLosslesslyDowngradableID3v23Date(date->fieldList().front())) {
+            continue;
+        }
+
+        auto *legacy_year = new TagLib::ID3v2::TextIdentificationFrame(
+            "TYER",
+            date->textEncoding()
+        );
+        legacy_year->setText(date->fieldList());
+        id3v2->addFrame(legacy_year);
+        id3v2->removeFrame(frame, true);
+    }
+}
+
 void RetainStandaloneLegacyID3v23TimeFrames(TagLib::MPEG::File &mpeg) {
     TagLib::ID3v2::Tag *id3v2 = mpeg.ID3v2Tag(false);
     if(id3v2 == nullptr
@@ -773,6 +815,7 @@ ATWriteResult ATWriteMetadata(
         );
 
         if(auto *mpeg = dynamic_cast<TagLib::MPEG::File *>(file.file())) {
+            RetainNonstandardLegacyID3v23YearFrames(*mpeg);
             RetainStandaloneLegacyID3v23TimeFrames(*mpeg);
             if(changes_artist) {
                 tag->setArtist(TagLib::String(artist_or_null, TagLib::String::UTF8));
