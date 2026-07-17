@@ -57,7 +57,7 @@ public actor BatchEditor: BatchEditing {
             isRunning = false
         }
 
-        let total = request.targets.count
+        let total = request.operations.count
         var results: [BatchFileResult] = []
         results.reserveCapacity(total)
 
@@ -66,11 +66,12 @@ public actor BatchEditor: BatchEditing {
             to: onProgress
         )
 
-        for (index, target) in request.targets.enumerated() {
+        for (index, operation) in request.operations.enumerated() {
+            let target = operation.target
             let url = target.url
             if stopRequested {
-                for remainingTarget in request.targets[index...] {
-                    let remainingURL = remainingTarget.url
+                for remainingOperation in request.operations[index...] {
+                    let remainingURL = remainingOperation.target.url
                     results.append(
                         BatchFileResult(
                             url: remainingURL,
@@ -88,7 +89,7 @@ public actor BatchEditor: BatchEditing {
                 break
             }
 
-            let result = await writer.apply(to: target, patch: request.patch)
+            let result = await writer.apply(to: target, patch: operation.patch)
             results.append(result)
             await reportCompletion(
                 of: url,
@@ -110,7 +111,7 @@ public actor BatchEditor: BatchEditing {
         for request: BatchEditRequest,
         onProgress: @escaping @Sendable (BatchProgress) -> Void
     ) async -> BatchEditSummary {
-        let total = request.targets.count
+        let total = request.operations.count
         var results: [BatchFileResult] = []
         results.reserveCapacity(total)
 
@@ -119,8 +120,8 @@ public actor BatchEditor: BatchEditing {
             to: onProgress
         )
 
-        for target in request.targets {
-            let url = target.url
+        for operation in request.operations {
+            let url = operation.target.url
             results.append(
                 BatchFileResult(
                     url: url,

@@ -48,16 +48,19 @@ public struct BatchEditSheet: View {
                     .foregroundStyle(.secondary)
             }
             Spacer()
-            Text("已选择 \(viewModel.batchEditTracks.count) 个文件")
-                .font(.callout.monospacedDigit())
-                .foregroundStyle(.secondary)
+            Text(
+                "已选择 \(viewModel.batchEditTracks.count) 个文件，将修改 "
+                    + "\(viewModel.batchActualModificationCount) 个"
+            )
+            .font(.callout.monospacedDigit())
+            .foregroundStyle(.secondary)
         }
         .padding(20)
     }
 
     private var valuesStep: some View {
         VStack(alignment: .leading, spacing: 22) {
-            Text("留空的字段不会修改。输入内容两端的空格和换行会在执行前移除。")
+            Text("留空或与原值相同的字段不会修改。输入内容两端的空格和换行会在执行前移除。")
                 .font(.callout)
                 .foregroundStyle(.secondary)
 
@@ -65,14 +68,14 @@ public struct BatchEditSheet: View {
                 GridRow {
                     Text("作者")
                         .frame(width: 70, alignment: .trailing)
-                    TextField("留空则不修改作者", text: $viewModel.batchArtist)
+                    TextField(viewModel.batchArtistPrompt, text: $viewModel.batchArtist)
                         .textFieldStyle(.roundedBorder)
                         .accessibilityLabel("新的作者")
                 }
                 GridRow {
                     Text("专辑")
                         .frame(width: 70, alignment: .trailing)
-                    TextField("留空则不修改专辑", text: $viewModel.batchAlbum)
+                    TextField(viewModel.batchAlbumPrompt, text: $viewModel.batchAlbum)
                         .textFieldStyle(.roundedBorder)
                         .accessibilityLabel("新的专辑")
                 }
@@ -97,7 +100,7 @@ public struct BatchEditSheet: View {
             }
 
             if !viewModel.canAdvanceBatchEdit {
-                Label("至少填写作者或专辑中的一项。", systemImage: "info.circle")
+                Label("请填写至少一个与原值不同的非空内容。", systemImage: "info.circle")
                     .font(.callout)
                     .foregroundStyle(.secondary)
             }
@@ -132,7 +135,11 @@ public struct BatchEditSheet: View {
             )
 
             if remainingPreviewCount > 0 {
-                Text("另有 \(remainingPreviewCount) 个文件未在预览中显示；执行时仍会处理全部 \(viewModel.batchEditTracks.count) 个文件。")
+                Text(
+                    "另有 \(remainingPreviewCount) 个已选文件未在预览中显示；"
+                        + "执行时只处理实际需要修改的 "
+                        + "\(viewModel.batchActualModificationCount) 个文件。"
+                )
                     .font(.callout)
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -194,10 +201,11 @@ public struct BatchEditSheet: View {
             }
             .frame(width: 190, alignment: .leading)
 
+            let patch = viewModel.effectiveBatchPatch(for: track)
             previewValue(originalArtist(track))
-            previewValue(newArtist(track), changed: viewModel.validatedBatchPatch?.artist != nil)
+            previewValue(patch?.artist ?? "保持不变", changed: patch?.artist != nil)
             previewValue(originalAlbum(track))
-            previewValue(newAlbum(track), changed: viewModel.validatedBatchPatch?.album != nil)
+            previewValue(patch?.album ?? "保持不变", changed: patch?.album != nil)
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 9)
@@ -276,16 +284,8 @@ public struct BatchEditSheet: View {
         displayValue(track.metadata.albums)
     }
 
-    private func newArtist(_ track: AudioTrack) -> String {
-        viewModel.validatedBatchPatch?.artist ?? originalArtist(track)
-    }
-
-    private func newAlbum(_ track: AudioTrack) -> String {
-        viewModel.validatedBatchPatch?.album ?? originalAlbum(track)
-    }
-
     private func displayValue(_ values: [String]) -> String {
-        let value = values.joined(separator: ", ")
+        let value = values.joined(separator: " / ")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         return value.isEmpty ? "未设置" : value
     }

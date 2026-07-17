@@ -40,13 +40,29 @@ public struct BatchEditTarget: Equatable, Sendable {
     }
 }
 
-public struct BatchEditRequest: Sendable {
-    public let targets: [BatchEditTarget]
+public struct BatchEditOperation: Equatable, Sendable {
+    public let target: BatchEditTarget
     public let patch: MetadataPatch
 
-    public init(targets: [BatchEditTarget], patch: MetadataPatch) {
-        self.targets = targets
+    public init(target: BatchEditTarget, patch: MetadataPatch) {
+        self.target = target
         self.patch = patch
+    }
+}
+
+public struct BatchEditRequest: Sendable {
+    public let operations: [BatchEditOperation]
+
+    public var targets: [BatchEditTarget] {
+        operations.map(\.target)
+    }
+
+    public init(operations: [BatchEditOperation]) {
+        self.operations = operations
+    }
+
+    public init(targets: [BatchEditTarget], patch: MetadataPatch) {
+        operations = targets.map { BatchEditOperation(target: $0, patch: patch) }
     }
 }
 

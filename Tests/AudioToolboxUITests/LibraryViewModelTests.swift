@@ -650,6 +650,120 @@ struct LibraryViewModelTests {
         #expect(viewModel.currentGroupSelectionState == .all)
     }
 
+    @Test("批量表单回填单文件原作者和原专辑且未变化时不可执行")
+    @MainActor
+    func batchFormPrefillsSingleTrackAndRequiresEffectiveChange() async {
+        let scanner = ScriptedScanner(scripts: [[.loaded(Self.firstTrack), .finished]])
+        let viewModel = makeViewModel(scanner: scanner)
+        await viewModel.loadDirectory(firstRoot)
+        viewModel.toggleSelection(Self.firstTrack.id)
+
+        viewModel.openBatchEditor()
+
+        #expect(viewModel.batchArtist == "Artist One")
+        #expect(viewModel.batchAlbum == "Special Album")
+        #expect(viewModel.batchArtistPrompt == "原作者")
+        #expect(viewModel.batchAlbumPrompt == "原专辑")
+        #expect(viewModel.batchActualModificationCount == 0)
+        #expect(viewModel.validatedBatchPatch == nil)
+        #expect(!viewModel.canAdvanceBatchEdit)
+
+        viewModel.batchArtist = "  Edited Artist  "
+
+        #expect(viewModel.batchActualModificationCount == 1)
+        #expect(viewModel.effectiveBatchPatch(for: Self.firstTrack)
+            == MetadataPatch(artist: "Edited Artist", album: nil))
+        #expect(viewModel.validatedBatchPatch
+            == MetadataPatch(artist: "Edited Artist", album: nil))
+        #expect(viewModel.canAdvanceBatchEdit)
+
+        viewModel.batchArtist = "Artist One"
+        #expect(viewModel.batchActualModificationCount == 0)
+        #expect(!viewModel.canAdvanceBatchEdit)
+
+        viewModel.batchArtist = ""
+        #expect(viewModel.batchActualModificationCount == 0)
+        #expect(!viewModel.canAdvanceBatchEdit)
+    }
+
+    @Test("共同值回填且混合值留空，只为实际不同的文件生成补丁")
+    @MainActor
+    func batchFormHandlesCommonAndMixedValuesPerTrack() async {
+        let scanner = ScriptedScanner(scripts: [[
+            .loaded(Self.firstTrack),
+            .loaded(Self.sameArtistTrack),
+            .finished,
+        ]])
+        let editor = FakeBatchEditor(summary: BatchEditSummary(results: []))
+        let viewModel = makeViewModel(scanner: scanner, batchEditor: editor)
+        await viewModel.loadDirectory(firstRoot)
+        viewModel.selectedGroupID = "artist:Artist One"
+        viewModel.setCurrentGroupSelected(true)
+
+        viewModel.openBatchEditor()
+
+        #expect(viewModel.batchArtist == "Artist One")
+        #expect(viewModel.batchArtistPrompt == "原作者")
+        #expect(viewModel.batchAlbum.isEmpty)
+        #expect(viewModel.batchAlbumPrompt == "多个不同专辑")
+        #expect(viewModel.batchActualModificationCount == 0)
+
+        viewModel.batchAlbum = "Special Album"
+
+        #expect(viewModel.effectiveBatchPatch(for: Self.firstTrack) == nil)
+        #expect(viewModel.effectiveBatchPatch(for: Self.sameArtistTrack)
+            == MetadataPatch(artist: nil, album: "Special Album"))
+        #expect(viewModel.batchActualModificationCount == 1)
+        #expect(viewModel.validatedBatchPatch
+            == MetadataPatch(artist: nil, album: "Special Album"))
+
+        viewModel.batchAcknowledgedNoBackup = true
+        await viewModel.runBatchEdit()
+
+        let operations = await editor.requests.first?.operations
+        #expect(operations?.map(\.target.url) == [Self.sameArtistTrack.url])
+        #expect(operations?.map(\.patch) == [
+            MetadataPatch(artist: nil, album: "Special Album"),
+        ])
+    }
+
+    @Test("混合作者和空元数据使用对应输入提示")
+    @MainActor
+    func batchFormPromptsForMixedAndEmptyMetadata() async {
+        let mixedScanner = ScriptedScanner(scripts: [[
+            .loaded(Self.firstTrack),
+            .loaded(Self.secondTrack),
+            .finished,
+        ]])
+        let mixedViewModel = makeViewModel(scanner: mixedScanner)
+        await mixedViewModel.loadDirectory(firstRoot)
+        mixedViewModel.toggleSelection(Self.firstTrack.id)
+        mixedViewModel.toggleSelection(Self.secondTrack.id)
+
+        mixedViewModel.openBatchEditor()
+
+        #expect(mixedViewModel.batchArtist.isEmpty)
+        #expect(mixedViewModel.batchAlbum.isEmpty)
+        #expect(mixedViewModel.batchArtistPrompt == "多个不同作者")
+        #expect(mixedViewModel.batchAlbumPrompt == "多个不同专辑")
+
+        let emptyScanner = ScriptedScanner(scripts: [[
+            .loaded(Self.untaggedWritableTrack),
+            .finished,
+        ]])
+        let emptyViewModel = makeViewModel(scanner: emptyScanner)
+        await emptyViewModel.loadDirectory(firstRoot)
+        emptyViewModel.toggleSelection(Self.untaggedWritableTrack.id)
+
+        emptyViewModel.openBatchEditor()
+
+        #expect(emptyViewModel.batchArtist.isEmpty)
+        #expect(emptyViewModel.batchAlbum.isEmpty)
+        #expect(emptyViewModel.batchArtistPrompt == "原值为空")
+        #expect(emptyViewModel.batchAlbumPrompt == "原值为空")
+        #expect(!emptyViewModel.canAdvanceBatchEdit)
+    }
+
     @Test("批量表单校验空 patch、首尾空格和无备份确认")
     @MainActor
     func batchFormValidatesPatchAndAcknowledgement() async {
@@ -773,7 +887,9 @@ struct LibraryViewModelTests {
         await viewModel.runBatchEdit()
 
         #expect(await editor.requests.count == 1)
-        #expect(await editor.requests.first?.patch == MetadataPatch(artist: "Edited Artist", album: nil))
+        #expect(await editor.requests.first?.operations.map(\.patch) == [
+            MetadataPatch(artist: "Edited Artist", album: nil),
+        ])
 
         await editor.complete()
         await firstRun.value

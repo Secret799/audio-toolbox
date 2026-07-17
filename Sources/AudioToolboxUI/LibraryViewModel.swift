@@ -35,6 +35,19 @@ public enum BatchSheetState: Equatable, Sendable {
     case completed(BatchEditSummary)
 }
 
+public enum BatchFieldInitialState: Equatable, Sendable {
+    case common(String)
+    case mixed
+    case empty
+}
+
+private extension BatchFieldInitialState {
+    var commonValue: String? {
+        guard case let .common(value) = self else { return nil }
+        return value
+    }
+}
+
 public struct BatchResultCounts: Equatable, Sendable {
     public let succeeded: Int
     public let warnings: Int
@@ -115,6 +128,8 @@ public final class LibraryViewModel: ObservableObject {
         }
     }
     @Published public var batchAcknowledgedNoBackup = false
+    public private(set) var batchArtistInitialState: BatchFieldInitialState = .empty
+    public private(set) var batchAlbumInitialState: BatchFieldInitialState = .empty
 
     public var selectedCount: Int {
         selectedTrackIDs.count
@@ -154,27 +169,73 @@ public final class LibraryViewModel: ObservableObject {
         batchEditTrackSnapshot
     }
 
+    public var batchArtistPrompt: String {
+        batchPrompt(for: batchArtistInitialState, commonLabel: "原作者", mixedLabel: "多个不同作者")
+    }
+
+    public var batchAlbumPrompt: String {
+        batchPrompt(for: batchAlbumInitialState, commonLabel: "原专辑", mixedLabel: "多个不同专辑")
+    }
+
     public var validatedBatchPatch: MetadataPatch? {
-        MetadataPatch.validated(artist: batchArtist, album: batchAlbum)
+        let operations = effectiveBatchOperations
+        let artist = operations.contains { $0.patch.artist != nil }
+            ? MetadataPatch(artist: batchArtist, album: nil).artist
+            : nil
+        let album = operations.contains { $0.patch.album != nil }
+            ? MetadataPatch(artist: nil, album: batchAlbum).album
+            : nil
+        return MetadataPatch.validated(artist: artist, album: album)
+    }
+
+    public var batchActualModificationCount: Int {
+        effectiveBatchOperations.count
+    }
+
+    public func effectiveBatchPatch(for track: AudioTrack) -> MetadataPatch? {
+        let desiredArtist = MetadataPatch(artist: batchArtist, album: nil).artist
+        let desiredAlbum = MetadataPatch(artist: nil, album: batchAlbum).album
+        let originalArtist = Self.batchMetadataValue(track.metadata.artists)
+        let originalAlbum = Self.batchMetadataValue(track.metadata.albums)
+        let artist = desiredArtist != nil && desiredArtist != originalArtist
+            ? desiredArtist
+            : nil
+        let album = desiredAlbum != nil && desiredAlbum != originalAlbum
+            ? desiredAlbum
+            : nil
+        return MetadataPatch.validated(artist: artist, album: album)
     }
 
     public var canAdvanceBatchEdit: Bool {
         guard case .editing = batchState else { return false }
-        return validatedBatchPatch != nil
+        return !effectiveBatchOperations.isEmpty
     }
 
     public var canExecuteBatchEdit: Bool {
         canAdvanceBatchEdit
             && batchAcknowledgedNoBackup
-            && !batchEditTrackSnapshot.isEmpty
-            && batchEditTrackSnapshot.allSatisfy(\.isEditable)
-            && batchSnapshotIsCurrentlyEditable
+            && effectiveBatchOperationsAreCurrentlyEditable
     }
 
-    private var batchSnapshotIsCurrentlyEditable: Bool {
+    private var effectiveBatchOperationsAreCurrentlyEditable: Bool {
         let currentTracks = Dictionary(uniqueKeysWithValues: tracks.map { ($0.id, $0) })
-        return batchEditTrackSnapshot.allSatisfy { snapshot in
-            currentTracks[snapshot.id]?.isEditable == true
+        return effectiveBatchOperations.allSatisfy { operation in
+            currentTracks[operation.target.fileIdentity]?.isEditable == true
+        }
+    }
+
+    private var effectiveBatchOperations: [BatchEditOperation] {
+        batchEditTrackSnapshot.compactMap { track in
+            guard let patch = effectiveBatchPatch(for: track) else { return nil }
+            return BatchEditOperation(
+                target: BatchEditTarget(
+                    url: track.url,
+                    fileIdentity: track.id,
+                    fileSize: track.fileSize,
+                    modificationDate: track.modificationDate
+                ),
+                patch: patch
+            )
         }
     }
 
@@ -469,8 +530,8 @@ public final class LibraryViewModel: ObservableObject {
             $0.isEditable && selectedTrackIDs.contains($0.id)
         }
         guard !selectedTracks.isEmpty else { return }
-        resetBatchDraft()
         batchEditTrackSnapshot = selectedTracks
+        initializeBatchDraft(from: selectedTracks)
         batchState = .editing
     }
 
@@ -486,13 +547,9 @@ public final class LibraryViewModel: ObservableObject {
     }
 
     public func runBatchEdit() async {
-        guard canExecuteBatchEdit,
-              let patch = validatedBatchPatch else {
-            return
-        }
-
-        let selectedTracks = batchEditTrackSnapshot
-        guard !selectedTracks.isEmpty else { return }
+        guard canExecuteBatchEdit else { return }
+        let operations = effectiveBatchOperations
+        guard !operations.isEmpty else { return }
 
         batchGeneration &+= 1
         let generation = batchGeneration
@@ -500,7 +557,7 @@ public final class LibraryViewModel: ObservableObject {
         let retainedLease = accessLease
         let initialProgress = BatchProgress(
             completed: 0,
-            total: selectedTracks.count,
+            total: operations.count,
             currentURL: nil
         )
         batchState = .running(initialProgress)
@@ -524,17 +581,7 @@ public final class LibraryViewModel: ObservableObject {
         batchProgressTask = progressTask
 
         let summary = await batchEditor.run(
-            BatchEditRequest(
-                targets: selectedTracks.map { track in
-                    BatchEditTarget(
-                        url: track.url,
-                        fileIdentity: track.id,
-                        fileSize: track.fileSize,
-                        modificationDate: track.modificationDate
-                    )
-                },
-                patch: patch
-            )
+            BatchEditRequest(operations: operations)
         ) { progress in
             progressContinuation.yield(progress)
         }
@@ -577,10 +624,58 @@ public final class LibraryViewModel: ObservableObject {
         await batchEditor.requestStop()
     }
 
+    private func initializeBatchDraft(from tracks: [AudioTrack]) {
+        batchAcknowledgedNoBackup = false
+        batchArtistInitialState = Self.batchFieldInitialState(
+            tracks.map { Self.batchMetadataValue($0.metadata.artists) }
+        )
+        batchAlbumInitialState = Self.batchFieldInitialState(
+            tracks.map { Self.batchMetadataValue($0.metadata.albums) }
+        )
+        batchArtist = batchArtistInitialState.commonValue ?? ""
+        batchAlbum = batchAlbumInitialState.commonValue ?? ""
+    }
+
     private func resetBatchDraft() {
         batchArtist = ""
         batchAlbum = ""
+        batchArtistInitialState = .empty
+        batchAlbumInitialState = .empty
         batchAcknowledgedNoBackup = false
+    }
+
+    private func batchPrompt(
+        for state: BatchFieldInitialState,
+        commonLabel: String,
+        mixedLabel: String
+    ) -> String {
+        switch state {
+        case .common:
+            commonLabel
+        case .mixed:
+            mixedLabel
+        case .empty:
+            "原值为空"
+        }
+    }
+
+    private static func batchFieldInitialState(
+        _ values: [String?]
+    ) -> BatchFieldInitialState {
+        guard !values.isEmpty else { return .empty }
+        let distinctValues = Set(values)
+        guard distinctValues.count == 1 else { return .mixed }
+        guard let value = values[0] else { return .empty }
+        return .common(value)
+    }
+
+    private static func batchMetadataValue(_ values: [String]) -> String? {
+        let normalizedValues = values.compactMap { value -> String? in
+            let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? nil : trimmed
+        }
+        guard !normalizedValues.isEmpty else { return nil }
+        return normalizedValues.joined(separator: " / ")
     }
 
     private var isBatchActive: Bool {

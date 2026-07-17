@@ -19,6 +19,35 @@ struct BatchEditorTests {
         #expect(await writer.appliedURLs() == files)
     }
 
+    @Test("每个文件使用自己的有效补丁并保持输入顺序")
+    func eachOperationUsesItsOwnPatch() async {
+        let files = testURLs(count: 2, prefix: "per-operation-patch")
+        let targets = files.enumerated().map { index, url in
+            BatchEditTarget(
+                url: url,
+                fileIdentity: FileIdentity(rawValue: "operation-\(index)"),
+                fileSize: Int64(index + 1),
+                modificationDate: Date(timeIntervalSince1970: Double(1_700_000_000 + index))
+            )
+        }
+        let patches = [
+            MetadataPatch(artist: "只改作者", album: nil),
+            MetadataPatch(artist: nil, album: "只改专辑"),
+        ]
+        let request = BatchEditRequest(operations: [
+            BatchEditOperation(target: targets[0], patch: patches[0]),
+            BatchEditOperation(target: targets[1], patch: patches[1]),
+        ])
+        let writer = StubBatchWriter(statuses: [.succeeded, .succeeded])
+        let editor = BatchEditor(writer: writer)
+
+        let summary = await editor.run(request, onProgress: { _ in })
+
+        #expect(summary.results.map(\.url) == files)
+        #expect(await writer.appliedURLs() == files)
+        #expect(await writer.appliedPatches() == patches)
+    }
+
     @Test("成功结果中的非空消息会单列为警告并保留恢复路径")
     func successfulWarningsAreCountedSeparately() {
         let recoveryURL = URL(fileURLWithPath: "/tmp/audio-toolbox-recovery/work.mp3")
@@ -211,6 +240,7 @@ private func testURLs(count: Int, prefix: String) -> [URL] {
 private actor StubBatchWriter: SafeMetadataWriting {
     private var statuses: [BatchFileStatus]
     private var urls: [URL] = []
+    private var patches: [MetadataPatch] = []
 
     init(statuses: [BatchFileStatus]) {
         self.statuses = statuses
@@ -219,12 +249,17 @@ private actor StubBatchWriter: SafeMetadataWriting {
     func apply(to target: BatchEditTarget, patch: MetadataPatch) async -> BatchFileResult {
         let url = target.url
         urls.append(url)
+        patches.append(patch)
         let status = statuses.removeFirst()
         return BatchFileResult(url: url, status: status, message: nil)
     }
 
     func appliedURLs() -> [URL] {
         urls
+    }
+
+    func appliedPatches() -> [MetadataPatch] {
+        patches
     }
 }
 
