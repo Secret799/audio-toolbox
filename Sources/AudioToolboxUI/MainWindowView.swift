@@ -204,6 +204,18 @@ public struct MainWindowView: View {
         HStack(spacing: 12) {
             Label("已选择 \(viewModel.selectedCount)", systemImage: "checkmark.circle")
                 .accessibilityLabel("全局已选择 \(viewModel.selectedCount) 个文件")
+            Button {
+                viewModel.clearSelection()
+            } label: {
+                Image(systemName: "xmark.circle")
+            }
+            .buttonStyle(.borderless)
+            .disabled(
+                viewModel.selectedCount == 0
+                    || viewModel.isLibraryInteractionLocked
+            )
+            .help("清空全部选择")
+            .accessibilityLabel("清空全部选择")
             Spacer()
             Text(scanStatusText)
                 .foregroundStyle(.secondary)

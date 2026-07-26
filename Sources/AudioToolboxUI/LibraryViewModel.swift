@@ -596,6 +596,12 @@ public final class LibraryViewModel: ObservableObject {
         publishSelection()
     }
 
+    public func clearSelection() {
+        guard !isLibraryInteractionLocked else { return }
+        selectionState.removeAll()
+        publishSelection()
+    }
+
     public func setCurrentGroupSelected(_ selected: Bool) {
         guard !isLibraryInteractionLocked else { return }
         guard let selectedGroupID,
@@ -735,11 +741,10 @@ public final class LibraryViewModel: ObservableObject {
             ))
 
             let oldIdentity = operation.target.fileIdentity
-            let wasSelected = selectedTrackIDs.contains(oldIdentity)
+            selectionState.setSelected([oldIdentity], selected: false)
             if result.migrationStatus == .moved,
                !Self.contains(result.finalURL, in: root) {
                 tracksByID.removeValue(forKey: oldIdentity)
-                selectionState.setSelected([oldIdentity], selected: false)
                 completedResultCount += 1
                 continue
             }
@@ -748,14 +753,9 @@ public final class LibraryViewModel: ObservableObject {
                 let track = try await trackReloader.reload(url: result.finalURL)
                 tracksByID.removeValue(forKey: oldIdentity)
                 tracksByID[track.id] = track
-                selectionState.setSelected([oldIdentity], selected: false)
-                if wasSelected && track.isEditable {
-                    selectionState.setSelected([track.id], selected: true)
-                }
             } catch {
                 if result.migrationStatus == .moved {
                     tracksByID.removeValue(forKey: oldIdentity)
-                    selectionState.setSelected([oldIdentity], selected: false)
                 }
                 updatedResults[index] = Self.appendingReloadWarning(
                     to: result,

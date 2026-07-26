@@ -203,6 +203,26 @@ struct LibraryViewModelTests {
         #expect(!viewModel.canOpenBatchEditor)
     }
 
+    @Test("清空全部选择会移除跨分组累计的选择")
+    @MainActor
+    func clearSelectionRemovesAccumulatedSelections() async {
+        let scanner = ScriptedScanner(scripts: [[
+            .loaded(Self.firstTrack),
+            .loaded(Self.secondTrack),
+            .finished,
+        ]])
+        let viewModel = makeViewModel(scanner: scanner)
+        await viewModel.loadDirectory(firstRoot)
+        viewModel.toggleSelection(Self.firstTrack.id)
+        viewModel.toggleSelection(Self.secondTrack.id)
+
+        viewModel.clearSelection()
+
+        #expect(viewModel.selectedTrackIDs.isEmpty)
+        #expect(viewModel.selectedCount == 0)
+        #expect(!viewModel.canOpenBatchEditor)
+    }
+
     @Test("空目录派生用户文案")
     @MainActor
     func emptyDirectoryDerivesUserMessage() async {
@@ -1258,7 +1278,7 @@ struct LibraryViewModelTests {
         #expect(viewModel.batchResultCounts == BatchResultCounts(succeeded: 1, failed: 0, notProcessed: 0))
         #expect(viewModel.tracks == [Self.editedFirstTrack])
         #expect(viewModel.groups.map(\.displayName) == ["Edited Artist"])
-        #expect(viewModel.selectedTrackIDs == [Self.firstTrack.id])
+        #expect(viewModel.selectedTrackIDs.isEmpty)
         #expect(await reloader.urls == [Self.firstTrack.url])
         #expect(scanner.scanCount == 1)
     }
@@ -1306,6 +1326,38 @@ struct LibraryViewModelTests {
             failed: 1,
             notProcessed: 1
         ))
+    }
+
+    @Test("批量完成后只取消成功项并保留失败和未处理项")
+    @MainActor
+    func batchCompletionDeselectsOnlySucceededTracks() async {
+        let summary = BatchEditSummary(results: [
+            BatchFileResult(url: Self.firstTrack.url, status: .succeeded, message: nil),
+            BatchFileResult(url: Self.sameArtistTrack.url, status: .failed, message: "写入失败"),
+            BatchFileResult(url: Self.secondTrack.url, status: .notProcessed, message: "未处理"),
+        ])
+        let viewModel = makeViewModel(
+            scanner: ScriptedScanner(scripts: [[
+                .loaded(Self.firstTrack),
+                .loaded(Self.sameArtistTrack),
+                .loaded(Self.secondTrack),
+                .finished,
+            ]]),
+            batchEditor: FakeBatchEditor(summary: summary),
+            trackReloader: RecordingTrackReloader(results: [
+                .success(Self.editedFirstTrack),
+            ])
+        )
+
+        await runBatchEdit(
+            viewModel,
+            selecting: [Self.firstTrack.id, Self.sameArtistTrack.id, Self.secondTrack.id]
+        )
+
+        #expect(viewModel.selectedTrackIDs == [
+            Self.sameArtistTrack.id,
+            Self.secondTrack.id,
+        ])
     }
 
     @Test("批量完成后的增量重载结束前拒绝重新打开编辑器")
@@ -1407,7 +1459,7 @@ struct LibraryViewModelTests {
         await runBatchEdit(viewModel, selecting: [Self.firstTrack.id])
 
         #expect(viewModel.tracks == [movedTrack])
-        #expect(viewModel.selectedTrackIDs == [movedTrack.id])
+        #expect(viewModel.selectedTrackIDs.isEmpty)
         #expect(await reloader.urls == [destination])
     }
 
@@ -1492,7 +1544,7 @@ struct LibraryViewModelTests {
         await runBatchEdit(viewModel, selecting: [Self.firstTrack.id])
 
         #expect(viewModel.tracks == [Self.firstTrack])
-        #expect(viewModel.selectedTrackIDs == [Self.firstTrack.id])
+        #expect(viewModel.selectedTrackIDs.isEmpty)
         guard case let .completed(summary) = viewModel.batchState,
               let result = summary.results.first else {
             Issue.record("Expected completed batch summary")
