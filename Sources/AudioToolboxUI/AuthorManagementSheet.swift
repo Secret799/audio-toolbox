@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 import AudioToolboxCore
 
@@ -130,8 +131,7 @@ public struct AuthorManagementSheet: View {
 
     private func authorRow(_ row: AuthorRenameRow) -> some View {
         HStack(spacing: 12) {
-            Text(row.displayName)
-                .lineLimit(2)
+            originalAuthorCell(row.displayName)
                 .frame(width: 220, alignment: .leading)
 
             VStack(alignment: .leading, spacing: 2) {
@@ -228,7 +228,7 @@ public struct AuthorManagementSheet: View {
 
     private func previewRow(_ preview: AuthorRenamePreview) -> some View {
         HStack(alignment: .top, spacing: 12) {
-            Text(preview.oldAuthor)
+            originalAuthorCell(preview.oldAuthor)
                 .frame(maxWidth: .infinity, alignment: .leading)
             Image(systemName: "arrow.right")
                 .foregroundStyle(.secondary)
@@ -248,7 +248,29 @@ public struct AuthorManagementSheet: View {
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 10)
-        .accessibilityElement(children: .combine)
+        .accessibilityElement(children: .contain)
+    }
+
+    private func originalAuthorCell(_ author: String) -> some View {
+        HStack(spacing: 6) {
+            Text(author)
+                .lineLimit(2)
+                .textSelection(.enabled)
+            Spacer(minLength: 4)
+            Button {
+                copyToPasteboard(author)
+            } label: {
+                Image(systemName: "doc.on.doc")
+            }
+            .buttonStyle(.borderless)
+            .help("复制原作者")
+            .accessibilityLabel("复制原作者 \(author)")
+        }
+    }
+
+    private func copyToPasteboard(_ value: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(value, forType: .string)
     }
 
     private var footer: some View {
