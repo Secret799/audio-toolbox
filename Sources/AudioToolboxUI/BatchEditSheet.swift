@@ -379,9 +379,10 @@ public struct BatchEditSheet: View {
 }
 
 struct BatchProgressSheet: View {
-    @ObservedObject var viewModel: LibraryViewModel
     let progress: BatchProgress
     let isStopping: Bool
+    let operationName: String
+    let stopAction: () async -> Void
 
     var body: some View {
         VStack(spacing: 22) {
@@ -420,7 +421,7 @@ struct BatchProgressSheet: View {
             .frame(maxWidth: 500)
 
             Button(isStopping ? "正在停止…" : "停止") {
-                Task { await viewModel.stopBatchEdit() }
+                Task { await stopAction() }
             }
             .disabled(isStopping)
         }
@@ -430,13 +431,13 @@ struct BatchProgressSheet: View {
     }
 
     private var progressTitle: String {
-        if isStopping { return "正在停止批量编辑" }
+        if isStopping { return "正在停止\(operationName)" }
         return switch progress.phase {
         case .preparing: "正在准备"
         case .editing: "正在修改元数据"
         case .moving: "正在移动文件"
         case .updatingLibrary: "正在更新列表"
-        case .completed: "正在完成批量编辑"
+        case .completed: "正在完成\(operationName)"
         }
     }
 

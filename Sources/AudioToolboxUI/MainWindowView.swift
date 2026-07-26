@@ -29,6 +29,10 @@ public struct MainWindowView: View {
             batchSheetContent
                 .interactiveDismissDisabled(viewModel.isBatchExecutionActive)
         }
+        .sheet(isPresented: authorManagementSheetPresented) {
+            authorManagementSheetContent
+                .interactiveDismissDisabled(isAuthorManagementExecutionActive)
+        }
     }
 
     private var sidebar: some View {
@@ -283,6 +287,14 @@ public struct MainWindowView: View {
             }
             .disabled(!viewModel.canOpenBatchEditor || isScanning)
             .accessibilityLabel("批量编辑已选择文件")
+
+            Button {
+                viewModel.openAuthorManagement()
+            } label: {
+                Label("作者管理", systemImage: "person.2")
+            }
+            .disabled(!viewModel.canOpenAuthorManagement || isScanning)
+            .accessibilityLabel("批量管理所有作者")
         }
     }
 
@@ -295,19 +307,53 @@ public struct MainWindowView: View {
             BatchEditSheet(viewModel: viewModel)
         case let .running(progress):
             BatchProgressSheet(
-                viewModel: viewModel,
                 progress: progress,
-                isStopping: false
-            )
+                isStopping: false,
+                operationName: "批量编辑"
+            ) {
+                await viewModel.stopBatchEdit()
+            }
         case let .stopping(progress):
             BatchProgressSheet(
-                viewModel: viewModel,
                 progress: progress,
-                isStopping: true
-            )
+                isStopping: true,
+                operationName: "批量编辑"
+            ) {
+                await viewModel.stopBatchEdit()
+            }
         case let .completed(summary):
             ResultSheet(summary: summary) {
                 viewModel.closeBatchEditor()
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var authorManagementSheetContent: some View {
+        switch viewModel.authorManagementState {
+        case .closed:
+            EmptyView()
+        case .editing, .previewing:
+            AuthorManagementSheet(viewModel: viewModel)
+        case let .running(progress):
+            BatchProgressSheet(
+                progress: progress,
+                isStopping: false,
+                operationName: "作者修改"
+            ) {
+                await viewModel.stopAuthorRenames()
+            }
+        case let .stopping(progress):
+            BatchProgressSheet(
+                progress: progress,
+                isStopping: true,
+                operationName: "作者修改"
+            ) {
+                await viewModel.stopAuthorRenames()
+            }
+        case let .completed(summary):
+            ResultSheet(summary: summary) {
+                viewModel.closeAuthorManagement()
             }
         }
     }
@@ -321,6 +367,26 @@ public struct MainWindowView: View {
                 }
             }
         )
+    }
+
+    private var authorManagementSheetPresented: Binding<Bool> {
+        Binding(
+            get: { viewModel.isAuthorManagementPresented },
+            set: { isPresented in
+                if !isPresented {
+                    viewModel.closeAuthorManagement()
+                }
+            }
+        )
+    }
+
+    private var isAuthorManagementExecutionActive: Bool {
+        switch viewModel.authorManagementState {
+        case .running, .stopping:
+            true
+        case .closed, .editing, .previewing, .completed:
+            false
+        }
     }
 
     private var groupingSectionTitle: String {
