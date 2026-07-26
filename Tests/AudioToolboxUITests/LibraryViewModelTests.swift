@@ -223,6 +223,76 @@ struct LibraryViewModelTests {
         #expect(!viewModel.canOpenBatchEditor)
     }
 
+    @Test("作者管理冻结快照并保留搜索隐藏的映射草稿")
+    @MainActor
+    func authorManagementBuildsDraftsAndPreviewFromSnapshot() async {
+        let scanner = ScriptedScanner(scripts: [[
+            .loaded(Self.firstTrack),
+            .loaded(Self.secondTrack),
+            .loaded(Self.untaggedWritableTrack),
+            .loaded(Self.readOnlyTrack),
+            .finished,
+        ]])
+        let viewModel = makeViewModel(scanner: scanner)
+        await viewModel.loadDirectory(firstRoot)
+
+        #expect(viewModel.canOpenAuthorManagement)
+        viewModel.openAuthorManagement()
+
+        #expect(viewModel.authorManagementState == .editing)
+        #expect(viewModel.authorRenameSnapshot.count == 4)
+        #expect(viewModel.authorRenameRows.map(\.id).contains(.unknown))
+
+        viewModel.setAuthorRenameDraft(" Renamed ", for: .named("Artist One"))
+        viewModel.setAuthorRenameDraft("Known", for: .unknown)
+        viewModel.authorSearchText = "artist one"
+
+        #expect(viewModel.filteredAuthorRenameRows.map(\.id) == [
+            .named("Artist One"),
+        ])
+        #expect(viewModel.authorRenameDrafts[.unknown] == "Known")
+        #expect(viewModel.authorRenameAuthorCount == 2)
+        #expect(viewModel.authorRenameFileCount == 2)
+        #expect(viewModel.canPreviewAuthorRenames)
+
+        viewModel.showAuthorRenamePreview()
+        #expect(viewModel.authorManagementState == .previewing)
+        #expect(!viewModel.authorRenameAcknowledgedNoBackup)
+        #expect(!viewModel.canExecuteAuthorRenames)
+
+        viewModel.returnToAuthorRenameEditing()
+        #expect(viewModel.authorManagementState == .editing)
+        viewModel.closeAuthorManagement()
+
+        #expect(viewModel.authorManagementState == .closed)
+        #expect(viewModel.authorRenameSnapshot.isEmpty)
+        #expect(viewModel.authorRenameDrafts.isEmpty)
+        #expect(viewModel.authorSearchText.isEmpty)
+    }
+
+    @Test("作者管理与普通批量编辑互斥")
+    @MainActor
+    func authorManagementAndRegularBatchAreMutuallyExclusive() async {
+        let scanner = ScriptedScanner(scripts: [[.loaded(Self.firstTrack), .finished]])
+        let viewModel = makeViewModel(scanner: scanner)
+        await viewModel.loadDirectory(firstRoot)
+        viewModel.toggleSelection(Self.firstTrack.id)
+
+        viewModel.openBatchEditor()
+        viewModel.openAuthorManagement()
+
+        #expect(viewModel.batchState == .editing)
+        #expect(viewModel.authorManagementState == .closed)
+
+        viewModel.closeBatchEditor()
+        viewModel.openAuthorManagement()
+        viewModel.openBatchEditor()
+
+        #expect(viewModel.authorManagementState == .editing)
+        #expect(viewModel.batchState == .closed)
+        #expect(viewModel.isLibraryInteractionLocked)
+    }
+
     @Test("空目录派生用户文案")
     @MainActor
     func emptyDirectoryDerivesUserMessage() async {

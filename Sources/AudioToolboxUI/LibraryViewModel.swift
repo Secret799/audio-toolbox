@@ -35,6 +35,15 @@ public enum BatchSheetState: Equatable, Sendable {
     case completed(BatchEditSummary)
 }
 
+public enum AuthorManagementState: Equatable, Sendable {
+    case closed
+    case editing
+    case previewing
+    case running(BatchProgress)
+    case stopping(BatchProgress)
+    case completed(BatchEditSummary)
+}
+
 public enum BatchFieldInitialState: Equatable, Sendable {
     case common(String)
     case mixed
@@ -117,6 +126,10 @@ public final class LibraryViewModel: ObservableObject {
         }
     }
     @Published public private(set) var batchState: BatchSheetState = .closed
+    @Published public private(set) var authorManagementState: AuthorManagementState = .closed
+    @Published public var authorSearchText = ""
+    @Published public private(set) var authorRenameDrafts: [AuthorIdentity: String] = [:]
+    @Published public var authorRenameAcknowledgedNoBackup = false
     @Published public var batchArtist = "" {
         didSet {
             if batchArtist != oldValue {
@@ -143,20 +156,43 @@ public final class LibraryViewModel: ObservableObject {
     @Published public var batchAcknowledgedNoBackup = false
     public private(set) var batchArtistInitialState: BatchFieldInitialState = .empty
     public private(set) var batchAlbumInitialState: BatchFieldInitialState = .empty
+    public private(set) var authorRenameSnapshot: [AudioTrack] = []
 
     public var selectedCount: Int {
         selectedTrackIDs.count
     }
 
     public var canOpenBatchEditor: Bool {
-        guard case .closed = batchState, !isBatchActive else { return false }
+        guard case .closed = batchState,
+              case .closed = authorManagementState else {
+            return false
+        }
         return tracks.contains { track in
             track.isEditable && selectedTrackIDs.contains(track.id)
         }
     }
 
+    public var canOpenAuthorManagement: Bool {
+        guard case .closed = batchState,
+              case .closed = authorManagementState,
+              !tracks.isEmpty else {
+            return false
+        }
+        return switch scanState {
+        case .loaded, .empty:
+            true
+        case .idle, .restoring, .scanning, .failed:
+            false
+        }
+    }
+
     public var isBatchSheetPresented: Bool {
         if case .closed = batchState { return false }
+        return true
+    }
+
+    public var isAuthorManagementPresented: Bool {
+        if case .closed = authorManagementState { return false }
         return true
     }
 
@@ -170,12 +206,46 @@ public final class LibraryViewModel: ObservableObject {
     }
 
     public var isLibraryInteractionLocked: Bool {
-        switch batchState {
-        case .editing, .running, .stopping:
-            true
-        case .closed, .completed:
-            false
+        isBatchActive || isAuthorManagementActive
+    }
+
+    public var authorRenameRows: [AuthorRenameRow] {
+        AuthorRenamePlanner.rows(from: authorRenameSnapshot)
+    }
+
+    public var filteredAuthorRenameRows: [AuthorRenameRow] {
+        let query = authorSearchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { return authorRenameRows }
+        return authorRenameRows.filter {
+            $0.displayName.localizedStandardContains(query)
         }
+    }
+
+    public var authorRenamePreviews: [AuthorRenamePreview] {
+        AuthorRenamePlanner.previews(
+            tracks: authorRenameSnapshot,
+            drafts: authorRenameDrafts
+        )
+    }
+
+    public var authorRenameAuthorCount: Int {
+        authorRenamePreviews.count
+    }
+
+    public var authorRenameFileCount: Int {
+        authorRenamePreviews.reduce(0) { $0 + $1.editableCount }
+    }
+
+    public var canPreviewAuthorRenames: Bool {
+        guard case .editing = authorManagementState else { return false }
+        return !effectiveAuthorRenameOperations.isEmpty
+    }
+
+    public var canExecuteAuthorRenames: Bool {
+        guard case .previewing = authorManagementState else { return false }
+        return authorRenameAcknowledgedNoBackup
+            && !effectiveAuthorRenameOperations.isEmpty
+            && authorRenameOperationsAreCurrentlyEditable
     }
 
     public var batchEditTracks: [AudioTrack] {
@@ -480,7 +550,7 @@ public final class LibraryViewModel: ObservableObject {
     }
 
     public func loadDirectory(_ url: URL) async {
-        guard !isBatchActive else { return }
+        guard !isEditingWorkflowActive else { return }
         guard let task = startDirectoryLoad(
             url.standardizedFileURL,
             persistBookmark: true
@@ -491,7 +561,7 @@ public final class LibraryViewModel: ObservableObject {
     }
 
     public func restoreLastDirectoryIfNeeded() async {
-        guard !hasAttemptedDirectoryRestore, !isBatchActive else { return }
+        guard !hasAttemptedDirectoryRestore, !isEditingWorkflowActive else { return }
         hasAttemptedDirectoryRestore = true
         await restoreLastDirectory()
     }
@@ -555,7 +625,7 @@ public final class LibraryViewModel: ObservableObject {
     }
 
     public func restoreLastDirectory() async {
-        guard !isBatchActive else { return }
+        guard !isEditingWorkflowActive else { return }
 
         directoryOperationError = nil
         invalidateScan()
@@ -621,8 +691,11 @@ public final class LibraryViewModel: ObservableObject {
     }
 
     public func openBatchEditor() {
-        guard case .closed = batchState else { return }
-        guard !selectedTrackIDs.isEmpty, !isBatchActive else { return }
+        guard case .closed = batchState,
+              case .closed = authorManagementState else {
+            return
+        }
+        guard !selectedTrackIDs.isEmpty else { return }
         let selectedTracks = tracks.filter {
             $0.isEditable && selectedTrackIDs.contains($0.id)
         }
@@ -631,6 +704,49 @@ public final class LibraryViewModel: ObservableObject {
         initializeBatchDraft(from: selectedTracks)
         movesSuccessfulFiles = hasValidMigrationDirectory
         batchState = .editing
+    }
+
+    public func openAuthorManagement() {
+        guard canOpenAuthorManagement else { return }
+        authorRenameSnapshot = tracks
+        authorRenameDrafts = [:]
+        authorSearchText = ""
+        authorRenameAcknowledgedNoBackup = false
+        authorManagementState = .editing
+    }
+
+    public func closeAuthorManagement() {
+        switch authorManagementState {
+        case .editing, .previewing, .completed:
+            authorManagementState = .closed
+            authorRenameSnapshot = []
+            authorRenameDrafts = [:]
+            authorSearchText = ""
+            authorRenameAcknowledgedNoBackup = false
+        case .closed, .running, .stopping:
+            return
+        }
+    }
+
+    public func setAuthorRenameDraft(
+        _ value: String,
+        for author: AuthorIdentity
+    ) {
+        guard case .editing = authorManagementState else { return }
+        authorRenameDrafts[author] = value
+        authorRenameAcknowledgedNoBackup = false
+    }
+
+    public func showAuthorRenamePreview() {
+        guard canPreviewAuthorRenames else { return }
+        authorRenameAcknowledgedNoBackup = false
+        authorManagementState = .previewing
+    }
+
+    public func returnToAuthorRenameEditing() {
+        guard case .previewing = authorManagementState else { return }
+        authorRenameAcknowledgedNoBackup = false
+        authorManagementState = .editing
     }
 
     public func closeBatchEditor() {
@@ -900,6 +1016,33 @@ public final class LibraryViewModel: ObservableObject {
             true
         case .closed, .completed:
             false
+        }
+    }
+
+    private var isAuthorManagementActive: Bool {
+        return switch authorManagementState {
+        case .editing, .previewing, .running, .stopping:
+            true
+        case .closed, .completed:
+            false
+        }
+    }
+
+    private var isEditingWorkflowActive: Bool {
+        isBatchActive || isAuthorManagementActive
+    }
+
+    private var effectiveAuthorRenameOperations: [BatchEditOperation] {
+        AuthorRenamePlanner.operations(
+            tracks: authorRenameSnapshot,
+            drafts: authorRenameDrafts
+        )
+    }
+
+    private var authorRenameOperationsAreCurrentlyEditable: Bool {
+        let currentTracks = Dictionary(uniqueKeysWithValues: tracks.map { ($0.id, $0) })
+        return effectiveAuthorRenameOperations.allSatisfy { operation in
+            currentTracks[operation.target.fileIdentity]?.isEditable == true
         }
     }
 
