@@ -179,9 +179,9 @@ public final class LibraryViewModel: ObservableObject {
             return false
         }
         return switch scanState {
-        case .loaded, .empty:
+        case .scanning, .loaded, .empty:
             true
-        case .idle, .restoring, .scanning, .failed:
+        case .idle, .restoring, .failed:
             false
         }
     }
@@ -769,6 +769,40 @@ public final class LibraryViewModel: ObservableObject {
             : nil
         guard !movesSuccessfulFiles || migration != nil else { return }
 
+        guard let summary = await executeBatchOperations(
+            operations,
+            migration: migration,
+            publishProgress: { [weak self] progress in
+                self?.publishBatchProgress(progress)
+            }
+        ) else {
+            return
+        }
+        batchState = .completed(summary)
+    }
+
+    public func runAuthorRenames() async {
+        guard canExecuteAuthorRenames else { return }
+        let operations = effectiveAuthorRenameOperations
+        guard !operations.isEmpty else { return }
+
+        guard let summary = await executeBatchOperations(
+            operations,
+            migration: nil,
+            publishProgress: { [weak self] progress in
+                self?.publishAuthorRenameProgress(progress)
+            }
+        ) else {
+            return
+        }
+        authorManagementState = .completed(summary)
+    }
+
+    private func executeBatchOperations(
+        _ operations: [BatchEditOperation],
+        migration: BatchMigrationConfiguration?,
+        publishProgress: @MainActor @escaping (BatchProgress) -> Void
+    ) async -> BatchEditSummary? {
         batchGeneration &+= 1
         let generation = batchGeneration
         let directoryURL = currentDirectoryURL
@@ -780,7 +814,7 @@ public final class LibraryViewModel: ObservableObject {
             currentURL: nil,
             phase: .preparing
         )
-        batchState = .running(initialProgress)
+        publishProgress(initialProgress)
 
         let (progressStream, progressContinuation) = AsyncStream.makeStream(
             of: BatchProgress.self
@@ -788,12 +822,7 @@ public final class LibraryViewModel: ObservableObject {
         let progressTask = Task { @MainActor [weak self] in
             for await progress in progressStream {
                 guard let self, self.batchGeneration == generation else { continue }
-                switch self.batchState {
-                case .stopping:
-                    self.batchState = .stopping(progress)
-                case .closed, .editing, .running, .completed:
-                    self.batchState = .running(progress)
-                }
+                publishProgress(progress)
             }
         }
 
@@ -813,23 +842,43 @@ public final class LibraryViewModel: ObservableObject {
 
         guard batchGeneration == generation else {
             withExtendedLifetime((retainedLease, retainedMigrationLease)) {}
-            return
+            return nil
         }
 
         let reconciledSummary = await reconcileBatchResults(
             summary,
             operations: operations,
-            root: directoryURL
+            root: directoryURL,
+            publishProgress: publishProgress
         )
-        batchState = .completed(reconciledSummary)
 
         withExtendedLifetime((retainedLease, retainedMigrationLease)) {}
+        return reconciledSummary
+    }
+
+    private func publishBatchProgress(_ progress: BatchProgress) {
+        switch batchState {
+        case .stopping:
+            batchState = .stopping(progress)
+        case .closed, .editing, .running, .completed:
+            batchState = .running(progress)
+        }
+    }
+
+    private func publishAuthorRenameProgress(_ progress: BatchProgress) {
+        switch authorManagementState {
+        case .stopping:
+            authorManagementState = .stopping(progress)
+        case .closed, .editing, .previewing, .running, .completed:
+            authorManagementState = .running(progress)
+        }
     }
 
     private func reconcileBatchResults(
         _ summary: BatchEditSummary,
         operations: [BatchEditOperation],
-        root: URL?
+        root: URL?,
+        publishProgress: @MainActor (BatchProgress) -> Void
     ) async -> BatchEditSummary {
         guard let root,
               currentDirectoryURL == root,
@@ -849,7 +898,7 @@ public final class LibraryViewModel: ObservableObject {
             guard result.status == .succeeded else {
                 continue
             }
-            batchState = .running(BatchProgress(
+            publishProgress(BatchProgress(
                 completed: completedResultCount,
                 total: successfulResultCount,
                 currentURL: result.finalURL,
@@ -928,6 +977,19 @@ public final class LibraryViewModel: ObservableObject {
         }
 
         batchState = .stopping(progress)
+        await batchEditor.requestStop()
+    }
+
+    public func stopAuthorRenames() async {
+        let progress: BatchProgress
+        switch authorManagementState {
+        case let .running(value):
+            progress = value
+        case .closed, .editing, .previewing, .stopping, .completed:
+            return
+        }
+
+        authorManagementState = .stopping(progress)
         await batchEditor.requestStop()
     }
 

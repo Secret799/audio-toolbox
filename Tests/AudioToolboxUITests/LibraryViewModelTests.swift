@@ -293,6 +293,141 @@ struct LibraryViewModelTests {
         #expect(viewModel.isLibraryInteractionLocked)
     }
 
+    @Test("作者管理批量提交映射并只增量重载成功文件")
+    @MainActor
+    func authorManagementExecutesMappingsWithoutRescanning() async {
+        let mergedFirst = Self.track(
+            id: Self.firstTrack.id.rawValue,
+            url: Self.firstTrack.url,
+            title: "First Title",
+            artist: "Merged",
+            album: "Special Album"
+        )
+        let mergedSecond = Self.track(
+            id: Self.secondTrack.id.rawValue,
+            url: Self.secondTrack.url,
+            title: "Second Title",
+            artist: "Merged",
+            album: "Album Two",
+            format: .flac
+        )
+        let summary = BatchEditSummary(results: [
+            BatchFileResult(url: Self.firstTrack.url, status: .succeeded, message: nil),
+            BatchFileResult(url: Self.secondTrack.url, status: .succeeded, message: nil),
+        ])
+        let scanner = ScriptedScanner(scripts: [[
+            .loaded(Self.firstTrack),
+            .loaded(Self.secondTrack),
+            .finished,
+        ]])
+        let editor = FakeBatchEditor(summary: summary)
+        let reloader = RecordingTrackReloader(results: [
+            .success(mergedFirst),
+            .success(mergedSecond),
+        ])
+        let viewModel = makeViewModel(
+            scanner: scanner,
+            batchEditor: editor,
+            trackReloader: reloader
+        )
+        await viewModel.loadDirectory(firstRoot)
+        viewModel.toggleSelection(Self.firstTrack.id)
+        viewModel.toggleSelection(Self.secondTrack.id)
+        viewModel.openAuthorManagement()
+        viewModel.setAuthorRenameDraft("Merged", for: .named("Artist One"))
+        viewModel.setAuthorRenameDraft("Merged", for: .named("Artist Two"))
+        viewModel.showAuthorRenamePreview()
+        viewModel.authorRenameAcknowledgedNoBackup = true
+
+        await viewModel.runAuthorRenames()
+
+        let request = await editor.requests.first
+        #expect(request?.migration == nil)
+        #expect(request?.operations.map(\.patch) == [
+            MetadataPatch(artist: "Merged", album: nil),
+            MetadataPatch(artist: "Merged", album: nil),
+        ])
+        #expect(await reloader.urls == [Self.firstTrack.url, Self.secondTrack.url])
+        #expect(scanner.scanCount == 1)
+        #expect(viewModel.tracks == LibraryProjection.sortedTracks([
+            mergedFirst,
+            mergedSecond,
+        ]))
+        #expect(viewModel.groups.map(\.displayName) == ["Merged"])
+        #expect(viewModel.selectedTrackIDs.isEmpty)
+        #expect(viewModel.authorManagementState == .completed(summary))
+
+        viewModel.openBatchEditor()
+        #expect(viewModel.batchState == .closed)
+    }
+
+    @Test("作者管理停止请求会保留未处理文件并转发给编辑器")
+    @MainActor
+    func stoppingAuthorManagementForwardsStop() async {
+        let editor = SuspendedBatchEditor()
+        let viewModel = makeViewModel(
+            scanner: ScriptedScanner(scripts: [[.loaded(Self.firstTrack), .finished]]),
+            batchEditor: editor
+        )
+        await viewModel.loadDirectory(firstRoot)
+        viewModel.toggleSelection(Self.firstTrack.id)
+        viewModel.openAuthorManagement()
+        viewModel.setAuthorRenameDraft("Stopped", for: .named("Artist One"))
+        viewModel.showAuthorRenamePreview()
+        viewModel.authorRenameAcknowledgedNoBackup = true
+        let run = Task { await viewModel.runAuthorRenames() }
+
+        await editor.waitUntilRunning()
+        await viewModel.stopAuthorRenames()
+
+        #expect(await editor.stopRequestCount == 1)
+        #expect(viewModel.authorManagementState == .stopping(BatchProgress(
+            completed: 0,
+            total: 1,
+            currentURL: nil
+        )))
+
+        await editor.complete()
+        await run.value
+
+        guard case let .completed(summary) = viewModel.authorManagementState else {
+            Issue.record("Expected completed author summary")
+            return
+        }
+        #expect(summary.results.map(\.status) == [.notProcessed])
+        #expect(viewModel.selectedTrackIDs == [Self.firstTrack.id])
+    }
+
+    @Test("作者管理执行前拒绝扫描中变为不可编辑的快照曲目")
+    @MainActor
+    func authorManagementRejectsSnapshotThatBecomesUnreadable() async {
+        let scanner = ControllableScanner()
+        let editor = FakeBatchEditor(summary: BatchEditSummary(results: []))
+        let viewModel = makeViewModel(scanner: scanner, batchEditor: editor)
+        let load = Task { await viewModel.loadDirectory(firstRoot) }
+        await scanner.waitForScanCount(1)
+        scanner.yield(.loaded(Self.firstTrack), toScan: 0)
+        await waitUntil { viewModel.tracks == [Self.firstTrack] }
+
+        viewModel.openAuthorManagement()
+        viewModel.setAuthorRenameDraft("Should Not Run", for: .named("Artist One"))
+        viewModel.showAuthorRenamePreview()
+        viewModel.authorRenameAcknowledgedNoBackup = true
+        #expect(viewModel.canExecuteAuthorRenames)
+
+        scanner.yield(
+            .unreadable(Self.firstTrackUnreadable, "标签后来变得不可读"),
+            toScan: 0
+        )
+        scanner.finish(scan: 0)
+        await load.value
+
+        #expect(!viewModel.canExecuteAuthorRenames)
+        await viewModel.runAuthorRenames()
+        #expect(await editor.requests.isEmpty)
+        #expect(viewModel.authorManagementState == .previewing)
+    }
+
     @Test("空目录派生用户文案")
     @MainActor
     func emptyDirectoryDerivesUserMessage() async {
