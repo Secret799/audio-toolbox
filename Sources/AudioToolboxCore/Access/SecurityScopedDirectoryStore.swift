@@ -29,16 +29,17 @@ public struct FoundationDirectoryBookmarkResolver: DirectoryBookmarkResolving {
 }
 
 public final class SecurityScopedDirectoryStore: @unchecked Sendable {
-    private static let bookmarkKey = "audioToolbox.lastDirectoryBookmark"
-
+    private let storageKey: String
     private let defaults: UserDefaults
     private let resolver: any DirectoryBookmarkResolving
     private let lock = NSLock()
 
     public init(
+        storageKey: String = "audioToolbox.lastDirectoryBookmark",
         defaults: UserDefaults = .standard,
         resolver: any DirectoryBookmarkResolving = FoundationDirectoryBookmarkResolver()
     ) {
+        self.storageKey = storageKey
         self.defaults = defaults
         self.resolver = resolver
     }
@@ -46,23 +47,23 @@ public final class SecurityScopedDirectoryStore: @unchecked Sendable {
     public func save(url: URL) throws {
         try lock.withLock {
             let data = try resolver.bookmarkData(for: url)
-            defaults.set(data, forKey: Self.bookmarkKey)
+            defaults.set(data, forKey: storageKey)
         }
     }
 
     public func clear() {
         lock.withLock {
-            defaults.removeObject(forKey: Self.bookmarkKey)
+            defaults.removeObject(forKey: storageKey)
         }
     }
 
     public func restore() throws -> URL? {
         try lock.withLock {
-            guard let storedValue = defaults.object(forKey: Self.bookmarkKey) else {
+            guard let storedValue = defaults.object(forKey: storageKey) else {
                 return nil
             }
             guard let data = storedValue as? Data else {
-                defaults.removeObject(forKey: Self.bookmarkKey)
+                defaults.removeObject(forKey: storageKey)
                 return nil
             }
 
@@ -70,13 +71,13 @@ public final class SecurityScopedDirectoryStore: @unchecked Sendable {
             do {
                 resolution = try resolver.resolve(data)
             } catch {
-                defaults.removeObject(forKey: Self.bookmarkKey)
+                defaults.removeObject(forKey: storageKey)
                 return nil
             }
 
             if resolution.isStale {
                 let refreshedData = try resolver.bookmarkData(for: resolution.url)
-                defaults.set(refreshedData, forKey: Self.bookmarkKey)
+                defaults.set(refreshedData, forKey: storageKey)
             }
 
             return resolution.url

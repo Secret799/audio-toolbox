@@ -794,6 +794,178 @@ struct LibraryViewModelTests {
         #expect(viewModel.validatedBatchPatch == MetadataPatch(artist: "Edited Artist", album: "Edited Album"))
     }
 
+    @Test("选择迁移目录会保存授权并在批量请求中携带目标目录")
+    @MainActor
+    func choosingMigrationDirectoryPersistsAndBuildsRequest() async throws {
+        let destination = FileManager.default.temporaryDirectory
+            .appendingPathComponent("audio-toolbox-view-model-migration", isDirectory: true)
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: destination,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: destination) }
+
+        let scanner = ScriptedScanner(scripts: [
+            [.loaded(Self.firstTrack), .finished],
+            [.loaded(Self.firstTrack), .finished],
+        ])
+        let editor = FakeBatchEditor(summary: BatchEditSummary(results: []))
+        let defaults = makeDefaults()
+        let scanStore = SecurityScopedDirectoryStore(
+            defaults: defaults,
+            resolver: IdentityBookmarkResolver()
+        )
+        let migrationStore = SecurityScopedDirectoryStore(
+            storageKey: "audioToolbox.migrationDirectoryBookmark",
+            defaults: defaults,
+            resolver: IdentityBookmarkResolver()
+        )
+        let viewModel = LibraryViewModel(
+            scanner: scanner,
+            batchEditor: editor,
+            bookmarkStore: scanStore,
+            migrationBookmarkStore: migrationStore,
+            makeAccessLease: {
+                SecurityScopedAccessLease(url: $0, accessor: NoopAccessor())
+            }
+        )
+        await viewModel.loadDirectory(firstRoot)
+        viewModel.toggleSelection(Self.firstTrack.id)
+        viewModel.openBatchEditor()
+        viewModel.batchArtist = "Edited Artist"
+        viewModel.batchAcknowledgedNoBackup = true
+
+        viewModel.chooseMigrationDirectory(destination)
+
+        #expect(viewModel.migrationDirectoryURL == destination)
+        #expect(viewModel.movesSuccessfulFiles)
+        #expect(viewModel.migrationDirectoryError == nil)
+        #expect(!viewModel.batchAcknowledgedNoBackup)
+        #expect(try migrationStore.restore() == destination)
+
+        viewModel.batchAcknowledgedNoBackup = true
+        #expect(viewModel.canExecuteBatchEdit)
+        await viewModel.runBatchEdit()
+
+        #expect(await editor.requests.first?.migration
+            == BatchMigrationConfiguration(destinationDirectory: destination))
+
+        viewModel.closeBatchEditor()
+        viewModel.openBatchEditor()
+        #expect(viewModel.migrationDirectoryURL == destination)
+        #expect(viewModel.movesSuccessfulFiles)
+    }
+
+    @Test("启用迁移但没有有效目录时禁止执行且不能只迁移")
+    @MainActor
+    func migrationRequiresValidDirectoryAndMetadataChange() async {
+        let scanner = ScriptedScanner(scripts: [[.loaded(Self.firstTrack), .finished]])
+        let viewModel = makeViewModel(scanner: scanner)
+        await viewModel.loadDirectory(firstRoot)
+        viewModel.toggleSelection(Self.firstTrack.id)
+        viewModel.openBatchEditor()
+
+        viewModel.movesSuccessfulFiles = true
+        viewModel.batchAcknowledgedNoBackup = true
+        #expect(!viewModel.canAdvanceBatchEdit)
+        #expect(!viewModel.canExecuteBatchEdit)
+
+        viewModel.batchArtist = "Edited Artist"
+        viewModel.batchAcknowledgedNoBackup = true
+        #expect(viewModel.canAdvanceBatchEdit)
+        #expect(!viewModel.canExecuteBatchEdit)
+
+        viewModel.movesSuccessfulFiles = false
+        viewModel.batchAcknowledgedNoBackup = true
+        #expect(viewModel.canExecuteBatchEdit)
+    }
+
+    @Test("迁移目录书签恢复时权限失败会清除授权")
+    @MainActor
+    func migrationBookmarkRestoreRequiresSecurityScope() async throws {
+        let destination = FileManager.default.temporaryDirectory
+            .appendingPathComponent("audio-toolbox-migration-restore", isDirectory: true)
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: destination,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: destination) }
+
+        let defaults = makeDefaults()
+        let migrationStore = SecurityScopedDirectoryStore(
+            storageKey: "audioToolbox.migrationDirectoryBookmark",
+            defaults: defaults,
+            resolver: IdentityBookmarkResolver()
+        )
+        try migrationStore.save(url: destination)
+        let viewModel = LibraryViewModel(
+            scanner: ScriptedScanner(scripts: []),
+            batchEditor: FakeBatchEditor(summary: BatchEditSummary(results: [])),
+            bookmarkStore: SecurityScopedDirectoryStore(
+                defaults: defaults,
+                resolver: IdentityBookmarkResolver()
+            ),
+            migrationBookmarkStore: migrationStore,
+            makeAccessLease: {
+                SecurityScopedAccessLease(
+                    url: $0,
+                    accessor: AccessLog(startResult: false)
+                )
+            }
+        )
+
+        await viewModel.restoreMigrationDirectoryIfNeeded()
+
+        #expect(viewModel.migrationDirectoryURL == nil)
+        #expect(!viewModel.movesSuccessfulFiles)
+        #expect(viewModel.migrationDirectoryError?.contains("授权已失效") == true)
+        #expect(try migrationStore.restore() == nil)
+    }
+
+    @Test("有效迁移书签恢复后在新批次中默认启用")
+    @MainActor
+    func validMigrationBookmarkDefaultsOnForNewBatch() async throws {
+        let destination = FileManager.default.temporaryDirectory
+            .appendingPathComponent("audio-toolbox-migration-valid", isDirectory: true)
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: destination,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: destination) }
+
+        let defaults = makeDefaults()
+        let migrationStore = SecurityScopedDirectoryStore(
+            storageKey: "audioToolbox.migrationDirectoryBookmark",
+            defaults: defaults,
+            resolver: IdentityBookmarkResolver()
+        )
+        try migrationStore.save(url: destination)
+        let viewModel = LibraryViewModel(
+            scanner: ScriptedScanner(scripts: [[.loaded(Self.firstTrack), .finished]]),
+            batchEditor: FakeBatchEditor(summary: BatchEditSummary(results: [])),
+            bookmarkStore: SecurityScopedDirectoryStore(
+                defaults: defaults,
+                resolver: IdentityBookmarkResolver()
+            ),
+            migrationBookmarkStore: migrationStore,
+            makeAccessLease: {
+                SecurityScopedAccessLease(url: $0, accessor: NoopAccessor())
+            }
+        )
+
+        await viewModel.restoreMigrationDirectoryIfNeeded()
+        await viewModel.loadDirectory(firstRoot)
+        viewModel.toggleSelection(Self.firstTrack.id)
+        viewModel.openBatchEditor()
+
+        #expect(viewModel.migrationDirectoryURL == destination)
+        #expect(viewModel.isMigrationDirectoryValid)
+        #expect(viewModel.movesSuccessfulFiles)
+    }
+
     @Test("打开批量编辑后冻结文件快照并拒绝目录与选择变化")
     @MainActor
     func batchEditorFreezesTrackSnapshotAndLibraryInteraction() async {
@@ -1096,7 +1268,9 @@ struct LibraryViewModelTests {
                 url: Self.untaggedWritableTrack.url,
                 status: .succeeded,
                 message: "修改成功，但保留了恢复文件",
-                recoveryURL: URL(fileURLWithPath: "/tmp/recovery.flac")
+                recoveryURL: URL(fileURLWithPath: "/tmp/recovery.flac"),
+                finalURL: URL(fileURLWithPath: "/tmp/migrated.flac"),
+                migrationStatus: .moved
             ),
             BatchFileResult(url: Self.sameArtistTrack.url, status: .failed, message: "写入失败"),
             BatchFileResult(url: Self.secondTrack.url, status: .notProcessed, message: "已停止"),
@@ -1114,6 +1288,7 @@ struct LibraryViewModelTests {
         #expect(viewModel.batchResultCounts == BatchResultCounts(
             succeeded: 2,
             warnings: 1,
+            moved: 1,
             failed: 1,
             notProcessed: 1
         ))
@@ -1262,11 +1437,17 @@ struct LibraryViewModelTests {
     ) -> LibraryViewModel {
         let defaults = makeDefaults()
         let store = SecurityScopedDirectoryStore(defaults: defaults, resolver: IdentityBookmarkResolver())
+        let migrationStore = SecurityScopedDirectoryStore(
+            storageKey: "audioToolbox.migrationDirectoryBookmark",
+            defaults: defaults,
+            resolver: IdentityBookmarkResolver()
+        )
         let accessor: any SecurityScopedResourceAccessing = accessLog ?? NoopAccessor()
         return LibraryViewModel(
             scanner: scanner,
             batchEditor: batchEditor,
             bookmarkStore: store,
+            migrationBookmarkStore: migrationStore,
             makeAccessLease: { SecurityScopedAccessLease(url: $0, accessor: accessor) }
         )
     }

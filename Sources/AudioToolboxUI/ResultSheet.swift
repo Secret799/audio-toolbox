@@ -43,7 +43,7 @@ public struct ResultSheet: View {
             Divider()
             footer
         }
-        .frame(width: 820, height: 600)
+        .frame(width: 920, height: 620)
         .accessibilityElement(children: .contain)
     }
 
@@ -65,6 +65,7 @@ public struct ResultSheet: View {
                 value: summary.succeededWithWarningCount,
                 color: .orange
             )
+            resultCount(title: "已移动", value: summary.movedCount, color: .accentColor)
             resultCount(title: "失败", value: summary.failedCount, color: .red)
             resultCount(title: "未处理", value: summary.notProcessedCount, color: .orange)
         }
@@ -126,17 +127,28 @@ public struct ResultSheet: View {
 
             VStack(alignment: .leading, spacing: 5) {
                 HStack(spacing: 8) {
-                    Text(result.url.lastPathComponent)
+                    Text(result.finalURL.lastPathComponent)
                         .fontWeight(.medium)
                         .lineLimit(1)
                     Text(statusTitle(result))
                         .font(.caption.weight(.semibold))
                         .foregroundStyle(statusColor(result))
                 }
-                Text(result.url.path)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .textSelection(.enabled)
+                if result.finalURL != result.url {
+                    Text("原位置：\(result.url.path)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                    Text("当前位置：\(result.finalURL.path)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                } else {
+                    Text(result.url.path)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                }
                 if let reason = resultReason(result) {
                     Text(reason)
                         .font(.callout)
@@ -148,8 +160,8 @@ public struct ResultSheet: View {
             Spacer(minLength: 12)
 
             VStack(alignment: .trailing, spacing: 8) {
-                Button("显示原文件") {
-                    NSWorkspace.shared.activateFileViewerSelecting([result.url])
+                Button("显示文件") {
+                    NSWorkspace.shared.activateFileViewerSelecting([result.finalURL])
                 }
                 .controlSize(.small)
 
@@ -168,7 +180,7 @@ public struct ResultSheet: View {
     private var footer: some View {
         HStack {
             if summary.succeededWithWarningCount > 0 {
-                Label("部分文件修改成功但有清理警告，请确认并保留需要的恢复文件。", systemImage: "exclamationmark.triangle")
+                Label("部分文件修改成功但有警告，请查看详细原因。", systemImage: "exclamationmark.triangle")
                     .font(.callout)
                     .foregroundStyle(.secondary)
             } else if summary.failedCount > 0 {
@@ -228,6 +240,7 @@ public struct ResultSheet: View {
 
     private func statusTitle(_ result: BatchFileResult) -> String {
         if result.isSucceededWithWarning { return "成功，有警告" }
+        if result.migrationStatus == .moved { return "成功，已移动" }
         switch result.status {
         case .succeeded: return "成功"
         case .failed: return "失败"

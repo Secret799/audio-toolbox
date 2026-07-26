@@ -4,6 +4,45 @@ import Testing
 
 @Suite("BatchEditorTests")
 struct BatchEditorTests {
+    @Test("迁移请求和结果保留原始路径、最终路径与移动统计")
+    func migrationModelsPreservePathsAndCountMoves() {
+        let source = URL(fileURLWithPath: "/tmp/audio-toolbox-model-source.mp3")
+        let destinationDirectory = URL(
+            fileURLWithPath: "/tmp/audio-toolbox-model-destination"
+        )
+        let destination = destinationDirectory.appendingPathComponent(
+            source.lastPathComponent
+        )
+        let baseRequest = request(files: [source])
+        let migration = BatchMigrationConfiguration(
+            destinationDirectory: destinationDirectory
+        )
+
+        let migrationRequest = BatchEditRequest(
+            operations: baseRequest.operations,
+            migration: migration
+        )
+        let defaultResult = BatchFileResult(
+            url: source,
+            status: .succeeded,
+            message: nil
+        )
+        let movedResult = BatchFileResult(
+            url: source,
+            status: .succeeded,
+            message: nil,
+            finalURL: destination,
+            migrationStatus: .moved
+        )
+
+        #expect(migrationRequest.migration == migration)
+        #expect(defaultResult.finalURL == source)
+        #expect(defaultResult.migrationStatus == .notRequested)
+        #expect(movedResult.url == source)
+        #expect(movedResult.finalURL == destination)
+        #expect(BatchEditSummary(results: [defaultResult, movedResult]).movedCount == 1)
+    }
+
     @Test("单文件失败不会阻止后续文件，并保留输入顺序")
     func failureDoesNotStopLaterFiles() async {
         let files = testURLs(count: 3, prefix: "failure-isolation")
@@ -71,6 +110,157 @@ struct BatchEditorTests {
         #expect(summary.succeededWithWarnings.map(\.recoveryURL) == [recoveryURL])
     }
 
+    @Test("只有元数据修改成功的文件会被移动并记录最终路径")
+    func onlySuccessfulEditsAreMoved() async {
+        let files = testURLs(count: 2, prefix: "move-success-only")
+        let destinationDirectory = URL(fileURLWithPath: "/tmp/move-success-target")
+        let destination = destinationDirectory.appendingPathComponent(
+            files[0].lastPathComponent
+        )
+        let writer = StubBatchWriter(statuses: [.succeeded, .failed])
+        let mover = RecordingFileMover(outcomes: [.success(.moved(destination))])
+        let editor = BatchEditor(writer: writer, mover: mover)
+        let batchRequest = request(
+            files: files,
+            migration: BatchMigrationConfiguration(
+                destinationDirectory: destinationDirectory
+            )
+        )
+
+        let summary = await editor.run(batchRequest, onProgress: { _ in })
+
+        #expect(await mover.sourceURLs == [files[0]])
+        #expect(summary.results.map(\.status) == [.succeeded, .failed])
+        #expect(summary.results[0].finalURL == destination)
+        #expect(summary.results[0].migrationStatus == .moved)
+        #expect(summary.results[1].finalURL == files[1])
+        #expect(summary.results[1].migrationStatus == .notRequested)
+        #expect(summary.movedCount == 1)
+    }
+
+    @Test("同名冲突保留元数据成功和已有警告并跳过移动")
+    func destinationConflictPreservesWriterWarning() async {
+        let source = testURLs(count: 1, prefix: "move-conflict")[0]
+        let destinationDirectory = URL(fileURLWithPath: "/tmp/move-conflict-target")
+        let destination = destinationDirectory.appendingPathComponent(
+            source.lastPathComponent
+        )
+        let writer = StubResultBatchWriter(results: [
+            BatchFileResult(
+                url: source,
+                status: .succeeded,
+                message: "修改成功，但保留了恢复文件"
+            ),
+        ])
+        let mover = RecordingFileMover(outcomes: [
+            .failure(.destinationExists(destination)),
+        ])
+        let editor = BatchEditor(writer: writer, mover: mover)
+        let batchRequest = request(
+            files: [source],
+            migration: BatchMigrationConfiguration(
+                destinationDirectory: destinationDirectory
+            )
+        )
+
+        let summary = await editor.run(batchRequest, onProgress: { _ in })
+        let result = summary.results[0]
+
+        #expect(result.status == .succeeded)
+        #expect(result.finalURL == source)
+        #expect(result.migrationStatus == .skippedConflict)
+        #expect(result.message?.contains("保留了恢复文件") == true)
+        #expect(result.message?.contains("已存在同名文件") == true)
+        #expect(summary.succeededWithWarningCount == 1)
+    }
+
+    @Test("迁移失败保留成功状态并继续后续文件")
+    func moveFailureWarnsAndContinues() async {
+        let files = testURLs(count: 2, prefix: "move-failure")
+        let destinationDirectory = URL(fileURLWithPath: "/tmp/move-failure-target")
+        let secondDestination = destinationDirectory.appendingPathComponent(
+            files[1].lastPathComponent
+        )
+        let writer = StubBatchWriter(statuses: [.succeeded, .succeeded])
+        let mover = RecordingFileMover(outcomes: [
+            .failure(.moveFailed(
+                source: files[0],
+                destination: destinationDirectory.appendingPathComponent(
+                    files[0].lastPathComponent
+                ),
+                reason: "没有权限"
+            )),
+            .success(.moved(secondDestination)),
+        ])
+        let editor = BatchEditor(writer: writer, mover: mover)
+
+        let summary = await editor.run(
+            request(
+                files: files,
+                migration: BatchMigrationConfiguration(
+                    destinationDirectory: destinationDirectory
+                )
+            ),
+            onProgress: { _ in }
+        )
+
+        #expect(summary.results.map(\.status) == [.succeeded, .succeeded])
+        #expect(summary.results[0].migrationStatus == .failed)
+        #expect(summary.results[0].finalURL == files[0])
+        #expect(summary.results[0].message?.contains("没有权限") == true)
+        #expect(summary.results[1].migrationStatus == .moved)
+        #expect(summary.results[1].finalURL == secondDestination)
+    }
+
+    @Test("迁移进度按准备、修改、移动和完成阶段发布")
+    func migrationReportsProgressPhases() async {
+        let source = testURLs(count: 1, prefix: "move-progress")[0]
+        let destinationDirectory = URL(fileURLWithPath: "/tmp/move-progress-target")
+        let destination = destinationDirectory.appendingPathComponent(
+            source.lastPathComponent
+        )
+        let writer = StubBatchWriter(statuses: [.succeeded])
+        let mover = RecordingFileMover(outcomes: [.success(.moved(destination))])
+        let editor = BatchEditor(writer: writer, mover: mover)
+        let recordedProgress = LockedBatchProgress()
+
+        _ = await editor.run(
+            request(
+                files: [source],
+                migration: BatchMigrationConfiguration(
+                    destinationDirectory: destinationDirectory
+                )
+            )
+        ) { recordedProgress.append($0) }
+
+        #expect(recordedProgress.values == [
+            BatchProgress(
+                completed: 0,
+                total: 1,
+                currentURL: nil,
+                phase: .preparing
+            ),
+            BatchProgress(
+                completed: 0,
+                total: 1,
+                currentURL: source,
+                phase: .editing
+            ),
+            BatchProgress(
+                completed: 0,
+                total: 1,
+                currentURL: source,
+                phase: .moving
+            ),
+            BatchProgress(
+                completed: 1,
+                total: 1,
+                currentURL: destination,
+                phase: .completed
+            ),
+        ])
+    }
+
     @Test("进度从初始状态开始，并在每个文件产生结果后递增")
     func progressStartsAtZeroAndAdvancesAfterEveryFile() async {
         let files = testURLs(count: 3, prefix: "progress")
@@ -83,10 +273,33 @@ struct BatchEditorTests {
         }
 
         #expect(recordedProgress.values == [
-            BatchProgress(completed: 0, total: 3, currentURL: nil),
+            BatchProgress(
+                completed: 0,
+                total: 3,
+                currentURL: nil,
+                phase: .preparing
+            ),
+            BatchProgress(
+                completed: 0,
+                total: 3,
+                currentURL: files[0],
+                phase: .editing
+            ),
             BatchProgress(completed: 1, total: 3, currentURL: files[0]),
+            BatchProgress(
+                completed: 1,
+                total: 3,
+                currentURL: files[1],
+                phase: .editing
+            ),
             BatchProgress(completed: 2, total: 3, currentURL: files[1]),
-            BatchProgress(completed: 3, total: 3, currentURL: files[2])
+            BatchProgress(
+                completed: 2,
+                total: 3,
+                currentURL: files[2],
+                phase: .editing
+            ),
+            BatchProgress(completed: 3, total: 3, currentURL: files[2]),
         ])
     }
 
@@ -115,10 +328,21 @@ struct BatchEditorTests {
         #expect(summary.results.map(\.status) == [.succeeded, .notProcessed, .notProcessed])
         #expect(await writer.appliedURLs() == [files[0]])
         #expect(recordedProgress.values == [
-            BatchProgress(completed: 0, total: 3, currentURL: nil),
+            BatchProgress(
+                completed: 0,
+                total: 3,
+                currentURL: nil,
+                phase: .preparing
+            ),
+            BatchProgress(
+                completed: 0,
+                total: 3,
+                currentURL: files[0],
+                phase: .editing
+            ),
             BatchProgress(completed: 1, total: 3, currentURL: files[0]),
             BatchProgress(completed: 2, total: 3, currentURL: files[1]),
-            BatchProgress(completed: 3, total: 3, currentURL: files[2])
+            BatchProgress(completed: 3, total: 3, currentURL: files[2]),
         ])
     }
 
@@ -211,13 +435,21 @@ struct BatchEditorTests {
 
         #expect(summary.results.isEmpty)
         #expect(recordedProgress.values == [
-            BatchProgress(completed: 0, total: 0, currentURL: nil)
+            BatchProgress(
+                completed: 0,
+                total: 0,
+                currentURL: nil,
+                phase: .preparing
+            ),
         ])
         #expect(await writer.appliedURLs().isEmpty)
     }
 }
 
-private func request(files: [URL]) -> BatchEditRequest {
+private func request(
+    files: [URL],
+    migration: BatchMigrationConfiguration? = nil
+) -> BatchEditRequest {
     BatchEditRequest(
         targets: files.enumerated().map { index, url in
             BatchEditTarget(
@@ -227,7 +459,8 @@ private func request(files: [URL]) -> BatchEditRequest {
                 modificationDate: Date(timeIntervalSince1970: Double(1_700_000_000 + index))
             )
         },
-        patch: MetadataPatch(artist: "新作者", album: "新专辑")
+        patch: MetadataPatch(artist: "新作者", album: "新专辑"),
+        migration: migration
     )
 }
 
@@ -260,6 +493,35 @@ private actor StubBatchWriter: SafeMetadataWriting {
 
     func appliedPatches() -> [MetadataPatch] {
         patches
+    }
+}
+
+private actor StubResultBatchWriter: SafeMetadataWriting {
+    private var results: [BatchFileResult]
+
+    init(results: [BatchFileResult]) {
+        self.results = results
+    }
+
+    func apply(to target: BatchEditTarget, patch: MetadataPatch) async -> BatchFileResult {
+        results.removeFirst()
+    }
+}
+
+private actor RecordingFileMover: FileMoving {
+    private var outcomes: [Result<FileMoveOutcome, FileMoveError>]
+    private(set) var sourceURLs: [URL] = []
+
+    init(outcomes: [Result<FileMoveOutcome, FileMoveError>]) {
+        self.outcomes = outcomes
+    }
+
+    func move(
+        _ sourceURL: URL,
+        to destinationDirectory: URL
+    ) async throws -> FileMoveOutcome {
+        sourceURLs.append(sourceURL)
+        return try outcomes.removeFirst().get()
     }
 }
 

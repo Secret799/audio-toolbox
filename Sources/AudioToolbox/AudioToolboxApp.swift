@@ -12,11 +12,15 @@ struct AudioToolboxApp: App {
         let writer = SafeMetadataWriter(metadataService: metadataService)
         let batchEditor = BatchEditor(writer: writer)
         let bookmarkStore = SecurityScopedDirectoryStore()
+        let migrationBookmarkStore = SecurityScopedDirectoryStore(
+            storageKey: "audioToolbox.migrationDirectoryBookmark"
+        )
         _libraryViewModel = StateObject(
             wrappedValue: LibraryViewModel(
                 scanner: scanner,
                 batchEditor: batchEditor,
-                bookmarkStore: bookmarkStore
+                bookmarkStore: bookmarkStore,
+                migrationBookmarkStore: migrationBookmarkStore
             )
         )
     }
@@ -25,6 +29,7 @@ struct AudioToolboxApp: App {
         WindowGroup {
             MainWindowView(viewModel: libraryViewModel)
                 .task {
+                    await libraryViewModel.restoreMigrationDirectoryIfNeeded()
                     await libraryViewModel.restoreLastDirectoryIfNeeded()
                 }
         }

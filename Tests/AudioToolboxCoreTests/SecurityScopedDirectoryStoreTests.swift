@@ -4,6 +4,35 @@ import Testing
 
 @Suite("SecurityScopedDirectoryStoreTests")
 struct SecurityScopedDirectoryStoreTests {
+    @Test("不同书签键独立保存恢复和清除")
+    func configurableKeysKeepBookmarksIndependent() throws {
+        let scanURL = URL(fileURLWithPath: "/tmp/audio-toolbox-scan-directory")
+        let migrationURL = URL(fileURLWithPath: "/tmp/audio-toolbox-migration-directory")
+        let defaults = makeDefaults()
+        let resolver = IdentityBookmarkResolver()
+        let scanStore = SecurityScopedDirectoryStore(
+            storageKey: "audioToolbox.lastDirectoryBookmark",
+            defaults: defaults,
+            resolver: resolver
+        )
+        let migrationStore = SecurityScopedDirectoryStore(
+            storageKey: "audioToolbox.migrationDirectoryBookmark",
+            defaults: defaults,
+            resolver: resolver
+        )
+
+        try scanStore.save(url: scanURL)
+        try migrationStore.save(url: migrationURL)
+
+        #expect(try scanStore.restore() == scanURL)
+        #expect(try migrationStore.restore() == migrationURL)
+
+        migrationStore.clear()
+
+        #expect(try scanStore.restore() == scanURL)
+        #expect(try migrationStore.restore() == nil)
+    }
+
     @Test("保存与恢复使用固定的安全作用域书签键")
     func saveAndRestoreUsesFixedBookmarkKey() throws {
         let directoryURL = URL(fileURLWithPath: "/tmp/audio-toolbox-bookmark-test")

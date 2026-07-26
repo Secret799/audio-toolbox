@@ -50,19 +50,37 @@ public struct BatchEditOperation: Equatable, Sendable {
     }
 }
 
+public struct BatchMigrationConfiguration: Equatable, Sendable {
+    public let destinationDirectory: URL
+
+    public init(destinationDirectory: URL) {
+        self.destinationDirectory = destinationDirectory
+    }
+}
+
 public struct BatchEditRequest: Sendable {
     public let operations: [BatchEditOperation]
+    public let migration: BatchMigrationConfiguration?
 
     public var targets: [BatchEditTarget] {
         operations.map(\.target)
     }
 
-    public init(operations: [BatchEditOperation]) {
+    public init(
+        operations: [BatchEditOperation],
+        migration: BatchMigrationConfiguration? = nil
+    ) {
         self.operations = operations
+        self.migration = migration
     }
 
-    public init(targets: [BatchEditTarget], patch: MetadataPatch) {
+    public init(
+        targets: [BatchEditTarget],
+        patch: MetadataPatch,
+        migration: BatchMigrationConfiguration? = nil
+    ) {
         operations = targets.map { BatchEditOperation(target: $0, patch: patch) }
+        self.migration = migration
     }
 }
 
@@ -70,22 +88,36 @@ public enum BatchFileStatus: Equatable, Sendable {
     case succeeded, failed, notProcessed
 }
 
+public enum BatchMigrationStatus: Equatable, Sendable {
+    case notRequested
+    case moved
+    case alreadyAtDestination
+    case skippedConflict
+    case failed
+}
+
 public struct BatchFileResult: Equatable, Sendable {
     public let url: URL
     public let status: BatchFileStatus
     public let message: String?
     public let recoveryURL: URL?
+    public let finalURL: URL
+    public let migrationStatus: BatchMigrationStatus
 
     public init(
         url: URL,
         status: BatchFileStatus,
         message: String?,
-        recoveryURL: URL? = nil
+        recoveryURL: URL? = nil,
+        finalURL: URL? = nil,
+        migrationStatus: BatchMigrationStatus = .notRequested
     ) {
         self.url = url
         self.status = status
         self.message = message
         self.recoveryURL = recoveryURL
+        self.finalURL = finalURL ?? url
+        self.migrationStatus = migrationStatus
     }
 
     public var isSucceededWithWarning: Bool {
@@ -122,5 +154,9 @@ public struct BatchEditSummary: Equatable, Sendable {
 
     public var succeededWithWarningCount: Int {
         succeededWithWarnings.count
+    }
+
+    public var movedCount: Int {
+        results.count { $0.migrationStatus == .moved }
     }
 }

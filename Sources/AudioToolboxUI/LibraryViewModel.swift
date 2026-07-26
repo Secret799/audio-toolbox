@@ -51,17 +51,20 @@ private extension BatchFieldInitialState {
 public struct BatchResultCounts: Equatable, Sendable {
     public let succeeded: Int
     public let warnings: Int
+    public let moved: Int
     public let failed: Int
     public let notProcessed: Int
 
     public init(
         succeeded: Int,
         warnings: Int = 0,
+        moved: Int = 0,
         failed: Int,
         notProcessed: Int
     ) {
         self.succeeded = succeeded
         self.warnings = warnings
+        self.moved = moved
         self.failed = failed
         self.notProcessed = notProcessed
     }
@@ -69,6 +72,7 @@ public struct BatchResultCounts: Equatable, Sendable {
     public static let zero = BatchResultCounts(
         succeeded: 0,
         warnings: 0,
+        moved: 0,
         failed: 0,
         notProcessed: 0
     )
@@ -127,6 +131,15 @@ public final class LibraryViewModel: ObservableObject {
             }
         }
     }
+    @Published public var movesSuccessfulFiles = false {
+        didSet {
+            if movesSuccessfulFiles != oldValue {
+                batchAcknowledgedNoBackup = false
+            }
+        }
+    }
+    @Published public private(set) var migrationDirectoryURL: URL?
+    @Published public private(set) var migrationDirectoryError: String?
     @Published public var batchAcknowledgedNoBackup = false
     public private(set) var batchArtistInitialState: BatchFieldInitialState = .empty
     public private(set) var batchAlbumInitialState: BatchFieldInitialState = .empty
@@ -215,6 +228,11 @@ public final class LibraryViewModel: ObservableObject {
         canAdvanceBatchEdit
             && batchAcknowledgedNoBackup
             && effectiveBatchOperationsAreCurrentlyEditable
+            && (!movesSuccessfulFiles || hasValidMigrationDirectory)
+    }
+
+    public var isMigrationDirectoryValid: Bool {
+        hasValidMigrationDirectory
     }
 
     private var effectiveBatchOperationsAreCurrentlyEditable: Bool {
@@ -244,6 +262,7 @@ public final class LibraryViewModel: ObservableObject {
         return BatchResultCounts(
             succeeded: summary.succeededCount,
             warnings: summary.succeededWithWarningCount,
+            moved: summary.movedCount,
             failed: summary.failedCount,
             notProcessed: summary.notProcessedCount
         )
@@ -393,10 +412,12 @@ public final class LibraryViewModel: ObservableObject {
     private let scanner: any DirectoryScanning
     private let batchEditor: any BatchEditing
     private let bookmarkStore: SecurityScopedDirectoryStore
+    private let migrationBookmarkStore: SecurityScopedDirectoryStore
     private let makeAccessLease: AccessLeaseFactory
 
     private var selectionState = SelectionState()
     private var accessLease: SecurityScopedAccessLease?
+    private var migrationAccessLease: SecurityScopedAccessLease?
     private var scanTask: Task<Void, Never>?
     private var scanFlushTask: Task<Void, Never>?
     private var batchProgressTask: Task<Void, Never>?
@@ -404,6 +425,7 @@ public final class LibraryViewModel: ObservableObject {
     private var batchGeneration: UInt64 = 0
     private var batchEditTrackSnapshot: [AudioTrack] = []
     private var hasAttemptedDirectoryRestore = false
+    private var hasAttemptedMigrationDirectoryRestore = false
     private var isRefreshingAfterBatch = false
     private var discoveredCount = 0
     private var processedCount = 0
@@ -416,6 +438,9 @@ public final class LibraryViewModel: ObservableObject {
         scanner: any DirectoryScanning,
         batchEditor: any BatchEditing,
         bookmarkStore: SecurityScopedDirectoryStore,
+        migrationBookmarkStore: SecurityScopedDirectoryStore = SecurityScopedDirectoryStore(
+            storageKey: "audioToolbox.migrationDirectoryBookmark"
+        ),
         makeAccessLease: @escaping AccessLeaseFactory = {
             SecurityScopedAccessLease(url: $0)
         }
@@ -423,6 +448,7 @@ public final class LibraryViewModel: ObservableObject {
         self.scanner = scanner
         self.batchEditor = batchEditor
         self.bookmarkStore = bookmarkStore
+        self.migrationBookmarkStore = migrationBookmarkStore
         self.makeAccessLease = makeAccessLease
     }
 
@@ -433,7 +459,10 @@ public final class LibraryViewModel: ObservableObject {
     }
 
     public static func live(
-        bookmarkStore: SecurityScopedDirectoryStore = SecurityScopedDirectoryStore()
+        bookmarkStore: SecurityScopedDirectoryStore = SecurityScopedDirectoryStore(),
+        migrationBookmarkStore: SecurityScopedDirectoryStore = SecurityScopedDirectoryStore(
+            storageKey: "audioToolbox.migrationDirectoryBookmark"
+        )
     ) -> LibraryViewModel {
         let metadataService = TagLibMetadataService()
         let scanner = DirectoryScanner(metadataService: metadataService)
@@ -442,7 +471,8 @@ public final class LibraryViewModel: ObservableObject {
         return LibraryViewModel(
             scanner: scanner,
             batchEditor: batchEditor,
-            bookmarkStore: bookmarkStore
+            bookmarkStore: bookmarkStore,
+            migrationBookmarkStore: migrationBookmarkStore
         )
     }
 
@@ -461,6 +491,64 @@ public final class LibraryViewModel: ObservableObject {
         guard !hasAttemptedDirectoryRestore, !isBatchActive else { return }
         hasAttemptedDirectoryRestore = true
         await restoreLastDirectory()
+    }
+
+    public func restoreMigrationDirectoryIfNeeded() async {
+        guard !hasAttemptedMigrationDirectoryRestore else { return }
+        hasAttemptedMigrationDirectoryRestore = true
+        migrationDirectoryError = nil
+
+        do {
+            guard let restoredURL = try migrationBookmarkStore.restore() else {
+                return
+            }
+            let url = restoredURL.standardizedFileURL
+            let lease = makeAccessLease(url)
+            guard lease.didStart else {
+                clearMigrationDirectory(
+                    message: "迁移目录授权已失效，请重新选择目录。"
+                )
+                return
+            }
+            guard Self.isDirectory(url) else {
+                clearMigrationDirectory(
+                    message: "上次迁移目录已不存在，请重新选择目录。"
+                )
+                return
+            }
+
+            migrationAccessLease = lease
+            migrationDirectoryURL = url
+        } catch {
+            clearMigrationDirectory(
+                message: "无法恢复迁移目录授权：\(error.localizedDescription)"
+            )
+        }
+    }
+
+    public func chooseMigrationDirectory(_ selectedURL: URL) {
+        let url = selectedURL.standardizedFileURL
+        migrationDirectoryError = nil
+        let lease = makeAccessLease(url)
+        guard lease.didStart else {
+            migrationDirectoryError = "无法取得迁移目录权限，请重新选择目录。"
+            return
+        }
+        guard Self.isDirectory(url) else {
+            migrationDirectoryError = "所选迁移目录不存在或不是文件夹。"
+            return
+        }
+
+        do {
+            try migrationBookmarkStore.save(url: url)
+        } catch {
+            migrationDirectoryError = "无法保存迁移目录授权：\(error.localizedDescription)"
+            return
+        }
+
+        migrationAccessLease = lease
+        migrationDirectoryURL = url
+        movesSuccessfulFiles = true
     }
 
     public func restoreLastDirectory() async {
@@ -532,6 +620,7 @@ public final class LibraryViewModel: ObservableObject {
         guard !selectedTracks.isEmpty else { return }
         batchEditTrackSnapshot = selectedTracks
         initializeBatchDraft(from: selectedTracks)
+        movesSuccessfulFiles = hasValidMigrationDirectory
         batchState = .editing
     }
 
@@ -550,15 +639,21 @@ public final class LibraryViewModel: ObservableObject {
         guard canExecuteBatchEdit else { return }
         let operations = effectiveBatchOperations
         guard !operations.isEmpty else { return }
+        let migration = movesSuccessfulFiles
+            ? migrationDirectoryURL.map(BatchMigrationConfiguration.init(destinationDirectory:))
+            : nil
+        guard !movesSuccessfulFiles || migration != nil else { return }
 
         batchGeneration &+= 1
         let generation = batchGeneration
         let directoryURL = currentDirectoryURL
         let retainedLease = accessLease
+        let retainedMigrationLease = migration == nil ? nil : migrationAccessLease
         let initialProgress = BatchProgress(
             completed: 0,
             total: operations.count,
-            currentURL: nil
+            currentURL: nil,
+            phase: .preparing
         )
         batchState = .running(initialProgress)
 
@@ -581,7 +676,7 @@ public final class LibraryViewModel: ObservableObject {
         batchProgressTask = progressTask
 
         let summary = await batchEditor.run(
-            BatchEditRequest(operations: operations)
+            BatchEditRequest(operations: operations, migration: migration)
         ) { progress in
             progressContinuation.yield(progress)
         }
@@ -592,7 +687,7 @@ public final class LibraryViewModel: ObservableObject {
         }
 
         guard batchGeneration == generation else {
-            withExtendedLifetime(retainedLease) {}
+            withExtendedLifetime((retainedLease, retainedMigrationLease)) {}
             return
         }
 
@@ -608,7 +703,7 @@ public final class LibraryViewModel: ObservableObject {
             await refreshCurrentDirectory(directoryURL)
         }
 
-        withExtendedLifetime(retainedLease) {}
+        withExtendedLifetime((retainedLease, retainedMigrationLease)) {}
     }
 
     public func stopBatchEdit() async {
@@ -642,6 +737,31 @@ public final class LibraryViewModel: ObservableObject {
         batchArtistInitialState = .empty
         batchAlbumInitialState = .empty
         batchAcknowledgedNoBackup = false
+        movesSuccessfulFiles = false
+    }
+
+    private var hasValidMigrationDirectory: Bool {
+        guard let migrationDirectoryURL,
+              migrationAccessLease?.didStart == true else {
+            return false
+        }
+        return Self.isDirectory(migrationDirectoryURL)
+    }
+
+    private func clearMigrationDirectory(message: String) {
+        migrationAccessLease = nil
+        migrationDirectoryURL = nil
+        movesSuccessfulFiles = false
+        migrationBookmarkStore.clear()
+        migrationDirectoryError = message
+    }
+
+    private static func isDirectory(_ url: URL) -> Bool {
+        var isDirectory: ObjCBool = false
+        return FileManager.default.fileExists(
+            atPath: url.path,
+            isDirectory: &isDirectory
+        ) && isDirectory.boolValue
     }
 
     private func batchPrompt(

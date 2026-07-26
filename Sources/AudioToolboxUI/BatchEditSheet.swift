@@ -31,7 +31,7 @@ public struct BatchEditSheet: View {
             Divider()
             footer
         }
-        .frame(width: step == .values ? 620 : 940, height: step == .values ? 430 : 650)
+        .frame(width: step == .values ? 660 : 940, height: step == .values ? 580 : 680)
         .animation(.easeInOut(duration: 0.15), value: step)
         .accessibilityElement(children: .contain)
     }
@@ -99,6 +99,8 @@ public struct BatchEditSheet: View {
                 .background(.quaternary.opacity(0.45), in: RoundedRectangle(cornerRadius: 10))
             }
 
+            migrationOptions
+
             if !viewModel.canAdvanceBatchEdit {
                 Label("请填写至少一个与原值不同的非空内容。", systemImage: "info.circle")
                     .font(.callout)
@@ -113,6 +115,9 @@ public struct BatchEditSheet: View {
     private var previewStep: some View {
         VStack(spacing: 16) {
             warning
+            if viewModel.movesSuccessfulFiles {
+                migrationPreview
+            }
 
             VStack(spacing: 0) {
                 previewHeader
@@ -153,7 +158,7 @@ public struct BatchEditSheet: View {
             Label("此操作不会创建永久备份", systemImage: "exclamationmark.triangle.fill")
                 .font(.headline)
                 .foregroundStyle(.orange)
-            Text("应用会使用安全临时副本写入，但成功替换后不会保留可供恢复的备份。请确认预览内容无误。")
+            Text(warningMessage)
                 .font(.callout)
                 .foregroundStyle(.secondary)
             Toggle("我了解此操作不会保留永久备份", isOn: $viewModel.batchAcknowledgedNoBackup)
@@ -167,6 +172,88 @@ public struct BatchEditSheet: View {
             RoundedRectangle(cornerRadius: 10)
                 .stroke(Color.orange.opacity(0.45), lineWidth: 1)
         )
+    }
+
+    private var migrationOptions: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Toggle(
+                "修改成功后移动文件",
+                isOn: $viewModel.movesSuccessfulFiles
+            )
+            .toggleStyle(.checkbox)
+
+            if viewModel.movesSuccessfulFiles {
+                HStack(spacing: 10) {
+                    Image(systemName: "folder")
+                        .foregroundStyle(.secondary)
+                    Text(viewModel.migrationDirectoryURL?.path ?? "尚未选择目标目录")
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .foregroundStyle(
+                            viewModel.migrationDirectoryURL == nil
+                                ? Color.secondary
+                                : Color.primary
+                        )
+                        .textSelection(.enabled)
+                        .help(viewModel.migrationDirectoryURL?.path ?? "尚未选择目标目录")
+                    Spacer(minLength: 8)
+                    Button {
+                        Task {
+                            if let url = await DirectoryPicker().pickDirectory(
+                                prompt: "选择迁移目录",
+                                message: "修改成功的文件将移动到此目录"
+                            ) {
+                                viewModel.chooseMigrationDirectory(url)
+                            }
+                        }
+                    } label: {
+                        Label("选择文件夹", systemImage: "folder.badge.plus")
+                    }
+                    .help("选择修改成功文件的目标目录")
+                }
+
+                Text("只移动实际修改成功的文件；目标目录中的同名文件不会被覆盖。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                if let error = viewModel.migrationDirectoryError {
+                    Label(error, systemImage: "exclamationmark.triangle")
+                        .font(.callout)
+                        .foregroundStyle(.red)
+                } else if !viewModel.isMigrationDirectoryValid {
+                    Label("请选择一个可用的目标目录。", systemImage: "info.circle")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+    }
+
+    private var migrationPreview: some View {
+        HStack(alignment: .top, spacing: 12) {
+            Image(systemName: "folder.badge.arrow.forward")
+                .foregroundStyle(.tint)
+            VStack(alignment: .leading, spacing: 4) {
+                Text("修改成功后移动 \(viewModel.batchActualModificationCount) 个文件")
+                    .font(.headline)
+                Text(viewModel.migrationDirectoryURL?.path ?? "目标目录不可用")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+                    .textSelection(.enabled)
+            }
+            Spacer()
+        }
+        .padding(.horizontal, 4)
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var warningMessage: String {
+        let base = "应用会使用安全临时副本写入，但成功替换后不会保留可供恢复的备份。"
+        if viewModel.movesSuccessfulFiles {
+            return base + " 修改成功的文件会离开原目录，请确认预览内容和目标目录无误。"
+        }
+        return base + " 请确认预览内容无误。"
     }
 
     private var previewHeader: some View {
@@ -298,12 +385,12 @@ struct BatchProgressSheet: View {
 
     var body: some View {
         VStack(spacing: 22) {
-            Image(systemName: isStopping ? "stop.circle" : "waveform.badge.plus")
+            Image(systemName: progressIcon)
                 .font(.system(size: 38))
                 .foregroundStyle(isStopping ? Color.orange : Color.accentColor)
 
             VStack(spacing: 6) {
-                Text(isStopping ? "正在停止批量编辑" : "正在批量编辑")
+                Text(progressTitle)
                     .font(.title2.weight(.semibold))
                 Text("已处理 \(progress.completed) / \(progress.total)")
                     .font(.headline.monospacedDigit())
@@ -340,5 +427,22 @@ struct BatchProgressSheet: View {
         .padding(36)
         .frame(width: 600, height: 360)
         .accessibilityElement(children: .contain)
+    }
+
+    private var progressTitle: String {
+        if isStopping { return "正在停止批量编辑" }
+        return switch progress.phase {
+        case .preparing: "正在准备"
+        case .editing: "正在修改元数据"
+        case .moving: "正在移动文件"
+        case .completed: "正在完成批量编辑"
+        }
+    }
+
+    private var progressIcon: String {
+        if isStopping { return "stop.circle" }
+        return progress.phase == .moving
+            ? "folder.badge.arrow.forward"
+            : "waveform.badge.plus"
     }
 }
