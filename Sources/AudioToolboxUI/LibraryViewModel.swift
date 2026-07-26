@@ -413,6 +413,7 @@ public final class LibraryViewModel: ObservableObject {
     private let batchEditor: any BatchEditing
     private let bookmarkStore: SecurityScopedDirectoryStore
     private let migrationBookmarkStore: SecurityScopedDirectoryStore
+    private let trackReloader: (any AudioTrackReloading)?
     private let makeAccessLease: AccessLeaseFactory
 
     private var selectionState = SelectionState()
@@ -426,7 +427,6 @@ public final class LibraryViewModel: ObservableObject {
     private var batchEditTrackSnapshot: [AudioTrack] = []
     private var hasAttemptedDirectoryRestore = false
     private var hasAttemptedMigrationDirectoryRestore = false
-    private var isRefreshingAfterBatch = false
     private var discoveredCount = 0
     private var processedCount = 0
     private var loadedCount = 0
@@ -441,6 +441,7 @@ public final class LibraryViewModel: ObservableObject {
         migrationBookmarkStore: SecurityScopedDirectoryStore = SecurityScopedDirectoryStore(
             storageKey: "audioToolbox.migrationDirectoryBookmark"
         ),
+        trackReloader: (any AudioTrackReloading)? = nil,
         makeAccessLease: @escaping AccessLeaseFactory = {
             SecurityScopedAccessLease(url: $0)
         }
@@ -449,6 +450,7 @@ public final class LibraryViewModel: ObservableObject {
         self.batchEditor = batchEditor
         self.bookmarkStore = bookmarkStore
         self.migrationBookmarkStore = migrationBookmarkStore
+        self.trackReloader = trackReloader
         self.makeAccessLease = makeAccessLease
     }
 
@@ -472,7 +474,8 @@ public final class LibraryViewModel: ObservableObject {
             scanner: scanner,
             batchEditor: batchEditor,
             bookmarkStore: bookmarkStore,
-            migrationBookmarkStore: migrationBookmarkStore
+            migrationBookmarkStore: migrationBookmarkStore,
+            trackReloader: AudioTrackReloader(metadataService: metadataService)
         )
     }
 
@@ -691,19 +694,112 @@ public final class LibraryViewModel: ObservableObject {
             return
         }
 
-        let shouldRefresh = directoryURL != nil
-            && currentDirectoryURL == directoryURL
-            && batchGeneration == generation
-        isRefreshingAfterBatch = shouldRefresh
-        defer { isRefreshingAfterBatch = false }
-
-        batchState = .completed(summary)
-
-        if let directoryURL, shouldRefresh {
-            await refreshCurrentDirectory(directoryURL)
-        }
+        let reconciledSummary = await reconcileBatchResults(
+            summary,
+            operations: operations,
+            root: directoryURL
+        )
+        batchState = .completed(reconciledSummary)
 
         withExtendedLifetime((retainedLease, retainedMigrationLease)) {}
+    }
+
+    private func reconcileBatchResults(
+        _ summary: BatchEditSummary,
+        operations: [BatchEditOperation],
+        root: URL?
+    ) async -> BatchEditSummary {
+        guard let root,
+              currentDirectoryURL == root,
+              let trackReloader else {
+            return summary
+        }
+        var tracksByID = Dictionary(uniqueKeysWithValues: tracks.map { ($0.id, $0) })
+        var updatedResults = summary.results
+        let successfulResultCount = summary.results.count {
+            $0.status == .succeeded
+        }
+        var completedResultCount = 0
+
+        for (index, operation) in operations.enumerated() {
+            guard updatedResults.indices.contains(index) else { break }
+            let result = updatedResults[index]
+            guard result.status == .succeeded else {
+                continue
+            }
+            batchState = .running(BatchProgress(
+                completed: completedResultCount,
+                total: successfulResultCount,
+                currentURL: result.finalURL,
+                phase: .updatingLibrary
+            ))
+
+            let oldIdentity = operation.target.fileIdentity
+            let wasSelected = selectedTrackIDs.contains(oldIdentity)
+            if result.migrationStatus == .moved,
+               !Self.contains(result.finalURL, in: root) {
+                tracksByID.removeValue(forKey: oldIdentity)
+                selectionState.setSelected([oldIdentity], selected: false)
+                completedResultCount += 1
+                continue
+            }
+
+            do {
+                let track = try await trackReloader.reload(url: result.finalURL)
+                tracksByID.removeValue(forKey: oldIdentity)
+                tracksByID[track.id] = track
+                selectionState.setSelected([oldIdentity], selected: false)
+                if wasSelected && track.isEditable {
+                    selectionState.setSelected([track.id], selected: true)
+                }
+            } catch {
+                if result.migrationStatus == .moved {
+                    tracksByID.removeValue(forKey: oldIdentity)
+                    selectionState.setSelected([oldIdentity], selected: false)
+                }
+                updatedResults[index] = Self.appendingReloadWarning(
+                    to: result,
+                    error: error
+                )
+            }
+            completedResultCount += 1
+        }
+
+        scannedTracksByID = tracksByID
+        tracks = LibraryProjection.sortedTracks(Array(tracksByID.values))
+        selectionState.retainOnly(Set(tracks.filter(\.isEditable).map(\.id)))
+        publishSelection()
+        rebuildGroups()
+        refreshTerminalScanState()
+        return BatchEditSummary(results: updatedResults)
+    }
+
+    private static func contains(_ fileURL: URL, in rootURL: URL) -> Bool {
+        let rootComponents = rootURL.standardizedFileURL.pathComponents
+        let fileComponents = fileURL.standardizedFileURL.pathComponents
+        return fileComponents.count > rootComponents.count
+            && fileComponents.starts(with: rootComponents)
+    }
+
+    private static func appendingReloadWarning(
+        to result: BatchFileResult,
+        error: Error
+    ) -> BatchFileResult {
+        let warning = "修改成功，但列表更新失败，请手动刷新：\(error.localizedDescription)"
+        let message = [result.message, warning]
+            .compactMap { value in
+                value?.trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+            .filter { !$0.isEmpty }
+            .joined(separator: "；")
+        return BatchFileResult(
+            url: result.url,
+            status: result.status,
+            message: message,
+            recoveryURL: result.recoveryURL,
+            finalURL: result.finalURL,
+            migrationStatus: result.migrationStatus
+        )
     }
 
     public func stopBatchEdit() async {
@@ -799,7 +895,6 @@ public final class LibraryViewModel: ObservableObject {
     }
 
     private var isBatchActive: Bool {
-        if isRefreshingAfterBatch { return true }
         return switch batchState {
         case .editing, .running, .stopping:
             true
@@ -852,17 +947,6 @@ public final class LibraryViewModel: ObservableObject {
             generation: generation,
             preservingGroupID: preservedGroupID
         )
-    }
-
-    private func refreshCurrentDirectory(_ url: URL) async {
-        invalidateScan()
-        let generation = scanGeneration
-        let task = beginScan(
-            root: url,
-            generation: generation,
-            preservingGroupID: selectedGroupID
-        )
-        await task.value
     }
 
     private func invalidateScan() {

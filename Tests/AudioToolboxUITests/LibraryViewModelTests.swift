@@ -1212,12 +1212,11 @@ struct LibraryViewModelTests {
         ]))
     }
 
-    @Test("打开、执行批量编辑会发布进度和结果，完成后刷新目录")
+    @Test("打开、执行批量编辑会发布进度和结果，完成后只增量重载成功文件")
     @MainActor
     func batchEditPublishesProgressAndRefreshes() async {
         let scanner = ScriptedScanner(scripts: [
             [.loaded(Self.firstTrack), .finished],
-            [.loaded(Self.editedFirstTrack), .finished],
         ])
         let summary = BatchEditSummary(results: [
             BatchFileResult(url: Self.firstTrack.url, status: .succeeded, message: nil),
@@ -1226,7 +1225,14 @@ struct LibraryViewModelTests {
             BatchProgress(completed: 0, total: 1, currentURL: nil),
             BatchProgress(completed: 1, total: 1, currentURL: Self.firstTrack.url),
         ])
-        let viewModel = makeViewModel(scanner: scanner, batchEditor: editor)
+        let reloader = RecordingTrackReloader(results: [
+            .success(Self.editedFirstTrack),
+        ])
+        let viewModel = makeViewModel(
+            scanner: scanner,
+            batchEditor: editor,
+            trackReloader: reloader
+        )
         await viewModel.loadDirectory(firstRoot)
         await waitUntil { viewModel.scanState == .loaded(failures: []) }
         viewModel.toggleSelection(Self.firstTrack.id)
@@ -1251,8 +1257,10 @@ struct LibraryViewModelTests {
         #expect(!viewModel.isBatchExecutionActive)
         #expect(viewModel.batchResultCounts == BatchResultCounts(succeeded: 1, failed: 0, notProcessed: 0))
         #expect(viewModel.tracks == [Self.editedFirstTrack])
+        #expect(viewModel.groups.map(\.displayName) == ["Edited Artist"])
         #expect(viewModel.selectedTrackIDs == [Self.firstTrack.id])
-        #expect(scanner.scanCount == 2)
+        #expect(await reloader.urls == [Self.firstTrack.url])
+        #expect(scanner.scanCount == 1)
     }
 
     @Test("批量结果计数区分成功、失败和未处理")
@@ -1276,7 +1284,13 @@ struct LibraryViewModelTests {
             BatchFileResult(url: Self.secondTrack.url, status: .notProcessed, message: "已停止"),
         ])
         let editor = FakeBatchEditor(summary: summary)
-        let viewModel = makeViewModel(scanner: scanner, batchEditor: editor)
+        let viewModel = makeViewModel(
+            scanner: scanner,
+            batchEditor: editor,
+            trackReloader: RecordingTrackReloader(results: [
+                .success(Self.editedFirstTrack),
+            ])
+        )
         await viewModel.loadDirectory(firstRoot)
         viewModel.toggleSelection(Self.firstTrack.id)
         viewModel.openBatchEditor()
@@ -1294,7 +1308,7 @@ struct LibraryViewModelTests {
         ))
     }
 
-    @Test("批量完成后的刷新结束前拒绝重新打开编辑器")
+    @Test("批量完成后的增量重载结束前拒绝重新打开编辑器")
     @MainActor
     func postBatchRefreshPreventsEditorReentry() async {
         let scanner = ControllableScanner()
@@ -1302,7 +1316,12 @@ struct LibraryViewModelTests {
             BatchFileResult(url: Self.firstTrack.url, status: .succeeded, message: nil),
         ])
         let editor = FakeBatchEditor(summary: summary)
-        let viewModel = makeViewModel(scanner: scanner, batchEditor: editor)
+        let reloader = SuspendedTrackReloader(result: Self.editedFirstTrack)
+        let viewModel = makeViewModel(
+            scanner: scanner,
+            batchEditor: editor,
+            trackReloader: reloader
+        )
 
         let initialLoad = Task { await viewModel.loadDirectory(firstRoot) }
         await scanner.waitForScanCount(1)
@@ -1318,15 +1337,341 @@ struct LibraryViewModelTests {
         let batch = Task {
             await viewModel.runBatchEdit()
         }
-        await scanner.waitForScanCount(2)
-        #expect(viewModel.batchState == .completed(summary))
+        await reloader.waitUntilStarted()
+        #expect(viewModel.isBatchExecutionActive)
 
         viewModel.openBatchEditor()
 
-        #expect(viewModel.batchState == .completed(summary))
-        scanner.yield(.loaded(Self.editedFirstTrack), toScan: 1)
-        scanner.finish(scan: 1)
+        #expect(viewModel.isBatchExecutionActive)
+        await reloader.complete()
         await batch.value
+        #expect(viewModel.batchState == .completed(summary))
+    }
+
+    @Test("迁移到扫描目录外会移除曲目和选择且不重载")
+    @MainActor
+    func movedOutsideRootRemovesTrackWithoutReloading() async {
+        let destination = URL(fileURLWithPath: "/outside/filename-match.mp3")
+        let summary = BatchEditSummary(results: [
+            BatchFileResult(
+                url: Self.firstTrack.url,
+                status: .succeeded,
+                message: nil,
+                finalURL: destination,
+                migrationStatus: .moved
+            ),
+        ])
+        let reloader = RecordingTrackReloader(results: [])
+        let viewModel = makeViewModel(
+            scanner: ScriptedScanner(scripts: [[.loaded(Self.firstTrack), .finished]]),
+            batchEditor: FakeBatchEditor(summary: summary),
+            trackReloader: reloader
+        )
+
+        await runBatchEdit(viewModel, selecting: [Self.firstTrack.id])
+
+        #expect(viewModel.tracks.isEmpty)
+        #expect(viewModel.selectedTrackIDs.isEmpty)
+        #expect(await reloader.urls.isEmpty)
+    }
+
+    @Test("迁移到扫描目录内会按最终路径重载并映射新身份选择")
+    @MainActor
+    func movedInsideRootReloadsFinalPathAndMapsSelection() async {
+        let destination = firstRoot
+            .appendingPathComponent("migrated", isDirectory: true)
+            .appendingPathComponent("filename-match.mp3")
+        let movedTrack = Self.track(
+            id: "migrated-first",
+            url: destination,
+            title: "First Title",
+            artist: "Edited Artist",
+            album: "Special Album"
+        )
+        let summary = BatchEditSummary(results: [
+            BatchFileResult(
+                url: Self.firstTrack.url,
+                status: .succeeded,
+                message: nil,
+                finalURL: destination,
+                migrationStatus: .moved
+            ),
+        ])
+        let reloader = RecordingTrackReloader(results: [.success(movedTrack)])
+        let viewModel = makeViewModel(
+            scanner: ScriptedScanner(scripts: [[.loaded(Self.firstTrack), .finished]]),
+            batchEditor: FakeBatchEditor(summary: summary),
+            trackReloader: reloader
+        )
+
+        await runBatchEdit(viewModel, selecting: [Self.firstTrack.id])
+
+        #expect(viewModel.tracks == [movedTrack])
+        #expect(viewModel.selectedTrackIDs == [movedTrack.id])
+        #expect(await reloader.urls == [destination])
+    }
+
+    @Test("迁移冲突和移动失败会重载修改后的原路径")
+    @MainActor
+    func migrationWarningsReloadOriginalPaths() async {
+        let editedFirst = Self.track(
+            id: Self.firstTrack.id.rawValue,
+            url: Self.firstTrack.url,
+            title: "First Title",
+            artist: "Edited Artist",
+            album: "Special Album"
+        )
+        let editedOther = Self.track(
+            id: Self.sameArtistTrack.id.rawValue,
+            url: Self.sameArtistTrack.url,
+            title: "Other Song",
+            artist: "Edited Artist",
+            album: "Different Album"
+        )
+        let summary = BatchEditSummary(results: [
+            BatchFileResult(
+                url: Self.firstTrack.url,
+                status: .succeeded,
+                message: "目标文件已存在",
+                migrationStatus: .skippedConflict
+            ),
+            BatchFileResult(
+                url: Self.sameArtistTrack.url,
+                status: .succeeded,
+                message: "无法移动文件",
+                migrationStatus: .failed
+            ),
+        ])
+        let reloader = RecordingTrackReloader(results: [
+            .success(editedFirst),
+            .success(editedOther),
+        ])
+        let viewModel = makeViewModel(
+            scanner: ScriptedScanner(scripts: [[
+                .loaded(Self.firstTrack),
+                .loaded(Self.sameArtistTrack),
+                .finished,
+            ]]),
+            batchEditor: FakeBatchEditor(summary: summary),
+            trackReloader: reloader
+        )
+
+        await runBatchEdit(
+            viewModel,
+            selecting: [Self.firstTrack.id, Self.sameArtistTrack.id]
+        )
+
+        #expect(await reloader.urls == [Self.firstTrack.url, Self.sameArtistTrack.url])
+        #expect(viewModel.tracks.count == 2)
+        #expect(viewModel.tracks.contains(editedFirst))
+        #expect(viewModel.tracks.contains(editedOther))
+    }
+
+    @Test("未移动文件重载失败会保留旧记录并追加手动刷新警告")
+    @MainActor
+    func reloadFailureRetainsOriginalTrackAndResultDetails() async {
+        let recoveryURL = URL(fileURLWithPath: "/tmp/recovery.mp3")
+        let originalResult = BatchFileResult(
+            url: Self.firstTrack.url,
+            status: .succeeded,
+            message: "修改成功，但保留了恢复文件",
+            recoveryURL: recoveryURL,
+            migrationStatus: .notRequested
+        )
+        let reloader = RecordingTrackReloader(results: [
+            .failure(TrackReloadTestError.reloadFailed),
+        ])
+        let viewModel = makeViewModel(
+            scanner: ScriptedScanner(scripts: [[.loaded(Self.firstTrack), .finished]]),
+            batchEditor: FakeBatchEditor(
+                summary: BatchEditSummary(results: [originalResult])
+            ),
+            trackReloader: reloader
+        )
+
+        await runBatchEdit(viewModel, selecting: [Self.firstTrack.id])
+
+        #expect(viewModel.tracks == [Self.firstTrack])
+        #expect(viewModel.selectedTrackIDs == [Self.firstTrack.id])
+        guard case let .completed(summary) = viewModel.batchState,
+              let result = summary.results.first else {
+            Issue.record("Expected completed batch summary")
+            return
+        }
+        #expect(result.status == .succeeded)
+        #expect(result.url == originalResult.url)
+        #expect(result.finalURL == originalResult.finalURL)
+        #expect(result.recoveryURL == recoveryURL)
+        #expect(result.migrationStatus == .notRequested)
+        #expect(result.message?.contains("修改成功，但保留了恢复文件") == true)
+        #expect(result.message?.contains("列表更新失败，请手动刷新") == true)
+        #expect(result.message?.contains("测试重载失败") == true)
+    }
+
+    @Test("移入扫描目录的文件重载失败会移除失效旧记录")
+    @MainActor
+    func movedInsideRootReloadFailureRemovesStaleTrack() async {
+        let destination = firstRoot.appendingPathComponent("migrated/filename-match.mp3")
+        let originalResult = BatchFileResult(
+            url: Self.firstTrack.url,
+            status: .succeeded,
+            message: nil,
+            finalURL: destination,
+            migrationStatus: .moved
+        )
+        let reloader = RecordingTrackReloader(results: [
+            .failure(TrackReloadTestError.reloadFailed),
+        ])
+        let viewModel = makeViewModel(
+            scanner: ScriptedScanner(scripts: [[.loaded(Self.firstTrack), .finished]]),
+            batchEditor: FakeBatchEditor(
+                summary: BatchEditSummary(results: [originalResult])
+            ),
+            trackReloader: reloader
+        )
+
+        await runBatchEdit(viewModel, selecting: [Self.firstTrack.id])
+
+        #expect(viewModel.tracks.isEmpty)
+        #expect(viewModel.selectedTrackIDs.isEmpty)
+        guard case let .completed(summary) = viewModel.batchState else {
+            Issue.record("Expected completed batch summary")
+            return
+        }
+        #expect(summary.results[0].message?.contains("列表更新失败，请手动刷新") == true)
+    }
+
+    @Test("一个文件重载失败不会阻止后续成功文件更新")
+    @MainActor
+    func reloadFailureDoesNotStopFollowingUpdates() async {
+        let editedOther = Self.track(
+            id: Self.sameArtistTrack.id.rawValue,
+            url: Self.sameArtistTrack.url,
+            title: "Other Song",
+            artist: "Edited Artist",
+            album: "Different Album"
+        )
+        let summary = BatchEditSummary(results: [
+            BatchFileResult(url: Self.firstTrack.url, status: .succeeded, message: nil),
+            BatchFileResult(url: Self.sameArtistTrack.url, status: .succeeded, message: nil),
+        ])
+        let reloader = RecordingTrackReloader(results: [
+            .failure(TrackReloadTestError.reloadFailed),
+            .success(editedOther),
+        ])
+        let viewModel = makeViewModel(
+            scanner: ScriptedScanner(scripts: [[
+                .loaded(Self.firstTrack),
+                .loaded(Self.sameArtistTrack),
+                .finished,
+            ]]),
+            batchEditor: FakeBatchEditor(summary: summary),
+            trackReloader: reloader
+        )
+
+        await runBatchEdit(
+            viewModel,
+            selecting: [Self.firstTrack.id, Self.sameArtistTrack.id]
+        )
+
+        #expect(viewModel.tracks.count == 2)
+        #expect(viewModel.tracks.contains(Self.firstTrack))
+        #expect(viewModel.tracks.contains(editedOther))
+        guard case let .completed(reconciledSummary) = viewModel.batchState else {
+            Issue.record("Expected completed batch summary")
+            return
+        }
+        #expect(reconciledSummary.results[0].message?.contains("列表更新失败，请手动刷新") == true)
+        #expect(reconciledSummary.results[1].message == nil)
+    }
+
+    @Test("目录字符串前缀相同但路径组件不同的迁移目标仍视为目录外")
+    @MainActor
+    func similarStringPrefixIsOutsideRoot() async {
+        let destination = URL(
+            fileURLWithPath: "/virtual/library-one-old/filename-match.mp3"
+        )
+        let summary = BatchEditSummary(results: [
+            BatchFileResult(
+                url: Self.firstTrack.url,
+                status: .succeeded,
+                message: nil,
+                finalURL: destination,
+                migrationStatus: .moved
+            ),
+        ])
+        let reloader = RecordingTrackReloader(results: [])
+        let viewModel = makeViewModel(
+            scanner: ScriptedScanner(scripts: [[.loaded(Self.firstTrack), .finished]]),
+            batchEditor: FakeBatchEditor(summary: summary),
+            trackReloader: reloader
+        )
+
+        await runBatchEdit(viewModel, selecting: [Self.firstTrack.id])
+
+        #expect(viewModel.tracks.isEmpty)
+        #expect(await reloader.urls.isEmpty)
+    }
+
+    @Test("增量更新列表会按成功文件数发布逐文件进度")
+    @MainActor
+    func incrementalLibraryUpdatePublishesProgress() async {
+        let editedOther = Self.track(
+            id: Self.sameArtistTrack.id.rawValue,
+            url: Self.sameArtistTrack.url,
+            title: "Other Song",
+            artist: "Edited Artist",
+            album: "Different Album"
+        )
+        let summary = BatchEditSummary(results: [
+            BatchFileResult(url: Self.firstTrack.url, status: .succeeded, message: nil),
+            BatchFileResult(url: Self.sameArtistTrack.url, status: .succeeded, message: nil),
+            BatchFileResult(url: Self.secondTrack.url, status: .failed, message: "写入失败"),
+        ])
+        let reloader = SteppedTrackReloader(results: [
+            Self.editedFirstTrack,
+            editedOther,
+        ])
+        let viewModel = makeViewModel(
+            scanner: ScriptedScanner(scripts: [[
+                .loaded(Self.firstTrack),
+                .loaded(Self.sameArtistTrack),
+                .loaded(Self.secondTrack),
+                .finished,
+            ]]),
+            batchEditor: FakeBatchEditor(summary: summary),
+            trackReloader: reloader
+        )
+
+        await viewModel.loadDirectory(firstRoot)
+        for id in [Self.firstTrack.id, Self.sameArtistTrack.id, Self.secondTrack.id] {
+            viewModel.toggleSelection(id)
+        }
+        viewModel.openBatchEditor()
+        viewModel.batchArtist = "Edited Artist"
+        viewModel.batchAcknowledgedNoBackup = true
+        let run = Task { await viewModel.runBatchEdit() }
+
+        await reloader.waitForCallCount(1)
+        #expect(viewModel.batchState == .running(BatchProgress(
+            completed: 0,
+            total: 2,
+            currentURL: Self.firstTrack.url,
+            phase: .updatingLibrary
+        )))
+
+        await reloader.completeCall(0)
+        await reloader.waitForCallCount(2)
+        #expect(viewModel.batchState == .running(BatchProgress(
+            completed: 1,
+            total: 2,
+            currentURL: Self.sameArtistTrack.url,
+            phase: .updatingLibrary
+        )))
+
+        await reloader.completeCall(1)
+        await run.value
+        #expect(viewModel.batchState == .completed(summary))
     }
 
     @Test("停止批量编辑请求会进入停止状态并转发给 editor")
@@ -1433,6 +1778,7 @@ struct LibraryViewModelTests {
     private func makeViewModel(
         scanner: any DirectoryScanning,
         batchEditor: any BatchEditing = FakeBatchEditor(summary: BatchEditSummary(results: [])),
+        trackReloader: any AudioTrackReloading = FailingTrackReloader(),
         accessLog: AccessLog? = nil
     ) -> LibraryViewModel {
         let defaults = makeDefaults()
@@ -1448,6 +1794,7 @@ struct LibraryViewModelTests {
             batchEditor: batchEditor,
             bookmarkStore: store,
             migrationBookmarkStore: migrationStore,
+            trackReloader: trackReloader,
             makeAccessLease: { SecurityScopedAccessLease(url: $0, accessor: accessor) }
         )
     }
@@ -1457,6 +1804,22 @@ struct LibraryViewModelTests {
         let defaults = UserDefaults(suiteName: suite)!
         defaults.removePersistentDomain(forName: suite)
         return defaults
+    }
+
+    @MainActor
+    private func runBatchEdit(
+        _ viewModel: LibraryViewModel,
+        selecting trackIDs: Set<FileIdentity>
+    ) async {
+        await viewModel.loadDirectory(firstRoot)
+        await waitUntil { viewModel.scanState == .loaded(failures: []) }
+        for trackID in trackIDs {
+            viewModel.toggleSelection(trackID)
+        }
+        viewModel.openBatchEditor()
+        viewModel.batchArtist = "Edited Artist"
+        viewModel.batchAcknowledgedNoBackup = true
+        await viewModel.runBatchEdit()
     }
 
     @MainActor
@@ -1600,9 +1963,28 @@ struct LibraryViewModelTests {
         album: String,
         format: AudioFormat = .mp3
     ) -> AudioTrack {
+        track(
+            id: id,
+            url: URL(fileURLWithPath: "/virtual/library-one", isDirectory: true)
+                .appendingPathComponent(fileName),
+            title: title,
+            artist: artist,
+            album: album,
+            format: format
+        )
+    }
+
+    private static func track(
+        id: String,
+        url: URL,
+        title: String,
+        artist: String,
+        album: String,
+        format: AudioFormat = .mp3
+    ) -> AudioTrack {
         AudioTrack(
             id: FileIdentity(rawValue: id),
-            url: URL(fileURLWithPath: "/virtual/\(fileName)"),
+            url: url,
             format: format,
             metadata: AudioMetadata(
                 title: title,
@@ -1808,6 +2190,111 @@ private actor SuspendedBatchEditor: BatchEditing {
     func complete() {
         completionContinuation?.resume()
         completionContinuation = nil
+    }
+}
+
+private enum TrackReloadTestError: LocalizedError {
+    case missingResult
+    case reloadFailed
+
+    var errorDescription: String? {
+        switch self {
+        case .missingResult:
+            "缺少测试重载结果"
+        case .reloadFailed:
+            "测试重载失败"
+        }
+    }
+}
+
+private actor RecordingTrackReloader: AudioTrackReloading {
+    private var results: [Result<AudioTrack, Error>]
+    private(set) var urls: [URL] = []
+
+    init(results: [Result<AudioTrack, Error>]) {
+        self.results = results
+    }
+
+    func reload(url: URL) async throws -> AudioTrack {
+        urls.append(url)
+        guard !results.isEmpty else {
+            throw TrackReloadTestError.missingResult
+        }
+        return try results.removeFirst().get()
+    }
+}
+
+private actor SuspendedTrackReloader: AudioTrackReloading {
+    private let result: AudioTrack
+    private var started = false
+    private var startedContinuations: [CheckedContinuation<Void, Never>] = []
+    private var completionContinuation: CheckedContinuation<Void, Never>?
+
+    init(result: AudioTrack) {
+        self.result = result
+    }
+
+    func reload(url: URL) async throws -> AudioTrack {
+        started = true
+        let continuations = startedContinuations
+        startedContinuations.removeAll()
+        continuations.forEach { $0.resume() }
+        await withCheckedContinuation { continuation in
+            completionContinuation = continuation
+        }
+        return result
+    }
+
+    func waitUntilStarted() async {
+        if started { return }
+        await withCheckedContinuation { continuation in
+            startedContinuations.append(continuation)
+        }
+    }
+
+    func complete() {
+        completionContinuation?.resume()
+        completionContinuation = nil
+    }
+}
+
+private actor SteppedTrackReloader: AudioTrackReloading {
+    private let results: [AudioTrack]
+    private var urls: [URL] = []
+    private var callContinuations: [Int: CheckedContinuation<Void, Never>] = [:]
+    private var callCountWaiters: [(Int, CheckedContinuation<Void, Never>)] = []
+
+    init(results: [AudioTrack]) {
+        self.results = results
+    }
+
+    func reload(url: URL) async throws -> AudioTrack {
+        let index = urls.count
+        urls.append(url)
+        let readyWaiters = callCountWaiters.filter { $0.0 <= urls.count }
+        callCountWaiters.removeAll { $0.0 <= urls.count }
+        readyWaiters.forEach { $0.1.resume() }
+        await withCheckedContinuation { continuation in
+            callContinuations[index] = continuation
+        }
+        return results[index]
+    }
+
+    func waitForCallCount(_ count: Int) async {
+        if urls.count >= count { return }
+        await withCheckedContinuation { continuation in
+            callCountWaiters.append((count, continuation))
+        }
+    }
+
+    func completeCall(_ index: Int) {
+        callContinuations.removeValue(forKey: index)?.resume()
+    }
+}
+
+private struct FailingTrackReloader: AudioTrackReloading {
+    func reload(url: URL) async throws -> AudioTrack {
+        throw TrackReloadTestError.missingResult
     }
 }
 

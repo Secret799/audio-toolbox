@@ -20,7 +20,8 @@ struct AudioToolboxApp: App {
                 scanner: scanner,
                 batchEditor: batchEditor,
                 bookmarkStore: bookmarkStore,
-                migrationBookmarkStore: migrationBookmarkStore
+                migrationBookmarkStore: migrationBookmarkStore,
+                trackReloader: AudioTrackReloader(metadataService: metadataService)
             )
         )
     }

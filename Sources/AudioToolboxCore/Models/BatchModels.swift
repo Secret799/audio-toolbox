@@ -128,6 +128,10 @@ public struct BatchFileResult: Equatable, Sendable {
 public struct BatchEditSummary: Equatable, Sendable {
     public let results: [BatchFileResult]
 
+    public init(results: [BatchFileResult]) {
+        self.results = results
+    }
+
     public var succeededCount: Int {
         results.count { $0.status == .succeeded }
     }

@@ -435,14 +435,20 @@ struct BatchProgressSheet: View {
         case .preparing: "正在准备"
         case .editing: "正在修改元数据"
         case .moving: "正在移动文件"
+        case .updatingLibrary: "正在更新列表"
         case .completed: "正在完成批量编辑"
         }
     }
 
     private var progressIcon: String {
         if isStopping { return "stop.circle" }
-        return progress.phase == .moving
-            ? "folder.badge.arrow.forward"
-            : "waveform.badge.plus"
+        return switch progress.phase {
+        case .moving:
+            "folder.badge.arrow.forward"
+        case .updatingLibrary:
+            "list.bullet.rectangle"
+        case .preparing, .editing, .completed:
+            "waveform.badge.plus"
+        }
     }
 }

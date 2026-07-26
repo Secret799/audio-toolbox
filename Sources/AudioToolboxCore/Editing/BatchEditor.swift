@@ -4,6 +4,7 @@ public enum BatchProgressPhase: Equatable, Sendable {
     case preparing
     case editing
     case moving
+    case updatingLibrary
     case completed
 }
 
