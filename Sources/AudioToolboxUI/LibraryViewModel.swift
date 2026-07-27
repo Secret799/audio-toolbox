@@ -901,6 +901,23 @@ public final class LibraryViewModel: ObservableObject {
         authorManagementState = .completed(summary)
     }
 
+    public func runArtistComposerSync() async {
+        guard canExecuteArtistComposerSync else { return }
+        let operations = effectiveArtistComposerSyncOperations
+        guard !operations.isEmpty else { return }
+
+        guard let summary = await executeBatchOperations(
+            operations,
+            migration: nil,
+            publishProgress: { [weak self] progress in
+                self?.publishAuthorRenameProgress(progress)
+            }
+        ) else {
+            return
+        }
+        authorManagementState = .completed(summary)
+    }
+
     private func executeBatchOperations(
         _ operations: [BatchEditOperation],
         migration: BatchMigrationConfiguration?,
@@ -1083,7 +1100,7 @@ public final class LibraryViewModel: ObservableObject {
         await batchEditor.requestStop()
     }
 
-    public func stopAuthorRenames() async {
+    public func stopAuthorManagement() async {
         let progress: BatchProgress
         switch authorManagementState {
         case let .running(value):

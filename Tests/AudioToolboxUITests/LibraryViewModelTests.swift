@@ -357,6 +357,154 @@ struct LibraryViewModelTests {
         #expect(viewModel.artistComposerSearchText.isEmpty)
     }
 
+    @Test("作者和作曲者同步只提交实际变化字段并增量重载")
+    @MainActor
+    func artistComposerSyncExecutesWithoutRescanning() async {
+        let first = Self.artistComposerTrack(
+            id: "sync-first",
+            artist: "Artist A",
+            composer: "Composer A"
+        )
+        let second = Self.artistComposerTrack(
+            id: "sync-second",
+            artist: nil,
+            composer: "Composer B"
+        )
+        let reloadedFirst = Self.artistComposerTrack(
+            id: "sync-first",
+            artist: "Artist A",
+            composer: "Artist A"
+        )
+        let reloadedSecond = Self.artistComposerTrack(
+            id: "sync-second",
+            artist: "Composer B",
+            composer: "Composer B"
+        )
+        let summary = BatchEditSummary(results: [
+            BatchFileResult(url: first.url, status: .succeeded, message: nil),
+            BatchFileResult(url: second.url, status: .succeeded, message: nil),
+        ])
+        let scanner = ScriptedScanner(scripts: [[
+            .loaded(first),
+            .loaded(second),
+            .finished,
+        ]])
+        let editor = FakeBatchEditor(summary: summary)
+        let reloader = RecordingTrackReloader(results: [
+            .success(reloadedFirst),
+            .success(reloadedSecond),
+        ])
+        let viewModel = makeViewModel(
+            scanner: scanner,
+            batchEditor: editor,
+            trackReloader: reloader
+        )
+        await viewModel.loadDirectory(firstRoot)
+        viewModel.toggleSelection(first.id)
+        viewModel.toggleSelection(second.id)
+        viewModel.openAuthorManagement()
+        viewModel.setAuthorManagementMode(.artistComposerSync)
+        viewModel.artistComposerAuthority = .artist
+        viewModel.applyArtistComposerAuthorityToAll()
+        viewModel.showArtistComposerPreview()
+        viewModel.artistComposerAcknowledgedNoBackup = true
+
+        await viewModel.runArtistComposerSync()
+
+        let request = await editor.requests.first
+        #expect(request?.migration == nil)
+        #expect(request?.operations.map(\.patch) == [
+            MetadataPatch(artist: nil, album: nil, composer: "Artist A"),
+            MetadataPatch(artist: "Composer B", album: nil, composer: nil),
+        ])
+        #expect(await reloader.urls == [first.url, second.url])
+        #expect(scanner.scanCount == 1)
+        #expect(viewModel.tracks == LibraryProjection.sortedTracks([
+            reloadedFirst,
+            reloadedSecond,
+        ]))
+        #expect(viewModel.selectedTrackIDs.isEmpty)
+        #expect(viewModel.authorManagementState == .completed(summary))
+    }
+
+    @Test("统一作者管理停止入口会停止作者和作曲者同步")
+    @MainActor
+    func stoppingArtistComposerSyncForwardsStop() async {
+        let track = Self.artistComposerTrack(
+            id: "sync-stop",
+            artist: "Artist",
+            composer: "Composer"
+        )
+        let editor = SuspendedBatchEditor()
+        let viewModel = makeViewModel(
+            scanner: ScriptedScanner(scripts: [[.loaded(track), .finished]]),
+            batchEditor: editor
+        )
+        await viewModel.loadDirectory(firstRoot)
+        viewModel.openAuthorManagement()
+        viewModel.setAuthorManagementMode(.artistComposerSync)
+        viewModel.applyArtistComposerAuthorityToAll()
+        viewModel.showArtistComposerPreview()
+        viewModel.artistComposerAcknowledgedNoBackup = true
+        let run = Task { await viewModel.runArtistComposerSync() }
+
+        await editor.waitUntilRunning()
+        await viewModel.stopAuthorManagement()
+
+        #expect(await editor.stopRequestCount == 1)
+        #expect(viewModel.authorManagementState == .stopping(BatchProgress(
+            completed: 0,
+            total: 1,
+            currentURL: nil
+        )))
+
+        await editor.complete()
+        await run.value
+    }
+
+    @Test("作者和作曲者同步拒绝执行已变为不可编辑的快照")
+    @MainActor
+    func artistComposerSyncRejectsSnapshotThatBecomesUnreadable() async {
+        let track = Self.artistComposerTrack(
+            id: "sync-change",
+            artist: "Artist",
+            composer: "Composer"
+        )
+        let unreadable = AudioTrack(
+            id: track.id,
+            url: track.url,
+            format: track.format,
+            metadata: track.metadata,
+            fileSize: track.fileSize,
+            modificationDate: track.modificationDate,
+            isWritable: false,
+            issue: .unreadable("标签后来变得不可读")
+        )
+        let scanner = ControllableScanner()
+        let editor = FakeBatchEditor(summary: BatchEditSummary(results: []))
+        let viewModel = makeViewModel(scanner: scanner, batchEditor: editor)
+        let load = Task { await viewModel.loadDirectory(firstRoot) }
+        await scanner.waitForScanCount(1)
+        scanner.yield(.loaded(track), toScan: 0)
+        await waitUntil { viewModel.tracks == [track] }
+
+        viewModel.openAuthorManagement()
+        viewModel.setAuthorManagementMode(.artistComposerSync)
+        viewModel.applyArtistComposerAuthorityToAll()
+        viewModel.showArtistComposerPreview()
+        viewModel.artistComposerAcknowledgedNoBackup = true
+        #expect(viewModel.canExecuteArtistComposerSync)
+
+        scanner.yield(.unreadable(unreadable, "标签后来变得不可读"), toScan: 0)
+        scanner.finish(scan: 0)
+        await load.value
+
+        #expect(!viewModel.canExecuteArtistComposerSync)
+        await viewModel.runArtistComposerSync()
+        #expect(await editor.requests.isEmpty)
+        #expect(viewModel.authorManagementState == .previewing)
+    }
+
     @Test("作者管理与普通批量编辑互斥")
     @MainActor
     func authorManagementAndRegularBatchAreMutuallyExclusive() async {
@@ -465,7 +613,7 @@ struct LibraryViewModelTests {
         let run = Task { await viewModel.runAuthorRenames() }
 
         await editor.waitUntilRunning()
-        await viewModel.stopAuthorRenames()
+        await viewModel.stopAuthorManagement()
 
         #expect(await editor.stopRequestCount == 1)
         #expect(viewModel.authorManagementState == .stopping(BatchProgress(

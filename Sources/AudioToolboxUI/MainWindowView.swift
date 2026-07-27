@@ -341,7 +341,7 @@ public struct MainWindowView: View {
                 isStopping: false,
                 operationName: "作者修改"
             ) {
-                await viewModel.stopAuthorRenames()
+                await viewModel.stopAuthorManagement()
             }
         case let .stopping(progress):
             BatchProgressSheet(
@@ -349,7 +349,7 @@ public struct MainWindowView: View {
                 isStopping: true,
                 operationName: "作者修改"
             ) {
-                await viewModel.stopAuthorRenames()
+                await viewModel.stopAuthorManagement()
             }
         case let .completed(summary):
             ResultSheet(summary: summary) {
