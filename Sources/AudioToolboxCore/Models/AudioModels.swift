@@ -16,12 +16,20 @@ public struct AudioMetadata: Equatable, Sendable {
     public var title: String?
     public var artists: [String]
     public var albums: [String]
+    public var composers: [String]
     public var duration: TimeInterval?
 
-    public init(title: String?, artists: [String], albums: [String], duration: TimeInterval?) {
+    public init(
+        title: String?,
+        artists: [String],
+        albums: [String],
+        composers: [String] = [],
+        duration: TimeInterval?
+    ) {
         self.title = title
         self.artists = artists
         self.albums = albums
+        self.composers = composers
         self.duration = duration
     }
 
@@ -31,6 +39,10 @@ public struct AudioMetadata: Equatable, Sendable {
 
     public var albumDisplayName: String {
         albums.first?.trimmedNonEmpty ?? "未知专辑"
+    }
+
+    public var composerDisplayName: String {
+        composers.first?.trimmedNonEmpty ?? "未设置"
     }
 }
 

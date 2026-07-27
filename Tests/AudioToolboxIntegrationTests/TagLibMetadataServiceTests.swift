@@ -45,6 +45,7 @@ struct TagLibMetadataServiceTests {
                 #expect(metadata.title == nil, "Unexpected title for \(name)")
                 #expect(metadata.artists.isEmpty, "Unexpected artist for \(name)")
                 #expect(metadata.albums.isEmpty, "Unexpected album for \(name)")
+                #expect(metadata.composers.isEmpty, "Unexpected composer for \(name)")
                 #expect(metadata.artistDisplayName == "未知作者")
                 #expect(metadata.albumDisplayName == "未知专辑")
                 #expect((metadata.duration ?? 0) > 0, "Duration missing for \(name)")
@@ -53,7 +54,11 @@ struct TagLibMetadataServiceTests {
                 do {
                     try await service.write(
                         url: copy,
-                        patch: MetadataPatch(artist: "First Artist", album: "First Album")
+                        patch: MetadataPatch(
+                            artist: "First Artist",
+                            album: "First Album",
+                            composer: "First Composer"
+                        )
                     )
                 } catch {
                     Issue.record("First write failed for \(name): \(error)")
@@ -63,6 +68,74 @@ struct TagLibMetadataServiceTests {
                 let saved = try await service.read(url: copy)
                 #expect(saved.artists.first == "First Artist", "Artist not created for \(name)")
                 #expect(saved.albums.first == "First Album", "Album not created for \(name)")
+                #expect(saved.composers.first == "First Composer", "Composer not created for \(name)")
+            }
+        }
+    }
+
+    @Test("reads and writes composer while preserving non-target metadata")
+    func readsAndWritesComposerInCommonFormats() async throws {
+        let service = TagLibMetadataService()
+
+        for name in writableFixtureNames {
+            try await withFixtureCopy(name) { copy in
+                #expect(setProperty(copy, key: "COMPOSER", value: "Original Composer"))
+                let beforeProperties = try canonicalProperties(
+                    copy,
+                    excludeArtist: false,
+                    excludeAlbum: false,
+                    excludeComposer: true
+                )
+                let beforeUnsupported = try unsupportedData(copy)
+
+                let original = try await service.read(url: copy)
+                #expect(original.composers.first == "Original Composer", "Composer missing for \(name)")
+
+                try await service.write(
+                    url: copy,
+                    patch: MetadataPatch(
+                        artist: nil,
+                        album: nil,
+                        composer: "New Composer"
+                    )
+                )
+
+                let saved = try await service.read(url: copy)
+                #expect(saved.composers.first == "New Composer", "Unexpected composer for \(name)")
+                #expect(saved.artists.first == "Original Artist", "Artist changed for \(name)")
+                #expect(saved.albums.first == "Original Album", "Album changed for \(name)")
+                #expect(saved.title == "Fixture Title", "Title changed for \(name)")
+                #expect(try canonicalProperties(
+                    copy,
+                    excludeArtist: false,
+                    excludeAlbum: false,
+                    excludeComposer: true
+                ) == beforeProperties)
+                #expect(try unsupportedData(copy) == beforeUnsupported)
+            }
+        }
+    }
+
+    @Test("artist-only writes preserve composer")
+    func artistOnlyWritesPreserveComposer() async throws {
+        let service = TagLibMetadataService()
+
+        for name in writableFixtureNames {
+            try await withFixtureCopy(name) { copy in
+                #expect(setProperty(copy, key: "COMPOSER", value: "Preserved Composer"))
+
+                try await service.write(
+                    url: copy,
+                    patch: MetadataPatch(
+                        artist: "Changed Artist",
+                        album: nil,
+                        composer: nil
+                    )
+                )
+
+                let saved = try await service.read(url: copy)
+                #expect(saved.artists.first == "Changed Artist")
+                #expect(saved.composers.first == "Preserved Composer", "Composer changed for \(name)")
             }
         }
     }
@@ -719,6 +792,16 @@ struct TagLibMetadataServiceTests {
         url.path.withCString { ATTestSeedRichMetadata($0, includeUnknownMP3Frame) }
     }
 
+    private func setProperty(_ url: URL, key: String, value: String) -> Bool {
+        url.path.withCString { path in
+            key.withCString { propertyKey in
+                value.withCString { propertyValue in
+                    ATTestSetProperty(path, propertyKey, propertyValue)
+                }
+            }
+        }
+    }
+
     private func propertyValues(_ url: URL, key: String) throws -> String {
         try readTestString(url: url) { path in
             key.withCString { ATTestPropertyValues(path, $0) }
@@ -728,10 +811,16 @@ struct TagLibMetadataServiceTests {
     private func canonicalProperties(
         _ url: URL,
         excludeArtist: Bool,
-        excludeAlbum: Bool
+        excludeAlbum: Bool,
+        excludeComposer: Bool = false
     ) throws -> String {
         try readTestString(url: url) { path in
-            ATTestCanonicalProperties(path, excludeArtist, excludeAlbum)
+            ATTestCanonicalProperties(
+                path,
+                excludeArtist,
+                excludeAlbum,
+                excludeComposer
+            )
         }
     }
 

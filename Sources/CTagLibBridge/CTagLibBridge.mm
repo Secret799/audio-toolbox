@@ -40,7 +40,7 @@ constexpr int32_t ATStatusSaveFailed = 7;
 constexpr size_t ATHeaderProbeSize = 64 * 1024;
 
 ATReadResult EmptyReadResult() {
-    return ATReadResult{0, nullptr, nullptr, nullptr, 0, nullptr};
+    return ATReadResult{0, nullptr, nullptr, nullptr, nullptr, 0, nullptr};
 }
 
 ATWriteResult EmptyWriteResult() {
@@ -51,6 +51,7 @@ void ReleaseReadResult(ATReadResult &result) {
     std::free(result.title);
     std::free(result.artist);
     std::free(result.album);
+    std::free(result.composer);
     std::free(result.error_message);
     result = EmptyReadResult();
 }
@@ -97,6 +98,28 @@ bool CopyTagStrings(const TagLib::Tag &tag, ATReadResult &result) {
     return true;
 }
 
+TagLib::String FirstNonEmptyPropertyValue(
+    const TagLib::PropertyMap &properties,
+    const char *key
+) {
+    const auto iterator = properties.find(TagLib::String(key, TagLib::String::UTF8));
+    if(iterator == properties.end()) {
+        return {};
+    }
+    for(const auto &value : iterator->second) {
+        if(!value.stripWhiteSpace().isEmpty()) {
+            return value;
+        }
+    }
+    return {};
+}
+
+bool CopyComposer(const TagLib::PropertyMap &properties, ATReadResult &result) {
+    const TagLib::String composer = FirstNonEmptyPropertyValue(properties, "COMPOSER");
+    result.composer = DuplicateUTF8(composer);
+    return composer.isEmpty() || result.composer != nullptr;
+}
+
 void AppendLengthPrefixed(std::ostringstream &stream, const std::string &value) {
     stream << value.size() << ':' << value;
 }
@@ -104,12 +127,15 @@ void AppendLengthPrefixed(std::ostringstream &stream, const std::string &value) 
 std::string CanonicalPropertyMap(
     const TagLib::PropertyMap &properties,
     bool exclude_artist,
-    bool exclude_album
+    bool exclude_album,
+    bool exclude_composer
 ) {
     std::vector<std::pair<std::string, std::vector<std::string>>> entries;
     for(auto iterator = properties.cbegin(); iterator != properties.cend(); ++iterator) {
         const std::string key = iterator->first.upper().to8Bit(true);
-        if((exclude_artist && key == "ARTIST") || (exclude_album && key == "ALBUM")) {
+        if((exclude_artist && key == "ARTIST")
+            || (exclude_album && key == "ALBUM")
+            || (exclude_composer && key == "COMPOSER")) {
             continue;
         }
 
@@ -663,6 +689,24 @@ bool HasUnsupportedID3v22(const TagLib::FileRef &file) {
     return id3v2 != nullptr && id3v2->header()->majorVersion() == 2;
 }
 
+bool SetMPEGComposer(TagLib::MPEG::File &mpeg, const char *composer) {
+    TagLib::ID3v2::Tag *tag = mpeg.ID3v2Tag(true);
+    if(tag == nullptr) {
+        return false;
+    }
+    const TagLib::ID3v2::FrameList existing = tag->frameList("TCOM");
+    for(auto *frame : existing) {
+        tag->removeFrame(frame, true);
+    }
+    auto *frame = new TagLib::ID3v2::TextIdentificationFrame(
+        "TCOM",
+        TagLib::String::UTF8
+    );
+    frame->setText(TagLib::String(composer, TagLib::String::UTF8));
+    tag->addFrame(frame);
+    return true;
+}
+
 }  // namespace
 
 ATReadResult ATReadMetadata(const char *path) {
@@ -703,7 +747,8 @@ ATReadResult ATReadMetadata(const char *path) {
             return result;
         }
 
-        if(!CopyTagStrings(*tag, result)) {
+        if(!CopyTagStrings(*tag, result)
+            || !CopyComposer(file.file()->properties(), result)) {
             ReleaseReadResult(result);
             SetError(result, ATStatusAllocationFailure, "读取音频标签时内存分配失败");
             return result;
@@ -763,7 +808,8 @@ bool ATCanWriteMetadata(const char *path) {
 ATWriteResult ATWriteMetadata(
     const char *path,
     const char *artist_or_null,
-    const char *album_or_null
+    const char *album_or_null,
+    const char *composer_or_null
 ) {
     ATWriteResult result = EmptyWriteResult();
 
@@ -804,11 +850,13 @@ ATWriteResult ATWriteMetadata(
 
         const bool changes_artist = artist_or_null != nullptr;
         const bool changes_album = album_or_null != nullptr;
+        const bool changes_composer = composer_or_null != nullptr;
         const TagLib::PropertyMap properties_before = file.file()->properties();
         const std::string non_target_before = CanonicalPropertyMap(
             properties_before,
             changes_artist,
-            changes_album
+            changes_album,
+            changes_composer
         );
         const std::vector<std::string> unsupported_before = CanonicalUnsupportedData(
             properties_before.unsupportedData()
@@ -822,6 +870,10 @@ ATWriteResult ATWriteMetadata(
             }
             if(changes_album) {
                 tag->setAlbum(TagLib::String(album_or_null, TagLib::String::UTF8));
+            }
+            if(changes_composer && !SetMPEGComposer(*mpeg, composer_or_null)) {
+                SetError(result, ATStatusSaveFailed, "作曲者标签无法写入当前音频格式");
+                return result;
             }
         } else {
             TagLib::PropertyMap updated_properties = properties_before;
@@ -838,6 +890,14 @@ ATWriteResult ATWriteMetadata(
                     "ALBUM",
                     TagLib::StringList(
                         TagLib::String(album_or_null, TagLib::String::UTF8)
+                    )
+                );
+            }
+            if(changes_composer) {
+                updated_properties.replace(
+                    "COMPOSER",
+                    TagLib::StringList(
+                        TagLib::String(composer_or_null, TagLib::String::UTF8)
                     )
                 );
             }
@@ -877,7 +937,8 @@ ATWriteResult ATWriteMetadata(
         const std::string non_target_after = CanonicalPropertyMap(
             properties_after,
             changes_artist,
-            changes_album
+            changes_album,
+            changes_composer
         );
         if(non_target_after != non_target_before) {
             SetError(result, ATStatusSaveFailed, "保存改变了非目标标签，已拒绝提交");

@@ -53,12 +53,15 @@ void AppendLengthPrefixed(std::ostringstream &stream, const std::string &value) 
 std::string CanonicalProperties(
     const TagLib::PropertyMap &properties,
     bool exclude_artist,
-    bool exclude_album
+    bool exclude_album,
+    bool exclude_composer
 ) {
     std::vector<std::pair<std::string, std::vector<std::string>>> entries;
     for(auto iterator = properties.cbegin(); iterator != properties.cend(); ++iterator) {
         const std::string key = UTF8(iterator->first.upper());
-        if((exclude_artist && key == "ARTIST") || (exclude_album && key == "ALBUM")) {
+        if((exclude_artist && key == "ARTIST")
+            || (exclude_album && key == "ALBUM")
+            || (exclude_composer && key == "COMPOSER")) {
             continue;
         }
         std::vector<std::string> values;
@@ -219,6 +222,24 @@ bool ATTestSeedRichMetadata(const char *path, bool include_unknown_mp3_frame) {
     }
 }
 
+bool ATTestSetProperty(const char *path, const char *key, const char *value) {
+    try {
+        TagLib::FileRef file(path, true, TagLib::AudioProperties::Accurate);
+        if(!Usable(file) || key == nullptr || value == nullptr) {
+            return false;
+        }
+        TagLib::PropertyMap properties = file.properties();
+        properties.replace(
+            TagLib::String(key, TagLib::String::UTF8).upper(),
+            Values({value})
+        );
+        return file.setProperties(properties).isEmpty() && file.save();
+    }
+    catch(...) {
+        return false;
+    }
+}
+
 char *ATTestPropertyValues(const char *path, const char *key) {
     try {
         const TagLib::FileRef file(path, true, TagLib::AudioProperties::Accurate);
@@ -237,13 +258,23 @@ char *ATTestPropertyValues(const char *path, const char *key) {
     }
 }
 
-char *ATTestCanonicalProperties(const char *path, bool exclude_artist, bool exclude_album) {
+char *ATTestCanonicalProperties(
+    const char *path,
+    bool exclude_artist,
+    bool exclude_album,
+    bool exclude_composer
+) {
     try {
         const TagLib::FileRef file(path, true, TagLib::AudioProperties::Accurate);
         if(!Usable(file)) {
             return nullptr;
         }
-        return Duplicate(CanonicalProperties(file.properties(), exclude_artist, exclude_album));
+        return Duplicate(CanonicalProperties(
+            file.properties(),
+            exclude_artist,
+            exclude_album,
+            exclude_composer
+        ));
     }
     catch(...) {
         return nullptr;

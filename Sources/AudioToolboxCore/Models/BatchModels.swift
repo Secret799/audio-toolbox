@@ -3,15 +3,27 @@ import Foundation
 public struct MetadataPatch: Equatable, Sendable {
     public let artist: String?
     public let album: String?
+    public let composer: String?
 
-    public init(artist: String?, album: String?) {
+    public init(artist: String?, album: String?, composer: String? = nil) {
         self.artist = artist?.trimmedNonEmpty
         self.album = album?.trimmedNonEmpty
+        self.composer = composer?.trimmedNonEmpty
     }
 
-    public static func validated(artist: String?, album: String?) -> MetadataPatch? {
-        let patch = MetadataPatch(artist: artist, album: album)
-        return patch.artist == nil && patch.album == nil ? nil : patch
+    public static func validated(
+        artist: String?,
+        album: String?,
+        composer: String? = nil
+    ) -> MetadataPatch? {
+        let patch = MetadataPatch(
+            artist: artist,
+            album: album,
+            composer: composer
+        )
+        return patch.artist == nil && patch.album == nil && patch.composer == nil
+            ? nil
+            : patch
     }
 }
 

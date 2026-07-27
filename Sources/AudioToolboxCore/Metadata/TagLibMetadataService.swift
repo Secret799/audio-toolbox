@@ -22,6 +22,7 @@ public actor TagLibMetadataService: MetadataService {
             title: result.title.map { String(cString: $0) },
             artists: result.artist.map { [String(cString: $0)] } ?? [],
             albums: result.album.map { [String(cString: $0)] } ?? [],
+            composers: result.composer.map { [String(cString: $0)] } ?? [],
             duration: result.duration_seconds > 0 ? result.duration_seconds : nil
         )
     }
@@ -44,7 +45,9 @@ public actor TagLibMetadataService: MetadataService {
         var result = url.path.withCString { path in
             withOptionalCString(patch.artist) { artist in
                 withOptionalCString(patch.album) { album in
-                    ATWriteMetadata(path, artist, album)
+                    withOptionalCString(patch.composer) { composer in
+                        ATWriteMetadata(path, artist, album, composer)
+                    }
                 }
             }
         }
@@ -70,6 +73,10 @@ public actor TagLibMetadataService: MetadataService {
         }
         if let album = patch.album, savedMetadata.albums.first != album {
             throw MetadataServiceError.verificationFailed("专辑标签写后验证失败")
+        }
+        if let composer = patch.composer,
+           savedMetadata.composers.first != composer {
+            throw MetadataServiceError.verificationFailed("作曲者标签写后验证失败")
         }
     }
 

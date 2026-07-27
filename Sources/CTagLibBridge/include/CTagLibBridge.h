@@ -17,6 +17,7 @@ typedef struct {
     char * _Nullable title;
     char * _Nullable artist;
     char * _Nullable album;
+    char * _Nullable composer;
     double duration_seconds;
     char * _Nullable error_message;
 } ATReadResult;
@@ -48,7 +49,8 @@ bool ATCanWriteMetadata(const char * _Nullable path);
 ATWriteResult ATWriteMetadata(
     const char * _Nullable path,
     const char * _Nullable artist_or_null,
-    const char * _Nullable album_or_null
+    const char * _Nullable album_or_null,
+    const char * _Nullable composer_or_null
 );
 
 /// Releases all strings owned by result and resets its fields to zero/null.
