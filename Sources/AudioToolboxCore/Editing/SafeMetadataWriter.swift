@@ -76,7 +76,7 @@ public actor SafeMetadataWriter: SafeMetadataWriting {
         guard !cancellationFlag.isCancelled else {
             return result(for: url, status: .notProcessed, message: "操作已取消")
         }
-        guard patch.artist != nil || patch.album != nil else {
+        guard patch.artist != nil || patch.album != nil || patch.composer != nil else {
             return result(for: url, status: .failed, message: "没有需要写入的标签")
         }
 
@@ -1114,6 +1114,11 @@ public actor SafeMetadataWriter: SafeMetadataWriting {
            metadata.albums.first != expectedAlbum
         {
             return "写入后验证失败：专辑标签不匹配"
+        }
+        if let expectedComposer = patch.composer,
+           metadata.composers.first != expectedComposer
+        {
+            return "写入后验证失败：作曲者标签不匹配"
         }
         return nil
     }

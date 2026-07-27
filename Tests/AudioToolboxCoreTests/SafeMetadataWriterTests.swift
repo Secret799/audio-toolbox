@@ -6,6 +6,62 @@ import Testing
 @Suite("SafeMetadataWriterTests")
 struct SafeMetadataWriterTests {
     @Test
+    func composerOnlyPatchIsAcceptedAndVerified() async throws {
+        let directory = try TemporaryAudioDirectory()
+        defer { directory.remove() }
+        let original = try directory.createAudioFile()
+        let service = FakeSafeMetadataService()
+        let writer = makeTestWriter(metadataService: service)
+
+        let patch = MetadataPatch(artist: nil, album: nil, composer: "统一作者")
+        let result = await writer.apply(to: original, patch: patch)
+
+        #expect(result.status == .succeeded)
+        #expect(await service.recordedPatches() == [patch])
+        let savedText = try String(contentsOf: original, encoding: .utf8)
+        #expect(savedText.contains("composer=统一作者"))
+    }
+
+    @Test
+    func composerVerificationMismatchRejectsCommit() async throws {
+        let directory = try TemporaryAudioDirectory()
+        defer { directory.remove() }
+        let original = try directory.createAudioFile()
+        let originalBytes = try Data(contentsOf: original)
+        let writer = makeTestWriter(
+            metadataService: FakeSafeMetadataService(mode: .composerVerificationMismatch)
+        )
+
+        let result = await writer.apply(
+            to: original,
+            patch: MetadataPatch(artist: nil, album: nil, composer: "统一作者")
+        )
+
+        #expect(result.status == .failed)
+        #expect(result.message == "写入后验证失败：作曲者标签不匹配")
+        #expect(try Data(contentsOf: original) == originalBytes)
+        #expect(try directory.workDirectories().isEmpty)
+    }
+
+    @Test
+    func artistOnlyPatchPreservesComposer() async throws {
+        let directory = try TemporaryAudioDirectory()
+        defer { directory.remove() }
+        let original = try directory.createAudioFile()
+        let writer = makeTestWriter(metadataService: FakeSafeMetadataService())
+
+        let result = await writer.apply(
+            to: original,
+            patch: MetadataPatch(artist: "新作者", album: nil)
+        )
+
+        #expect(result.status == .succeeded)
+        let savedText = try String(contentsOf: original, encoding: .utf8)
+        #expect(savedText.contains("artist=新作者"))
+        #expect(savedText.contains("composer=原作曲者"))
+    }
+
+    @Test
     func successfulCommitUsesPrivateWorkDirectoryAndPreservesModeXattrAndMetadata() async throws {
         let directory = try TemporaryAudioDirectory()
         defer { directory.remove() }
@@ -1648,6 +1704,7 @@ private actor FakeSafeMetadataService: MetadataService {
         case normal
         case writeFails
         case verificationMismatch
+        case composerVerificationMismatch
         case replaceWorkingFileInode
         case mutateOriginal(URL, Data, Date)
         case corruptWorkingAfterRead(Data)
@@ -1657,6 +1714,7 @@ private actor FakeSafeMetadataService: MetadataService {
     private let mode: Mode
     private let writable: Bool
     private var writeURLs: [URL] = []
+    private var patches: [MetadataPatch] = []
     private var readURLs: [URL] = []
     private var workDirectoryPermissions: UInt16?
 
@@ -1672,6 +1730,9 @@ private actor FakeSafeMetadataService: MetadataService {
             title: fields["title"],
             artists: [mode.isVerificationMismatch ? "验证不匹配" : fields["artist"]].compactMap { $0 },
             albums: fields["album"].map { [$0] } ?? [],
+            composers: [mode.isComposerVerificationMismatch
+                ? "验证不匹配"
+                : fields["composer"]].compactMap { $0 },
             duration: fields["duration"].flatMap(TimeInterval.init)
         )
         if case let .corruptWorkingAfterRead(bytes) = mode {
@@ -1684,6 +1745,7 @@ private actor FakeSafeMetadataService: MetadataService {
 
     func write(url: URL, patch: MetadataPatch) async throws {
         writeURLs.append(url)
+        patches.append(patch)
         let attributes = try FileManager.default.attributesOfItem(
             atPath: url.deletingLastPathComponent().path
         )
@@ -1695,6 +1757,7 @@ private actor FakeSafeMetadataService: MetadataService {
         var fields = try Self.readFields(url)
         if let artist = patch.artist { fields["artist"] = artist }
         if let album = patch.album { fields["album"] = album }
+        if let composer = patch.composer { fields["composer"] = composer }
         if case .replaceWorkingFileInode = mode {
             try Data("atomic replacement\n".utf8).write(to: url, options: .atomic)
             return
@@ -1714,6 +1777,7 @@ private actor FakeSafeMetadataService: MetadataService {
     }
 
     func recordedWriteURLs() -> [URL] { writeURLs }
+    func recordedPatches() -> [MetadataPatch] { patches }
     func recordedReadURLs() -> [URL] { readURLs }
     func recordedWorkDirectoryPermissions() -> UInt16? { workDirectoryPermissions }
 
@@ -1727,7 +1791,7 @@ private actor FakeSafeMetadataService: MetadataService {
     }
 
     private static func encodedFields(_ fields: [String: String]) -> Data {
-        let preferredOrder = ["title", "artist", "album", "duration", "custom"]
+        let preferredOrder = ["title", "artist", "album", "composer", "duration", "custom"]
         let orderedKeys = preferredOrder.filter { fields[$0] != nil }
             + fields.keys.filter { !preferredOrder.contains($0) }.sorted()
         let text = orderedKeys.map { "\($0)=\(fields[$0]!)" }.joined(separator: "\n") + "\n"
@@ -1738,6 +1802,11 @@ private actor FakeSafeMetadataService: MetadataService {
 private extension FakeSafeMetadataService.Mode {
     var isVerificationMismatch: Bool {
         if case .verificationMismatch = self { return true }
+        return false
+    }
+
+    var isComposerVerificationMismatch: Bool {
+        if case .composerVerificationMismatch = self { return true }
         return false
     }
 }
@@ -1757,6 +1826,7 @@ private struct TemporaryAudioDirectory {
         title=原始标题
         artist=原作者
         album=原专辑
+        composer=原作曲者
         duration=123
         custom=必须保留
 
