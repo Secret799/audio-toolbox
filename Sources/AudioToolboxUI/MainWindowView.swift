@@ -339,7 +339,7 @@ public struct MainWindowView: View {
             BatchProgressSheet(
                 progress: progress,
                 isStopping: false,
-                operationName: "作者修改"
+                operationName: authorManagementOperationName
             ) {
                 await viewModel.stopAuthorManagement()
             }
@@ -347,7 +347,7 @@ public struct MainWindowView: View {
             BatchProgressSheet(
                 progress: progress,
                 isStopping: true,
-                operationName: "作者修改"
+                operationName: authorManagementOperationName
             ) {
                 await viewModel.stopAuthorManagement()
             }
@@ -356,6 +356,12 @@ public struct MainWindowView: View {
                 viewModel.closeAuthorManagement()
             }
         }
+    }
+
+    private var authorManagementOperationName: String {
+        viewModel.authorManagementMode == .artistComposerSync
+            ? "作者/作曲者同步"
+            : "作者修改"
     }
 
     private var batchSheetPresented: Binding<Bool> {

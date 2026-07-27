@@ -12,13 +12,22 @@ public struct AuthorManagementSheet: View {
     public var body: some View {
         VStack(spacing: 0) {
             header
+            modePicker
             Divider()
             Group {
                 switch viewModel.authorManagementState {
                 case .editing:
-                    editingContent
+                    if viewModel.authorManagementMode == .rename {
+                        editingContent
+                    } else {
+                        ArtistComposerSyncEditingView(viewModel: viewModel)
+                    }
                 case .previewing:
-                    previewContent
+                    if viewModel.authorManagementMode == .rename {
+                        previewContent
+                    } else {
+                        ArtistComposerSyncPreviewView(viewModel: viewModel)
+                    }
                 case .closed, .running, .stopping, .completed:
                     EmptyView()
                 }
@@ -26,7 +35,8 @@ public struct AuthorManagementSheet: View {
             Divider()
             footer
         }
-        .frame(width: 820, height: 680)
+        .frame(width: sheetWidth, height: 680)
+        .animation(.easeInOut(duration: 0.15), value: viewModel.authorManagementMode)
         .accessibilityElement(children: .contain)
     }
 
@@ -38,17 +48,28 @@ public struct AuthorManagementSheet: View {
             VStack(alignment: .leading, spacing: 3) {
                 Text("作者管理")
                     .font(.title2.weight(.semibold))
-                Text(isPreviewing
-                    ? "第 2 步（共 2 步）：预览并确认"
-                    : "第 1 步（共 2 步）：设置作者映射")
+                Text(headerSubtitle)
                     .foregroundStyle(.secondary)
             }
             Spacer()
-            Text("共 \(viewModel.authorRenameRows.count) 位作者")
+            Text(headerCount)
                 .font(.callout.monospacedDigit())
                 .foregroundStyle(.secondary)
         }
-        .padding(20)
+        .padding(.horizontal, 20)
+        .padding(.top, 20)
+        .padding(.bottom, 12)
+    }
+
+    private var modePicker: some View {
+        Picker("管理方式", selection: modeBinding) {
+            Text("作者重命名").tag(AuthorManagementMode.rename)
+            Text("作者/作曲者同步").tag(AuthorManagementMode.artistComposerSync)
+        }
+        .pickerStyle(.segmented)
+        .frame(width: 360)
+        .disabled(isPreviewing)
+        .padding(.bottom, 14)
     }
 
     private var editingContent: some View {
@@ -284,19 +305,33 @@ public struct AuthorManagementSheet: View {
 
             if isPreviewing {
                 Button("上一步") {
-                    viewModel.returnToAuthorRenameEditing()
+                    if viewModel.authorManagementMode == .rename {
+                        viewModel.returnToAuthorRenameEditing()
+                    } else {
+                        viewModel.returnToArtistComposerEditing()
+                    }
                 }
                 Button("执行修改") {
-                    Task { await viewModel.runAuthorRenames() }
+                    Task {
+                        if viewModel.authorManagementMode == .rename {
+                            await viewModel.runAuthorRenames()
+                        } else {
+                            await viewModel.runArtistComposerSync()
+                        }
+                    }
                 }
                 .keyboardShortcut(.defaultAction)
-                .disabled(!viewModel.canExecuteAuthorRenames)
+                .disabled(!canExecuteCurrentMode)
             } else {
                 Button("下一步") {
-                    viewModel.showAuthorRenamePreview()
+                    if viewModel.authorManagementMode == .rename {
+                        viewModel.showAuthorRenamePreview()
+                    } else {
+                        viewModel.showArtistComposerPreview()
+                    }
                 }
                 .keyboardShortcut(.defaultAction)
-                .disabled(!viewModel.canPreviewAuthorRenames)
+                .disabled(!canPreviewCurrentMode)
             }
         }
         .padding(16)
@@ -305,6 +340,53 @@ public struct AuthorManagementSheet: View {
     private var isPreviewing: Bool {
         if case .previewing = viewModel.authorManagementState { return true }
         return false
+    }
+
+    private var sheetWidth: CGFloat {
+        viewModel.authorManagementMode == .rename ? 820 : 960
+    }
+
+    private var headerSubtitle: String {
+        if isPreviewing {
+            return "第 2 步（共 2 步）：预览并确认"
+        }
+        return viewModel.authorManagementMode == .rename
+            ? "第 1 步（共 2 步）：设置作者映射"
+            : "第 1 步（共 2 步）：统一作者与作曲者"
+    }
+
+    private var headerCount: String {
+        switch viewModel.authorManagementMode {
+        case .rename:
+            "共 \(viewModel.authorRenameRows.count) 位作者"
+        case .artistComposerSync:
+            "共 \(viewModel.artistComposerSyncRows.count) 组不一致"
+        }
+    }
+
+    private var canPreviewCurrentMode: Bool {
+        switch viewModel.authorManagementMode {
+        case .rename:
+            viewModel.canPreviewAuthorRenames
+        case .artistComposerSync:
+            viewModel.canPreviewArtistComposerSync
+        }
+    }
+
+    private var canExecuteCurrentMode: Bool {
+        switch viewModel.authorManagementMode {
+        case .rename:
+            viewModel.canExecuteAuthorRenames
+        case .artistComposerSync:
+            viewModel.canExecuteArtistComposerSync
+        }
+    }
+
+    private var modeBinding: Binding<AuthorManagementMode> {
+        Binding(
+            get: { viewModel.authorManagementMode },
+            set: { viewModel.setAuthorManagementMode($0) }
+        )
     }
 
     private func draftBinding(for author: AuthorIdentity) -> Binding<String> {
