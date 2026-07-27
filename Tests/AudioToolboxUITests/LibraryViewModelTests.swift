@@ -270,6 +270,93 @@ struct LibraryViewModelTests {
         #expect(viewModel.authorSearchText.isEmpty)
     }
 
+    @Test("作者和作曲者同步保留跨标签草稿并按预览计算文件数")
+    @MainActor
+    func artistComposerSyncBuildsDraftsFromSnapshot() async {
+        let same = Self.artistComposerTrack(
+            id: "same",
+            artist: "A",
+            composer: " A "
+        )
+        let artistOnly = Self.artistComposerTrack(
+            id: "artist-only",
+            artist: "B",
+            composer: nil
+        )
+        let composerOnly = Self.artistComposerTrack(
+            id: "composer-only",
+            artist: nil,
+            composer: "C"
+        )
+        let conflict = Self.artistComposerTrack(
+            id: "conflict",
+            artist: "D",
+            composer: "E"
+        )
+        let unavailableConflict = Self.artistComposerTrack(
+            id: "conflict-unavailable",
+            artist: "D",
+            composer: "E",
+            isEditable: false
+        )
+        let scanner = ScriptedScanner(scripts: [[
+            .loaded(same),
+            .loaded(artistOnly),
+            .loaded(composerOnly),
+            .loaded(conflict),
+            .loaded(unavailableConflict),
+            .finished,
+        ]])
+        let viewModel = makeViewModel(scanner: scanner)
+        await viewModel.loadDirectory(firstRoot)
+
+        viewModel.openAuthorManagement()
+        viewModel.setAuthorManagementMode(.artistComposerSync)
+
+        #expect(viewModel.authorManagementMode == .artistComposerSync)
+        #expect(viewModel.artistComposerSyncRows.count == 3)
+        viewModel.artistComposerAuthority = .artist
+        viewModel.applyArtistComposerAuthorityToAll()
+
+        let artistOnlyID = ArtistComposerIdentity(artist: "B", composer: nil)
+        let composerOnlyID = ArtistComposerIdentity(artist: nil, composer: "C")
+        let conflictID = ArtistComposerIdentity(artist: "D", composer: "E")
+        #expect(viewModel.artistComposerDrafts[artistOnlyID] == "B")
+        #expect(viewModel.artistComposerDrafts[composerOnlyID] == "C")
+        #expect(viewModel.artistComposerDrafts[conflictID] == "D")
+
+        viewModel.artistComposerSearchText = "C"
+        #expect(viewModel.filteredArtistComposerSyncRows.map(\.id) == [composerOnlyID])
+        #expect(viewModel.artistComposerDrafts[conflictID] == "D")
+
+        viewModel.setAuthorManagementMode(.rename)
+        viewModel.setAuthorManagementMode(.artistComposerSync)
+        #expect(viewModel.artistComposerDrafts[conflictID] == "D")
+
+        viewModel.setArtistComposerDraft(" Manual ", for: conflictID)
+        #expect(viewModel.artistComposerSyncPreviews.first(where: {
+            $0.id == conflictID
+        })?.unifiedValue == "Manual")
+        #expect(viewModel.artistComposerSyncGroupCount == 3)
+        #expect(viewModel.artistComposerSyncFileCount == 3)
+        #expect(viewModel.canPreviewArtistComposerSync)
+
+        viewModel.showArtistComposerPreview()
+        #expect(viewModel.authorManagementState == .previewing)
+        #expect(!viewModel.artistComposerAcknowledgedNoBackup)
+        #expect(!viewModel.canExecuteArtistComposerSync)
+
+        viewModel.artistComposerAcknowledgedNoBackup = true
+        #expect(viewModel.canExecuteArtistComposerSync)
+        viewModel.returnToArtistComposerEditing()
+        #expect(viewModel.authorManagementState == .editing)
+
+        viewModel.closeAuthorManagement()
+        #expect(viewModel.authorManagementMode == .rename)
+        #expect(viewModel.artistComposerDrafts.isEmpty)
+        #expect(viewModel.artistComposerSearchText.isEmpty)
+    }
+
     @Test("作者管理与普通批量编辑互斥")
     @MainActor
     func authorManagementAndRegularBatchAreMutuallyExclusive() async {
@@ -2252,6 +2339,30 @@ struct LibraryViewModelTests {
             fileSize: 1_024,
             modificationDate: Date(timeIntervalSince1970: 1_700_000_000),
             isWritable: true,
+            issue: nil
+        )
+    }
+
+    private static func artistComposerTrack(
+        id: String,
+        artist: String?,
+        composer: String?,
+        isEditable: Bool = true
+    ) -> AudioTrack {
+        AudioTrack(
+            id: FileIdentity(rawValue: id),
+            url: URL(fileURLWithPath: "/virtual/library-one/\(id).mp3"),
+            format: .mp3,
+            metadata: AudioMetadata(
+                title: id,
+                artists: artist.map { [$0] } ?? [],
+                albums: ["Album"],
+                composers: composer.map { [$0] } ?? [],
+                duration: 120
+            ),
+            fileSize: 1_024,
+            modificationDate: Date(timeIntervalSince1970: 1_700_000_000),
+            isWritable: isEditable,
             issue: nil
         )
     }

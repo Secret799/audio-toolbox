@@ -44,6 +44,11 @@ public enum AuthorManagementState: Equatable, Sendable {
     case completed(BatchEditSummary)
 }
 
+public enum AuthorManagementMode: Hashable, Sendable {
+    case rename
+    case artistComposerSync
+}
+
 public enum BatchFieldInitialState: Equatable, Sendable {
     case common(String)
     case mixed
@@ -127,9 +132,14 @@ public final class LibraryViewModel: ObservableObject {
     }
     @Published public private(set) var batchState: BatchSheetState = .closed
     @Published public private(set) var authorManagementState: AuthorManagementState = .closed
+    @Published public private(set) var authorManagementMode: AuthorManagementMode = .rename
     @Published public var authorSearchText = ""
     @Published public private(set) var authorRenameDrafts: [AuthorIdentity: String] = [:]
     @Published public var authorRenameAcknowledgedNoBackup = false
+    @Published public var artistComposerSearchText = ""
+    @Published public var artistComposerAuthority: ArtistComposerAuthority = .artist
+    @Published public private(set) var artistComposerDrafts: [ArtistComposerIdentity: String] = [:]
+    @Published public var artistComposerAcknowledgedNoBackup = false
     @Published public var batchArtist = "" {
         didSet {
             if batchArtist != oldValue {
@@ -237,15 +247,59 @@ public final class LibraryViewModel: ObservableObject {
     }
 
     public var canPreviewAuthorRenames: Bool {
-        guard case .editing = authorManagementState else { return false }
+        guard authorManagementMode == .rename,
+              case .editing = authorManagementState else { return false }
         return !effectiveAuthorRenameOperations.isEmpty
     }
 
     public var canExecuteAuthorRenames: Bool {
-        guard case .previewing = authorManagementState else { return false }
+        guard authorManagementMode == .rename,
+              case .previewing = authorManagementState else { return false }
         return authorRenameAcknowledgedNoBackup
             && !effectiveAuthorRenameOperations.isEmpty
             && authorRenameOperationsAreCurrentlyEditable
+    }
+
+    public var artistComposerSyncRows: [ArtistComposerSyncRow] {
+        ArtistComposerSyncPlanner.rows(from: authorRenameSnapshot)
+    }
+
+    public var filteredArtistComposerSyncRows: [ArtistComposerSyncRow] {
+        let query = artistComposerSearchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { return artistComposerSyncRows }
+        return artistComposerSyncRows.filter { row in
+            row.artistDisplayName.localizedStandardContains(query)
+                || row.composerDisplayName.localizedStandardContains(query)
+        }
+    }
+
+    public var artistComposerSyncPreviews: [ArtistComposerSyncPreview] {
+        ArtistComposerSyncPlanner.previews(
+            tracks: authorRenameSnapshot,
+            drafts: artistComposerDrafts
+        )
+    }
+
+    public var artistComposerSyncGroupCount: Int {
+        artistComposerSyncPreviews.count
+    }
+
+    public var artistComposerSyncFileCount: Int {
+        artistComposerSyncPreviews.reduce(0) { $0 + $1.editableCount }
+    }
+
+    public var canPreviewArtistComposerSync: Bool {
+        guard authorManagementMode == .artistComposerSync,
+              case .editing = authorManagementState else { return false }
+        return !effectiveArtistComposerSyncOperations.isEmpty
+    }
+
+    public var canExecuteArtistComposerSync: Bool {
+        guard authorManagementMode == .artistComposerSync,
+              case .previewing = authorManagementState else { return false }
+        return artistComposerAcknowledgedNoBackup
+            && !effectiveArtistComposerSyncOperations.isEmpty
+            && artistComposerSyncOperationsAreCurrentlyEditable
     }
 
     public var batchEditTracks: [AudioTrack] {
@@ -709,9 +763,14 @@ public final class LibraryViewModel: ObservableObject {
     public func openAuthorManagement() {
         guard canOpenAuthorManagement else { return }
         authorRenameSnapshot = tracks
+        authorManagementMode = .rename
         authorRenameDrafts = [:]
         authorSearchText = ""
         authorRenameAcknowledgedNoBackup = false
+        artistComposerDrafts = [:]
+        artistComposerSearchText = ""
+        artistComposerAuthority = .artist
+        artistComposerAcknowledgedNoBackup = false
         authorManagementState = .editing
     }
 
@@ -720,12 +779,22 @@ public final class LibraryViewModel: ObservableObject {
         case .editing, .previewing, .completed:
             authorManagementState = .closed
             authorRenameSnapshot = []
+            authorManagementMode = .rename
             authorRenameDrafts = [:]
             authorSearchText = ""
             authorRenameAcknowledgedNoBackup = false
+            artistComposerDrafts = [:]
+            artistComposerSearchText = ""
+            artistComposerAuthority = .artist
+            artistComposerAcknowledgedNoBackup = false
         case .closed, .running, .stopping:
             return
         }
+    }
+
+    public func setAuthorManagementMode(_ mode: AuthorManagementMode) {
+        guard case .editing = authorManagementState else { return }
+        authorManagementMode = mode
     }
 
     public func setAuthorRenameDraft(
@@ -737,6 +806,26 @@ public final class LibraryViewModel: ObservableObject {
         authorRenameAcknowledgedNoBackup = false
     }
 
+    public func applyArtistComposerAuthorityToAll() {
+        guard authorManagementMode == .artistComposerSync,
+              case .editing = authorManagementState else { return }
+        artistComposerDrafts = ArtistComposerSyncPlanner.automaticDrafts(
+            rows: artistComposerSyncRows,
+            authority: artistComposerAuthority
+        )
+        artistComposerAcknowledgedNoBackup = false
+    }
+
+    public func setArtistComposerDraft(
+        _ value: String,
+        for identity: ArtistComposerIdentity
+    ) {
+        guard authorManagementMode == .artistComposerSync,
+              case .editing = authorManagementState else { return }
+        artistComposerDrafts[identity] = value
+        artistComposerAcknowledgedNoBackup = false
+    }
+
     public func showAuthorRenamePreview() {
         guard canPreviewAuthorRenames else { return }
         authorRenameAcknowledgedNoBackup = false
@@ -744,8 +833,22 @@ public final class LibraryViewModel: ObservableObject {
     }
 
     public func returnToAuthorRenameEditing() {
-        guard case .previewing = authorManagementState else { return }
+        guard authorManagementMode == .rename,
+              case .previewing = authorManagementState else { return }
         authorRenameAcknowledgedNoBackup = false
+        authorManagementState = .editing
+    }
+
+    public func showArtistComposerPreview() {
+        guard canPreviewArtistComposerSync else { return }
+        artistComposerAcknowledgedNoBackup = false
+        authorManagementState = .previewing
+    }
+
+    public func returnToArtistComposerEditing() {
+        guard authorManagementMode == .artistComposerSync,
+              case .previewing = authorManagementState else { return }
+        artistComposerAcknowledgedNoBackup = false
         authorManagementState = .editing
     }
 
@@ -1104,6 +1207,20 @@ public final class LibraryViewModel: ObservableObject {
     private var authorRenameOperationsAreCurrentlyEditable: Bool {
         let currentTracks = Dictionary(uniqueKeysWithValues: tracks.map { ($0.id, $0) })
         return effectiveAuthorRenameOperations.allSatisfy { operation in
+            currentTracks[operation.target.fileIdentity]?.isEditable == true
+        }
+    }
+
+    private var effectiveArtistComposerSyncOperations: [BatchEditOperation] {
+        ArtistComposerSyncPlanner.operations(
+            tracks: authorRenameSnapshot,
+            drafts: artistComposerDrafts
+        )
+    }
+
+    private var artistComposerSyncOperationsAreCurrentlyEditable: Bool {
+        let currentTracks = Dictionary(uniqueKeysWithValues: tracks.map { ($0.id, $0) })
+        return effectiveArtistComposerSyncOperations.allSatisfy { operation in
             currentTracks[operation.target.fileIdentity]?.isEditable == true
         }
     }
