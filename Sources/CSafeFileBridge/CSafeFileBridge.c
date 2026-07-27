@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/acl.h>
+#include <sys/param.h>
 #include <sys/stat.h>
 #include <sys/xattr.h>
 #include <unistd.h>
@@ -232,14 +233,21 @@ int32_t ATSFFullSyncFD(int32_t fd) {
     return result == 0 ? 0 : errno;
 }
 
-ATSFCopyResult ATSFCopyFileToDirectory(
-    const char *source_path,
-    int32_t directory_fd,
+int32_t ATSFPathForFD(int32_t fd, char *buffer, size_t buffer_size) {
+    if(fd < 0 || buffer == NULL || buffer_size < MAXPATHLEN) {
+        return EINVAL;
+    }
+    return fcntl(fd, F_GETPATH, buffer) == 0 ? 0 : errno;
+}
+
+static ATSFCopyResult ATSFCopyOpenFileToDirectory(
+    int source_fd,
+    int32_t destination_directory_fd,
     const char *destination_name,
     ATSFCancellationFlag *cancellation_flag
 ) {
     ATSFCopyResult result = {-1, EINVAL, -1};
-    if(source_path == NULL || destination_name == NULL || directory_fd < 0) {
+    if(source_fd < 0 || destination_name == NULL || destination_directory_fd < 0) {
         return result;
     }
     if(ATSFCancellationFlagIsCancelled(cancellation_flag)) {
@@ -247,20 +255,14 @@ ATSFCopyResult ATSFCopyFileToDirectory(
         return result;
     }
 
-    int source_fd = open(source_path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
-    if(source_fd < 0) {
-        result.error_code = errno;
-        return result;
-    }
     int destination_fd = openat(
-        directory_fd,
+        destination_directory_fd,
         destination_name,
         O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
         0600
     );
     if(destination_fd < 0) {
         result.error_code = errno;
-        close(source_fd);
         return result;
     }
 
@@ -269,7 +271,6 @@ ATSFCopyResult ATSFCopyFileToDirectory(
         result.error_code = ENOMEM;
         result.destination_fd = fcntl(destination_fd, F_DUPFD_CLOEXEC, 0);
         close(destination_fd);
-        close(source_fd);
         return result;
     }
 
@@ -287,7 +288,6 @@ ATSFCopyResult ATSFCopyFileToDirectory(
         result.destination_fd = fcntl(destination_fd, F_DUPFD_CLOEXEC, 0);
         copyfile_state_free(state);
         close(destination_fd);
-        close(source_fd);
         return result;
     }
 
@@ -323,7 +323,6 @@ ATSFCopyResult ATSFCopyFileToDirectory(
     if(destination_fd >= 0) {
         close(destination_fd);
     }
-    close(source_fd);
 
     if(ATSFCancellationFlagIsCancelled(cancellation_flag)) {
         result.error_code = ECANCELED;
@@ -340,6 +339,72 @@ ATSFCopyResult ATSFCopyFileToDirectory(
 
     result.status = 0;
     result.error_code = 0;
+    return result;
+}
+
+ATSFCopyResult ATSFCopyFileToDirectory(
+    const char *source_path,
+    int32_t directory_fd,
+    const char *destination_name,
+    ATSFCancellationFlag *cancellation_flag
+) {
+    ATSFCopyResult result = {-1, EINVAL, -1};
+    if(source_path == NULL || destination_name == NULL || directory_fd < 0) {
+        return result;
+    }
+    if(ATSFCancellationFlagIsCancelled(cancellation_flag)) {
+        result.error_code = ECANCELED;
+        return result;
+    }
+    int source_fd = open(source_path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if(source_fd < 0) {
+        result.error_code = errno;
+        return result;
+    }
+    result = ATSFCopyOpenFileToDirectory(
+        source_fd,
+        directory_fd,
+        destination_name,
+        cancellation_flag
+    );
+    close(source_fd);
+    return result;
+}
+
+ATSFCopyResult ATSFCopyFileBetweenDirectories(
+    int32_t source_directory_fd,
+    const char *source_name,
+    int32_t destination_directory_fd,
+    const char *destination_name,
+    ATSFCancellationFlag *cancellation_flag
+) {
+    ATSFCopyResult result = {-1, EINVAL, -1};
+    if(source_directory_fd < 0
+        || source_name == NULL
+        || destination_directory_fd < 0
+        || destination_name == NULL) {
+        return result;
+    }
+    if(ATSFCancellationFlagIsCancelled(cancellation_flag)) {
+        result.error_code = ECANCELED;
+        return result;
+    }
+    int source_fd = openat(
+        source_directory_fd,
+        source_name,
+        O_RDONLY | O_NOFOLLOW | O_CLOEXEC
+    );
+    if(source_fd < 0) {
+        result.error_code = errno;
+        return result;
+    }
+    result = ATSFCopyOpenFileToDirectory(
+        source_fd,
+        destination_directory_fd,
+        destination_name,
+        cancellation_flag
+    );
+    close(source_fd);
     return result;
 }
 

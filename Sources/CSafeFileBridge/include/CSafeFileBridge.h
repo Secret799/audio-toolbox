@@ -38,6 +38,7 @@ void ATSFCancellationFlagRelease(ATSFCancellationFlag * _Nullable flag);
 
 /// Uses F_FULLFSYNC when supported and falls back to fsync. Returns 0 or errno.
 int32_t ATSFFullSyncFD(int32_t fd);
+int32_t ATSFPathForFD(int32_t fd, char * _Nullable buffer, size_t buffer_size);
 
 /// Opens source with O_NOFOLLOW, creates destination with openat(O_EXCL |
 /// O_NOFOLLOW) relative to directory_fd, then copies all data and metadata with
@@ -49,6 +50,16 @@ int32_t ATSFFullSyncFD(int32_t fd);
 ATSFCopyResult ATSFCopyFileToDirectory(
     const char * _Nullable source_path,
     int32_t directory_fd,
+    const char * _Nullable destination_name,
+    ATSFCancellationFlag * _Nullable cancellation_flag
+);
+
+/// Opens both source and destination relative to owned directory descriptors.
+/// Destination creation remains exclusive and never overwrites an existing entry.
+ATSFCopyResult ATSFCopyFileBetweenDirectories(
+    int32_t source_directory_fd,
+    const char * _Nullable source_name,
+    int32_t destination_directory_fd,
     const char * _Nullable destination_name,
     ATSFCancellationFlag * _Nullable cancellation_flag
 );

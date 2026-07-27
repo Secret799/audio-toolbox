@@ -67,6 +67,23 @@ struct SafeMetadataFileSnapshot: Equatable, Sendable {
             && fileSystemMetadata == expected.fileSystemMetadata
     }
 
+    func isEquivalentQuarantineMove(to source: Self) -> Bool {
+        let permittedFlags = source.nodeState.flags | UInt32(UF_HIDDEN)
+        return nodeState.size == source.nodeState.size
+            && nodeState.modificationSeconds == source.nodeState.modificationSeconds
+            && nodeState.modificationNanoseconds == source.nodeState.modificationNanoseconds
+            && nodeState.mode == source.nodeState.mode
+            && nodeState.ownerID == source.nodeState.ownerID
+            && nodeState.groupID == source.nodeState.groupID
+            && (nodeState.flags == source.nodeState.flags
+                || nodeState.flags == permittedFlags)
+            && nodeState.linkCount == 1
+            && digest == source.digest
+            && fileSystemMetadata.isEquivalentCopyMetadata(
+                to: source.fileSystemMetadata
+            )
+    }
+
     // renameatx_np(RENAME_SWAP) legitimately advances ctime for both inodes.
     // Post-swap comparisons retain every other stat field plus SHA-256.
     func matchesAfterRename(_ expected: Self) -> Bool {
@@ -353,10 +370,15 @@ final class SafeMetadataWorkspace: @unchecked Sendable {
     let fileURL: URL
     let directoryName: String
     let fileName: String
+    let originalFileName: String
+    let recoveryFileName: String
+    let rollbackFileName: String
+    let partialFileName: String
     let parentDirectoryFD: Int32
     let directoryFD: Int32
     let parentDirectoryIdentity: SafeMetadataFileIdentity
     let directoryIdentity: SafeMetadataFileIdentity
+    let supportsStableFileIdentity: Bool
 
     private let closeLock = NSLock()
     private var isClosed = false
@@ -367,20 +389,42 @@ final class SafeMetadataWorkspace: @unchecked Sendable {
         fileURL: URL,
         directoryName: String,
         fileName: String,
+        originalFileName: String,
         parentDirectoryFD: Int32,
         directoryFD: Int32,
         parentDirectoryIdentity: SafeMetadataFileIdentity,
-        directoryIdentity: SafeMetadataFileIdentity
+        directoryIdentity: SafeMetadataFileIdentity,
+        supportsStableFileIdentity: Bool
     ) {
         self.parentDirectoryURL = parentDirectoryURL
         self.directoryURL = directoryURL
         self.fileURL = fileURL
         self.directoryName = directoryName
         self.fileName = fileName
+        self.originalFileName = originalFileName
+        recoveryFileName = Self.originalRecoveryFileName(for: fileName)
+        rollbackFileName = Self.rollbackFileName(for: fileName)
+        partialFileName = Self.partialFileName(for: fileName)
         self.parentDirectoryFD = parentDirectoryFD
         self.directoryFD = directoryFD
         self.parentDirectoryIdentity = parentDirectoryIdentity
         self.directoryIdentity = directoryIdentity
+        self.supportsStableFileIdentity = supportsStableFileIdentity
+    }
+
+    private static func originalRecoveryFileName(for workingFileName: String) -> String {
+        let fileExtension = URL(fileURLWithPath: workingFileName).pathExtension
+        return fileExtension.isEmpty ? "recovery" : "recovery.\(fileExtension)"
+    }
+
+    private static func rollbackFileName(for workingFileName: String) -> String {
+        let fileExtension = URL(fileURLWithPath: workingFileName).pathExtension
+        return fileExtension.isEmpty ? "rollback-current" : "rollback-current.\(fileExtension)"
+    }
+
+    private static func partialFileName(for workingFileName: String) -> String {
+        let fileExtension = URL(fileURLWithPath: workingFileName).pathExtension
+        return fileExtension.isEmpty ? "partial" : "partial.\(fileExtension)"
     }
 
     deinit {
@@ -394,6 +438,19 @@ final class SafeMetadataWorkspace: @unchecked Sendable {
             Darwin.close(directoryFD)
             Darwin.close(parentDirectoryFD)
         }
+    }
+
+    func currentDirectoryURL() -> URL {
+        var path = [CChar](repeating: 0, count: Int(MAXPATHLEN))
+        let result = path.withUnsafeMutableBufferPointer { buffer in
+            ATSFPathForFD(directoryFD, buffer.baseAddress, buffer.count)
+        }
+        guard result == 0 else { return directoryURL }
+        let end = path.firstIndex(of: 0) ?? path.endIndex
+        return URL(
+            fileURLWithPath: String(decoding: path[..<end].map(UInt8.init), as: UTF8.self),
+            isDirectory: true
+        )
     }
 }
 
@@ -417,10 +474,15 @@ struct SafeMetadataFileOperations: @unchecked Sendable {
         SafeMetadataWorkspace,
         SafeMetadataCancellationFlag
     ) throws -> SafeMetadataFileSnapshot
+    let snapshotOriginal: (
+        SafeMetadataWorkspace,
+        SafeMetadataCancellationFlag
+    ) throws -> SafeMetadataFileSnapshot
     let validateWorkspacePath: (
         SafeMetadataWorkspace,
         SafeMetadataFileIdentity
     ) throws -> Void
+    let validateOriginalParentPath: (SafeMetadataWorkspace) throws -> Void
     let isReadable: (URL) -> Bool
     let isWritable: (URL) -> Bool
     let coordinateReplacing: (
@@ -429,16 +491,38 @@ struct SafeMetadataFileOperations: @unchecked Sendable {
         (URL, URL) throws -> Void
     ) throws -> Void
     let swap: (URL, URL) throws -> Void
+    let moveOriginalToWorkspaceEntry: (SafeMetadataWorkspace, String) throws -> Void
+    let copyWorkspaceEntryToOriginal: (
+        SafeMetadataWorkspace,
+        String,
+        SafeMetadataCancellationFlag
+    ) throws -> SafeMetadataFileNodeState
+    let snapshotWorkspaceEntry: (
+        SafeMetadataWorkspace,
+        String,
+        SafeMetadataCancellationFlag
+    ) throws -> SafeMetadataFileSnapshot
+    let syncWorkspaceEntry: (
+        SafeMetadataWorkspace,
+        String,
+        SafeMetadataFileIdentity
+    ) throws -> Void
     let syncWorkspaceFile: (
         SafeMetadataWorkspace,
         SafeMetadataFileIdentity
     ) throws -> Void
     let syncWorkspaceDirectory: (SafeMetadataWorkspace) throws -> Void
     let syncURLFile: (URL, SafeMetadataFileIdentity) throws -> Void
+    let syncOriginal: (SafeMetadataWorkspace, SafeMetadataFileIdentity) throws -> Void
     let syncParentDirectory: (SafeMetadataWorkspace) throws -> Void
     let removeWorkspaceFileIfOwned: (
         SafeMetadataWorkspace,
         SafeMetadataFileIdentity
+    ) -> SafeMetadataConditionalRemoval
+    let removeWorkspaceEntryIfOwned: (
+        SafeMetadataWorkspace,
+        String,
+        SafeMetadataFileSnapshot
     ) -> SafeMetadataConditionalRemoval
     let removeWorkspaceDirectoryIfOwned: (
         SafeMetadataWorkspace
@@ -450,7 +534,9 @@ struct SafeMetadataFileOperations: @unchecked Sendable {
             copyIntoWorkspace: copyIntoWorkspace,
             snapshotURL: snapshotURL,
             snapshotWorkspace: snapshotWorkspace,
+            snapshotOriginal: snapshotOriginal,
             validateWorkspacePath: validateWorkspacePath,
+            validateOriginalParentPath: validateOriginalParentPath,
             isReadable: { url in
                 url.path.withCString { access($0, R_OK) == 0 }
             },
@@ -459,14 +545,28 @@ struct SafeMetadataFileOperations: @unchecked Sendable {
             },
             coordinateReplacing: coordinateReplacing,
             swap: swap,
+            moveOriginalToWorkspaceEntry: moveOriginalToWorkspaceEntry,
+            copyWorkspaceEntryToOriginal: copyWorkspaceEntryToOriginal,
+            snapshotWorkspaceEntry: snapshotWorkspaceEntry,
+            syncWorkspaceEntry: syncWorkspaceEntry,
             syncWorkspaceFile: syncWorkspaceFile,
             syncWorkspaceDirectory: syncWorkspaceDirectory,
             syncURLFile: syncURLFile,
+            syncOriginal: syncOriginal,
             syncParentDirectory: syncParentDirectory,
             removeWorkspaceFileIfOwned: { workspace, expectedIdentity in
                 removeWorkspaceFileIfOwnedForTesting(
                     workspace,
                     expectedIdentity: expectedIdentity,
+                    afterQuarantineValidation: { _ in }
+                )
+            },
+            removeWorkspaceEntryIfOwned: { workspace, entryName, expectedSnapshot in
+                removeWorkspaceEntryIfOwned(
+                    workspace,
+                    entryName: entryName,
+                    expectedIdentity: expectedSnapshot.nodeState.identity,
+                    expectedSnapshot: expectedSnapshot,
                     afterQuarantineValidation: { _ in }
                 )
             },
@@ -484,16 +584,24 @@ struct SafeMetadataFileOperations: @unchecked Sendable {
         copyIntoWorkspace: ((URL, SafeMetadataWorkspace, SafeMetadataCancellationFlag) throws -> SafeMetadataFileNodeState)? = nil,
         snapshotURL: ((URL, SafeMetadataCancellationFlag) throws -> SafeMetadataFileSnapshot)? = nil,
         snapshotWorkspace: ((SafeMetadataWorkspace, SafeMetadataCancellationFlag) throws -> SafeMetadataFileSnapshot)? = nil,
+        snapshotOriginal: ((SafeMetadataWorkspace, SafeMetadataCancellationFlag) throws -> SafeMetadataFileSnapshot)? = nil,
         validateWorkspacePath: ((SafeMetadataWorkspace, SafeMetadataFileIdentity) throws -> Void)? = nil,
+        validateOriginalParentPath: ((SafeMetadataWorkspace) throws -> Void)? = nil,
         isReadable: ((URL) -> Bool)? = nil,
         isWritable: ((URL) -> Bool)? = nil,
         coordinateReplacing: ((URL, URL, (URL, URL) throws -> Void) throws -> Void)? = nil,
         swap: ((URL, URL) throws -> Void)? = nil,
+        moveOriginalToWorkspaceEntry: ((SafeMetadataWorkspace, String) throws -> Void)? = nil,
+        copyWorkspaceEntryToOriginal: ((SafeMetadataWorkspace, String, SafeMetadataCancellationFlag) throws -> SafeMetadataFileNodeState)? = nil,
+        snapshotWorkspaceEntry: ((SafeMetadataWorkspace, String, SafeMetadataCancellationFlag) throws -> SafeMetadataFileSnapshot)? = nil,
+        syncWorkspaceEntry: ((SafeMetadataWorkspace, String, SafeMetadataFileIdentity) throws -> Void)? = nil,
         syncWorkspaceFile: ((SafeMetadataWorkspace, SafeMetadataFileIdentity) throws -> Void)? = nil,
         syncWorkspaceDirectory: ((SafeMetadataWorkspace) throws -> Void)? = nil,
         syncURLFile: ((URL, SafeMetadataFileIdentity) throws -> Void)? = nil,
+        syncOriginal: ((SafeMetadataWorkspace, SafeMetadataFileIdentity) throws -> Void)? = nil,
         syncParentDirectory: ((SafeMetadataWorkspace) throws -> Void)? = nil,
         removeWorkspaceFileIfOwned: ((SafeMetadataWorkspace, SafeMetadataFileIdentity) -> SafeMetadataConditionalRemoval)? = nil,
+        removeWorkspaceEntryIfOwned: ((SafeMetadataWorkspace, String, SafeMetadataFileSnapshot) -> SafeMetadataConditionalRemoval)? = nil,
         removeWorkspaceDirectoryIfOwned: ((SafeMetadataWorkspace) -> SafeMetadataConditionalRemoval)? = nil
     ) -> Self {
         Self(
@@ -501,16 +609,24 @@ struct SafeMetadataFileOperations: @unchecked Sendable {
             copyIntoWorkspace: copyIntoWorkspace ?? self.copyIntoWorkspace,
             snapshotURL: snapshotURL ?? self.snapshotURL,
             snapshotWorkspace: snapshotWorkspace ?? self.snapshotWorkspace,
+            snapshotOriginal: snapshotOriginal ?? self.snapshotOriginal,
             validateWorkspacePath: validateWorkspacePath ?? self.validateWorkspacePath,
+            validateOriginalParentPath: validateOriginalParentPath ?? self.validateOriginalParentPath,
             isReadable: isReadable ?? self.isReadable,
             isWritable: isWritable ?? self.isWritable,
             coordinateReplacing: coordinateReplacing ?? self.coordinateReplacing,
             swap: swap ?? self.swap,
+            moveOriginalToWorkspaceEntry: moveOriginalToWorkspaceEntry ?? self.moveOriginalToWorkspaceEntry,
+            copyWorkspaceEntryToOriginal: copyWorkspaceEntryToOriginal ?? self.copyWorkspaceEntryToOriginal,
+            snapshotWorkspaceEntry: snapshotWorkspaceEntry ?? self.snapshotWorkspaceEntry,
+            syncWorkspaceEntry: syncWorkspaceEntry ?? self.syncWorkspaceEntry,
             syncWorkspaceFile: syncWorkspaceFile ?? self.syncWorkspaceFile,
             syncWorkspaceDirectory: syncWorkspaceDirectory ?? self.syncWorkspaceDirectory,
             syncURLFile: syncURLFile ?? self.syncURLFile,
+            syncOriginal: syncOriginal ?? self.syncOriginal,
             syncParentDirectory: syncParentDirectory ?? self.syncParentDirectory,
             removeWorkspaceFileIfOwned: removeWorkspaceFileIfOwned ?? self.removeWorkspaceFileIfOwned,
+            removeWorkspaceEntryIfOwned: removeWorkspaceEntryIfOwned ?? self.removeWorkspaceEntryIfOwned,
             removeWorkspaceDirectoryIfOwned: removeWorkspaceDirectoryIfOwned ?? self.removeWorkspaceDirectoryIfOwned
         )
     }
@@ -596,11 +712,18 @@ struct SafeMetadataFileOperations: @unchecked Sendable {
             fileURL: directoryURL.appendingPathComponent(fileName),
             directoryName: directoryName,
             fileName: fileName,
+            originalFileName: originalURL.lastPathComponent,
             parentDirectoryFD: parentFD,
             directoryFD: directoryFD,
             parentDirectoryIdentity: parentState.identity,
-            directoryIdentity: directoryState.identity
+            directoryIdentity: directoryState.identity,
+            supportsStableFileIdentity: Self.supportsStableFileIdentity(at: parentURL)
         )
+    }
+
+    private static func supportsStableFileIdentity(at url: URL) -> Bool {
+        let values = try? url.resourceValues(forKeys: [.volumeSupportsPersistentIDsKey])
+        return values?.volumeSupportsPersistentIDs ?? true
     }
 
     private static func copyIntoWorkspace(
@@ -688,12 +811,48 @@ struct SafeMetadataFileOperations: @unchecked Sendable {
         workspace: SafeMetadataWorkspace,
         cancellationFlag: SafeMetadataCancellationFlag
     ) throws -> SafeMetadataFileSnapshot {
+        try snapshotWorkspaceEntry(
+            workspace: workspace,
+            entryName: workspace.fileName,
+            cancellationFlag: cancellationFlag
+        )
+    }
+
+    private static func snapshotWorkspaceEntry(
+        workspace: SafeMetadataWorkspace,
+        entryName: String,
+        cancellationFlag: SafeMetadataCancellationFlag
+    ) throws -> SafeMetadataFileSnapshot {
+        try snapshotEntry(
+            directoryFD: workspace.directoryFD,
+            entryName: entryName,
+            cancellationFlag: cancellationFlag
+        )
+    }
+
+    private static func snapshotOriginal(
+        workspace: SafeMetadataWorkspace,
+        cancellationFlag: SafeMetadataCancellationFlag
+    ) throws -> SafeMetadataFileSnapshot {
+        try validateParentDirectory(workspace)
+        return try snapshotEntry(
+            directoryFD: workspace.parentDirectoryFD,
+            entryName: workspace.originalFileName,
+            cancellationFlag: cancellationFlag
+        )
+    }
+
+    private static func snapshotEntry(
+        directoryFD: Int32,
+        entryName: String,
+        cancellationFlag: SafeMetadataCancellationFlag
+    ) throws -> SafeMetadataFileSnapshot {
         try checkCancellation(cancellationFlag)
-        let pathBefore = try workspaceFileState(workspace)
-        let descriptor = workspace.fileName.withCString { fileName in
+        let pathBefore = try entryState(directoryFD: directoryFD, entryName: entryName)
+        let descriptor = entryName.withCString { entryName in
             openat(
-                workspace.directoryFD,
-                fileName,
+                directoryFD,
+                entryName,
                 O_RDONLY | O_NOFOLLOW | O_CLOEXEC
             )
         }
@@ -712,7 +871,7 @@ struct SafeMetadataFileOperations: @unchecked Sendable {
         )
         let digest = try digest(descriptor: descriptor, cancellationFlag: cancellationFlag)
         let descriptorAfter = try stateForDescriptor(descriptor, operation: .digest)
-        let pathAfter = try workspaceFileState(workspace)
+        let pathAfter = try entryState(directoryFD: directoryFD, entryName: entryName)
         guard descriptorBefore == descriptorAfter,
               descriptorAfter == pathAfter
         else {
@@ -807,6 +966,81 @@ struct SafeMetadataFileOperations: @unchecked Sendable {
         }
     }
 
+    private static func moveOriginalToWorkspaceEntry(
+        workspace: SafeMetadataWorkspace,
+        destinationName: String
+    ) throws {
+        try validateParentDirectory(workspace)
+        let result = workspace.originalFileName.withCString { originalName in
+            destinationName.withCString { destinationName in
+                renameat(
+                    workspace.parentDirectoryFD,
+                    originalName,
+                    workspace.directoryFD,
+                    destinationName
+                )
+            }
+        }
+        guard result == 0 else {
+            throw SafeMetadataFileSystemError(operation: .swap, code: errno)
+        }
+    }
+
+    private static func copyWorkspaceEntryToOriginal(
+        workspace: SafeMetadataWorkspace,
+        sourceName: String,
+        cancellationFlag: SafeMetadataCancellationFlag
+    ) throws -> SafeMetadataFileNodeState {
+        try validateParentDirectory(workspace)
+        let copyResult = sourceName.withCString { sourceName in
+            workspace.originalFileName.withCString { originalName in
+                ATSFCopyFileBetweenDirectories(
+                    workspace.directoryFD,
+                    sourceName,
+                    workspace.parentDirectoryFD,
+                    originalName,
+                    cancellationFlag.rawValue
+                )
+            }
+        }
+        defer {
+            if copyResult.destination_fd >= 0 {
+                Darwin.close(copyResult.destination_fd)
+            }
+        }
+        let copiedState = copyResult.destination_fd >= 0
+            ? try? stateForDescriptor(copyResult.destination_fd, operation: .copy)
+            : nil
+        guard copyResult.status == 0, let copiedState else {
+            throw SafeMetadataFileSystemError(
+                operation: .copy,
+                code: copyResult.error_code,
+                ownedNodeState: copiedState
+            )
+        }
+        return copiedState
+    }
+
+    private static func validateParentDirectory(
+        _ workspace: SafeMetadataWorkspace
+    ) throws {
+        guard try stateForDescriptor(
+            workspace.parentDirectoryFD,
+            operation: .stat
+        ).identity == workspace.parentDirectoryIdentity else {
+            throw SafeMetadataFileSystemError(operation: .stat, code: ESTALE)
+        }
+    }
+
+    private static func validateOriginalParentPath(
+        _ workspace: SafeMetadataWorkspace
+    ) throws {
+        guard try nodeState(url: workspace.parentDirectoryURL).identity
+            == workspace.parentDirectoryIdentity else {
+            throw SafeMetadataFileSystemError(operation: .stat, code: ESTALE)
+        }
+    }
+
     private static func syncWorkspaceFile(
         workspace: SafeMetadataWorkspace,
         expectedIdentity: SafeMetadataFileIdentity
@@ -815,10 +1049,46 @@ struct SafeMetadataFileOperations: @unchecked Sendable {
             workspace: workspace,
             expectedFileIdentity: expectedIdentity
         )
-        let descriptor = workspace.fileName.withCString { fileName in
+        try syncWorkspaceEntry(
+            workspace: workspace,
+            entryName: workspace.fileName,
+            expectedIdentity: expectedIdentity
+        )
+    }
+
+    private static func syncWorkspaceEntry(
+        workspace: SafeMetadataWorkspace,
+        entryName: String,
+        expectedIdentity: SafeMetadataFileIdentity
+    ) throws {
+        try syncEntry(
+            directoryFD: workspace.directoryFD,
+            entryName: entryName,
+            expectedIdentity: expectedIdentity
+        )
+    }
+
+    private static func syncOriginal(
+        workspace: SafeMetadataWorkspace,
+        expectedIdentity: SafeMetadataFileIdentity
+    ) throws {
+        try validateParentDirectory(workspace)
+        try syncEntry(
+            directoryFD: workspace.parentDirectoryFD,
+            entryName: workspace.originalFileName,
+            expectedIdentity: expectedIdentity
+        )
+    }
+
+    private static func syncEntry(
+        directoryFD: Int32,
+        entryName: String,
+        expectedIdentity: SafeMetadataFileIdentity
+    ) throws {
+        let descriptor = entryName.withCString { entryName in
             openat(
-                workspace.directoryFD,
-                fileName,
+                directoryFD,
+                entryName,
                 O_RDONLY | O_NOFOLLOW | O_CLOEXEC
             )
         }
@@ -892,8 +1162,28 @@ struct SafeMetadataFileOperations: @unchecked Sendable {
     static func removeWorkspaceFileIfOwnedForTesting(
         _ workspace: SafeMetadataWorkspace,
         expectedIdentity: SafeMetadataFileIdentity,
-        afterQuarantineValidation: (URL) -> Void
+        afterQuarantineValidation: (URL) -> Void,
+        renameEntry: ((Int32, String, String) -> Int32)? = nil
     ) -> SafeMetadataConditionalRemoval {
+        removeWorkspaceEntryIfOwned(
+            workspace,
+            entryName: workspace.fileName,
+            expectedIdentity: expectedIdentity,
+            expectedSnapshot: nil,
+            afterQuarantineValidation: afterQuarantineValidation,
+            renameEntry: renameEntry
+        )
+    }
+
+    private static func removeWorkspaceEntryIfOwned(
+        _ workspace: SafeMetadataWorkspace,
+        entryName: String,
+        expectedIdentity: SafeMetadataFileIdentity,
+        expectedSnapshot: SafeMetadataFileSnapshot?,
+        afterQuarantineValidation: (URL) -> Void,
+        renameEntry: ((Int32, String, String) -> Int32)? = nil
+    ) -> SafeMetadataConditionalRemoval {
+        let entryURL = workspace.directoryURL.appendingPathComponent(entryName)
         // The 0700 directory and random quarantine name are the boundary
         // against ordinary same-UID competitors. If either identity check
         // fails, the quarantine object is retained rather than deleted.
@@ -916,56 +1206,118 @@ struct SafeMetadataFileOperations: @unchecked Sendable {
 
         let state: SafeMetadataFileNodeState
         do {
-            state = try workspaceFileState(workspace)
+            state = try workspaceEntryState(workspace, entryName: entryName)
         } catch let error as SafeMetadataFileSystemError where error.code == ENOENT {
             return .missing
         } catch let error as SafeMetadataFileSystemError {
-            return .failed(error, preservedURL: workspace.fileURL)
+            return .failed(error, preservedURL: entryURL)
         } catch {
             return .failed(
                 SafeMetadataFileSystemError(operation: .unlink, code: EIO),
-                preservedURL: workspace.fileURL
+                preservedURL: entryURL
             )
         }
         guard state.identity == expectedIdentity else {
-            return .identityMismatch(preservedURL: workspace.fileURL)
+            return .identityMismatch(preservedURL: entryURL)
+        }
+        let unstableExpectedSnapshot: SafeMetadataFileSnapshot?
+        if workspace.supportsStableFileIdentity {
+            unstableExpectedSnapshot = nil
+        } else {
+            guard let flag = try? SafeMetadataCancellationFlag(),
+                  let snapshot = try? snapshotWorkspaceEntry(
+                    workspace: workspace,
+                    entryName: entryName,
+                    cancellationFlag: flag
+                  ) else {
+                return .failed(
+                    SafeMetadataFileSystemError(operation: .unlink, code: EIO),
+                    preservedURL: entryURL
+                )
+            }
+            if let expectedSnapshot,
+               !snapshot.isEquivalentTransactionInput(to: expectedSnapshot) {
+                return .identityMismatch(preservedURL: entryURL)
+            }
+            unstableExpectedSnapshot = snapshot
         }
 
         let quarantineName = ".quarantine-file-\(UUID().uuidString)"
-        let renameResult = workspace.fileName.withCString { fileName in
-            quarantineName.withCString { quarantineName in
-                renameatx_np(
-                    workspace.directoryFD,
-                    fileName,
-                    workspace.directoryFD,
-                    quarantineName,
-                    UInt32(RENAME_EXCL)
-                )
+        var renameResult: Int32
+        if let renameEntry {
+            renameResult = renameEntry(
+                workspace.directoryFD,
+                entryName,
+                quarantineName
+            )
+        } else {
+            renameResult = entryName.withCString { fileName in
+                quarantineName.withCString { quarantineName in
+                    renameatx_np(
+                        workspace.directoryFD,
+                        fileName,
+                        workspace.directoryFD,
+                        quarantineName,
+                        UInt32(RENAME_EXCL)
+                    )
+                }
+            }
+        }
+        if renameResult != 0, isUnsupportedExclusiveRename(errno) {
+            renameResult = entryName.withCString { fileName in
+                quarantineName.withCString { quarantineName in
+                    renameat(
+                        workspace.directoryFD,
+                        fileName,
+                        workspace.directoryFD,
+                        quarantineName
+                    )
+                }
             }
         }
         guard renameResult == 0 else {
-            if errno == ENOENT { return .missing }
+            let code = errno
+            if code == ENOENT { return .missing }
             return .failed(
-                SafeMetadataFileSystemError(operation: .unlink, code: errno),
-                preservedURL: workspace.fileURL
+                SafeMetadataFileSystemError(operation: .unlink, code: code),
+                preservedURL: entryURL
             )
         }
 
         let quarantineURL = workspace.directoryURL.appendingPathComponent(quarantineName)
-        guard quarantineEntryIdentity(
-            directoryFD: workspace.directoryFD,
-            name: quarantineName
-        ) == expectedIdentity else {
-            return .identityMismatch(preservedURL: quarantineURL)
+        if workspace.supportsStableFileIdentity {
+            guard quarantineEntryIdentity(
+                directoryFD: workspace.directoryFD,
+                name: quarantineName
+            ) == expectedIdentity else {
+                return .identityMismatch(preservedURL: quarantineURL)
+            }
         }
 
         afterQuarantineValidation(quarantineURL)
 
-        guard quarantineEntryIdentity(
-            directoryFD: workspace.directoryFD,
-            name: quarantineName
-        ) == expectedIdentity else {
-            return .identityMismatch(preservedURL: quarantineURL)
+        if workspace.supportsStableFileIdentity {
+            guard quarantineEntryIdentity(
+                directoryFD: workspace.directoryFD,
+                name: quarantineName
+            ) == expectedIdentity else {
+                return .identityMismatch(preservedURL: quarantineURL)
+            }
+        } else {
+            guard let expectedSnapshot = unstableExpectedSnapshot,
+                  let flag = try? SafeMetadataCancellationFlag(),
+                  let quarantinedSnapshot = try? snapshotWorkspaceEntry(
+                    workspace: workspace,
+                    entryName: quarantineName,
+                    cancellationFlag: flag
+                  ) else {
+                return .identityMismatch(preservedURL: quarantineURL)
+            }
+            guard quarantinedSnapshot.isEquivalentQuarantineMove(
+                to: expectedSnapshot
+            ) else {
+                return .identityMismatch(preservedURL: quarantineURL)
+            }
         }
 
         let unlinkResult = quarantineName.withCString { name in
@@ -982,7 +1334,8 @@ struct SafeMetadataFileOperations: @unchecked Sendable {
 
     static func removeWorkspaceDirectoryIfOwnedForTesting(
         _ workspace: SafeMetadataWorkspace,
-        afterQuarantineValidation: (URL) -> Void
+        afterQuarantineValidation: (URL) -> Void,
+        renameEntry: ((Int32, String, String) -> Int32)? = nil
     ) -> SafeMetadataConditionalRemoval {
         do {
             let openState = try stateForDescriptor(
@@ -1009,21 +1362,43 @@ struct SafeMetadataFileOperations: @unchecked Sendable {
         }
 
         let quarantineName = ".quarantine-directory-\(UUID().uuidString).work"
-        let renameResult = workspace.directoryName.withCString { directoryName in
-            quarantineName.withCString { quarantineName in
-                renameatx_np(
-                    workspace.parentDirectoryFD,
-                    directoryName,
-                    workspace.parentDirectoryFD,
-                    quarantineName,
-                    UInt32(RENAME_EXCL)
-                )
+        var renameResult: Int32
+        if let renameEntry {
+            renameResult = renameEntry(
+                workspace.parentDirectoryFD,
+                workspace.directoryName,
+                quarantineName
+            )
+        } else {
+            renameResult = workspace.directoryName.withCString { directoryName in
+                quarantineName.withCString { quarantineName in
+                    renameatx_np(
+                        workspace.parentDirectoryFD,
+                        directoryName,
+                        workspace.parentDirectoryFD,
+                        quarantineName,
+                        UInt32(RENAME_EXCL)
+                    )
+                }
+            }
+        }
+        if renameResult != 0, isUnsupportedExclusiveRename(errno) {
+            renameResult = workspace.directoryName.withCString { directoryName in
+                quarantineName.withCString { quarantineName in
+                    renameat(
+                        workspace.parentDirectoryFD,
+                        directoryName,
+                        workspace.parentDirectoryFD,
+                        quarantineName
+                    )
+                }
             }
         }
         guard renameResult == 0 else {
-            if errno == ENOENT { return .missing }
+            let code = errno
+            if code == ENOENT { return .missing }
             return .failed(
-                SafeMetadataFileSystemError(operation: .unlink, code: errno),
+                SafeMetadataFileSystemError(operation: .unlink, code: code),
                 preservedURL: workspace.directoryURL
             )
         }
@@ -1032,20 +1407,24 @@ struct SafeMetadataFileOperations: @unchecked Sendable {
             quarantineName,
             isDirectory: true
         )
-        guard quarantineEntryIdentity(
-            directoryFD: workspace.parentDirectoryFD,
-            name: quarantineName
-        ) == workspace.directoryIdentity else {
-            return .identityMismatch(preservedURL: quarantineURL)
+        if workspace.supportsStableFileIdentity {
+            guard quarantineEntryIdentity(
+                directoryFD: workspace.parentDirectoryFD,
+                name: quarantineName
+            ) == workspace.directoryIdentity else {
+                return .identityMismatch(preservedURL: quarantineURL)
+            }
         }
 
         afterQuarantineValidation(quarantineURL)
 
-        guard quarantineEntryIdentity(
-            directoryFD: workspace.parentDirectoryFD,
-            name: quarantineName
-        ) == workspace.directoryIdentity else {
-            return .identityMismatch(preservedURL: quarantineURL)
+        if workspace.supportsStableFileIdentity {
+            guard quarantineEntryIdentity(
+                directoryFD: workspace.parentDirectoryFD,
+                name: quarantineName
+            ) == workspace.directoryIdentity else {
+                return .identityMismatch(preservedURL: quarantineURL)
+            }
         }
 
         let removeResult = quarantineName.withCString { name in
@@ -1072,14 +1451,32 @@ struct SafeMetadataFileOperations: @unchecked Sendable {
         return SafeMetadataFileNodeState(status).identity
     }
 
+    private static func isUnsupportedExclusiveRename(_ code: Int32) -> Bool {
+        code == ENOTSUP || code == EOPNOTSUPP
+    }
+
     private static func workspaceFileState(
         _ workspace: SafeMetadataWorkspace
     ) throws -> SafeMetadataFileNodeState {
+        try workspaceEntryState(workspace, entryName: workspace.fileName)
+    }
+
+    private static func workspaceEntryState(
+        _ workspace: SafeMetadataWorkspace,
+        entryName: String
+    ) throws -> SafeMetadataFileNodeState {
+        try entryState(directoryFD: workspace.directoryFD, entryName: entryName)
+    }
+
+    private static func entryState(
+        directoryFD: Int32,
+        entryName: String
+    ) throws -> SafeMetadataFileNodeState {
         var status = stat()
-        let result = workspace.fileName.withCString { fileName in
+        let result = entryName.withCString { entryName in
             fstatat(
-                workspace.directoryFD,
-                fileName,
+                directoryFD,
+                entryName,
                 &status,
                 AT_SYMLINK_NOFOLLOW
             )

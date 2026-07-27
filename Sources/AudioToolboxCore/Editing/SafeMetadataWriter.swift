@@ -130,9 +130,9 @@ public actor SafeMetadataWriter: SafeMetadataWriting {
             return result(for: url, status: .failed, message: "文件格式不支持标签写入")
         }
 
-        let ownedWork: OwnedWorkFile
+        let initialOwnedWork: OwnedWorkFile
         do {
-            ownedWork = try await createOwnedWorkFile(
+            initialOwnedWork = try await createOwnedWorkFile(
                 originalURL: url,
                 initialSnapshot: initialSnapshot,
                 cancellationFlag: cancellationFlag
@@ -162,15 +162,17 @@ public actor SafeMetadataWriter: SafeMetadataWriting {
                 url: url,
                 status: .notProcessed,
                 message: "操作已取消",
-                ownedWork: ownedWork
+                ownedWork: initialOwnedWork
             )
         }
 
+        let workspace = initialOwnedWork.workspace
+        let initialWorkIdentity = initialOwnedWork.identity
         do {
             try await Self.runBlocking {
                 try operations.validateWorkspacePath(
-                    ownedWork.workspace,
-                    ownedWork.identity
+                    workspace,
+                    initialWorkIdentity
                 )
             }
         } catch {
@@ -178,7 +180,7 @@ public actor SafeMetadataWriter: SafeMetadataWriting {
                 url: url,
                 status: .failed,
                 message: "私有工作区路径身份发生变化，已拒绝写入",
-                ownedWork: ownedWork
+                ownedWork: initialOwnedWork
             )
         }
 
@@ -187,70 +189,84 @@ public actor SafeMetadataWriter: SafeMetadataWriting {
                 url: url,
                 status: .notProcessed,
                 message: "操作已取消",
-                ownedWork: ownedWork
+                ownedWork: initialOwnedWork
             )
         }
 
         do {
-            try await metadataService.write(url: ownedWork.workspace.fileURL, patch: patch)
+            try await metadataService.write(url: workspace.fileURL, patch: patch)
         } catch is CancellationError where cancellationFlag.isCancelled {
             return await finishBeforeCommit(
                 url: url,
                 status: .notProcessed,
                 message: "操作已取消",
-                ownedWork: ownedWork
+                ownedWork: initialOwnedWork
             )
         } catch {
             return await finishBeforeCommit(
                 url: url,
                 status: .failed,
                 message: "元数据写入失败",
-                ownedWork: ownedWork
+                ownedWork: initialOwnedWork
             )
         }
 
         let writtenSnapshot: SafeMetadataFileSnapshot
         do {
             writtenSnapshot = try await Self.runBlocking {
-                try operations.validateWorkspacePath(
-                    ownedWork.workspace,
-                    ownedWork.identity
-                )
-                return try operations.snapshotWorkspace(
-                    ownedWork.workspace,
+                let snapshot = try operations.snapshotWorkspace(
+                    workspace,
                     cancellationFlag
                 )
-            }
-            guard writtenSnapshot.nodeState.identity == ownedWork.identity,
-                  writtenSnapshot.nodeState.isRegularFile,
-                  writtenSnapshot.nodeState.linkCount == 1
-            else {
-                throw WorkValidationError.identityChanged
-            }
-            guard writtenSnapshot.preservesFileSystemMetadata(
-                of: ownedWork.copiedExpected
-            ) else {
-                throw WorkValidationError.preservedMetadataChanged
+                if workspace.supportsStableFileIdentity,
+                   snapshot.nodeState.identity != initialWorkIdentity
+                {
+                    throw WorkValidationError.identityChanged
+                }
+                try operations.validateWorkspacePath(
+                    workspace,
+                    snapshot.nodeState.identity
+                )
+                return snapshot
             }
         } catch is CancellationError {
             return await finishBeforeCommit(
                 url: url,
                 status: .notProcessed,
                 message: "操作已取消",
-                ownedWork: ownedWork
-            )
-        } catch WorkValidationError.preservedMetadataChanged {
-            return await finishBeforeCommit(
-                url: url,
-                status: .failed,
-                message: "元数据服务改变了必须保留的文件系统属性，已拒绝提交",
-                ownedWork: ownedWork
+                ownedWork: initialOwnedWork
             )
         } catch {
             return await finishBeforeCommit(
                 url: url,
                 status: .failed,
                 message: "工作副本身份发生变化，已拒绝提交",
+                ownedWork: initialOwnedWork
+            )
+        }
+
+        let ownedWork = OwnedWorkFile(
+            workspace: workspace,
+            identity: writtenSnapshot.nodeState.identity,
+            copiedExpected: initialOwnedWork.copiedExpected
+        )
+        guard writtenSnapshot.nodeState.isRegularFile,
+              writtenSnapshot.nodeState.linkCount == 1
+        else {
+            return await finishBeforeCommit(
+                url: url,
+                status: .failed,
+                message: "工作副本身份发生变化，已拒绝提交",
+                ownedWork: ownedWork
+            )
+        }
+        guard writtenSnapshot.preservesFileSystemMetadata(
+            of: initialOwnedWork.copiedExpected
+        ) else {
+            return await finishBeforeCommit(
+                url: url,
+                status: .failed,
+                message: "元数据服务改变了必须保留的文件系统属性，已拒绝提交",
                 ownedWork: ownedWork
             )
         }
@@ -405,7 +421,7 @@ public actor SafeMetadataWriter: SafeMetadataWriting {
         case let .rolledBack(coordinatorTailWarning):
             let cleanup = await cleanupWorkspace(
                 ownedWork.workspace,
-                expectedFileIdentity: editedExpected.nodeState.identity
+                expectedFileIdentity: commitResult.cleanupIdentity
             )
             var message = "提交后检测到并发修改或耐久同步失败，已安全回滚"
             if coordinatorTailWarning {
@@ -459,13 +475,13 @@ public actor SafeMetadataWriter: SafeMetadataWriting {
                 recoveryURL: cleanup.recoveryURL
             )
 
-        case let .uncertain(message):
+        case let .uncertain(message, recoveryURL):
             ownedWork.workspace.closeDescriptors()
             return result(
                 for: url,
                 status: .failed,
-                message: "\(message)；提交状态不确定，恢复文件路径：\(ownedWork.workspace.fileURL.path)",
-                recoveryURL: ownedWork.workspace.fileURL
+                message: "\(message)；提交状态不确定，恢复文件路径：\(recoveryURL.path)",
+                recoveryURL: recoveryURL
             )
         }
     }
@@ -783,7 +799,17 @@ public actor SafeMetadataWriter: SafeMetadataWriting {
                         uncancellableFlag: uncancellableFlag
                     )
                     if case .notStarted = observed {
-                        observed = .preSwapFailed(swapFailureMessage(error))
+                        if isUnsupportedSwap(error) {
+                            observed = commitUsingExclusiveCopyFallback(
+                                commitOriginal: commitOriginal,
+                                editedExpected: editedExpected,
+                                ownedWork: ownedWork,
+                                operations: operations,
+                                uncancellableFlag: uncancellableFlag
+                            )
+                        } else {
+                            observed = .preSwapFailed(swapFailureMessage(error))
+                        }
                     } else {
                         observed = Self.finalizeDurabilityIfCommitted(
                             observed,
@@ -839,6 +865,488 @@ public actor SafeMetadataWriter: SafeMetadataWriting {
         )
     }
 
+    private nonisolated static func commitUsingExclusiveCopyFallback(
+        commitOriginal: SafeMetadataFileSnapshot,
+        editedExpected: SafeMetadataFileSnapshot,
+        ownedWork: OwnedWorkFile,
+        operations: SafeMetadataFileOperations,
+        uncancellableFlag: SafeMetadataCancellationFlag
+    ) -> ObservedCommitState {
+        let workspace = ownedWork.workspace
+        let recovery: SafeMetadataFileSnapshot
+        do {
+            try operations.moveOriginalToWorkspaceEntry(
+                workspace,
+                workspace.recoveryFileName
+            )
+            recovery = try operations.snapshotWorkspaceEntry(
+                workspace,
+                workspace.recoveryFileName,
+                uncancellableFlag
+            )
+        } catch {
+            if let original = try? operations.snapshotOriginal(
+                ownedWork.workspace,
+                uncancellableFlag
+            ),
+               fallbackSnapshotMatches(
+                    original,
+                    expected: commitOriginal,
+                    workspace: workspace
+               )
+            {
+                return .preSwapFailed("所在文件系统不支持原子交换，且无法保留原文件")
+            }
+            guard let movedOriginal = try? operations.snapshotWorkspaceEntry(
+                workspace,
+                workspace.recoveryFileName,
+                uncancellableFlag
+            ) else {
+                return .uncertain(
+                    "保留原文件后无法确认恢复副本状态",
+                    recoveryURL: ownedWork.workspace.currentDirectoryURL()
+                )
+            }
+            recovery = movedOriginal
+        }
+
+        guard fallbackSnapshotMatches(
+            recovery,
+            expected: commitOriginal,
+            workspace: ownedWork.workspace
+        ) else {
+            return restoreFallbackOriginalBeforeCommit(
+                expectedOriginal: recovery,
+                editedExpected: editedExpected,
+                ownedWork: ownedWork,
+                operations: operations,
+                uncancellableFlag: uncancellableFlag,
+                failureMessage: Self.changedFileMessage
+            )
+        }
+
+        do {
+            try operations.syncWorkspaceEntry(
+                workspace,
+                workspace.recoveryFileName,
+                recovery.nodeState.identity
+            )
+            try operations.syncWorkspaceDirectory(workspace)
+            try operations.syncParentDirectory(workspace)
+        } catch {
+            return restoreFallbackOriginalBeforeCommit(
+                expectedOriginal: commitOriginal,
+                editedExpected: editedExpected,
+                ownedWork: ownedWork,
+                operations: operations,
+                uncancellableFlag: uncancellableFlag,
+                failureMessage: "兼容提交前耐久同步失败，未执行替换"
+            )
+        }
+
+        do {
+            _ = try operations.copyWorkspaceEntryToOriginal(
+                workspace,
+                workspace.fileName,
+                uncancellableFlag
+            )
+        } catch {
+            let installed = try? operations.snapshotOriginal(
+                ownedWork.workspace,
+                uncancellableFlag
+            )
+            if installed.map({
+                $0.isEquivalentTransactionInput(to: editedExpected)
+            }) != true {
+                if let error = error as? SafeMetadataFileSystemError,
+                   error.code == EEXIST,
+                   error.ownedNodeState == nil
+                {
+                    return .uncertain(
+                        "兼容提交时原路径被并发占用",
+                        recoveryURL: ownedWork.workspace.currentDirectoryURL()
+                    )
+                }
+                if let error = error as? SafeMetadataFileSystemError,
+                   error.ownedNodeState != nil
+                {
+                    return restoreFallbackAfterPartialCopy(
+                        expectedOriginal: commitOriginal,
+                        ownedWork: ownedWork,
+                        operations: operations,
+                        uncancellableFlag: uncancellableFlag
+                    )
+                }
+                return restoreFallbackOriginalBeforeCommit(
+                    expectedOriginal: commitOriginal,
+                    editedExpected: editedExpected,
+                    ownedWork: ownedWork,
+                    operations: operations,
+                    uncancellableFlag: uncancellableFlag,
+                    failureMessage: "所在文件系统的兼容替换失败，未提交修改"
+                )
+            }
+        }
+
+        let replacedOriginal: SafeMetadataFileSnapshot
+        do {
+            replacedOriginal = try operations.snapshotOriginal(
+                ownedWork.workspace,
+                uncancellableFlag
+            )
+            guard replacedOriginal.isEquivalentTransactionInput(to: editedExpected) else {
+                return rollbackExclusiveCopyFallback(
+                    commitOriginal: commitOriginal,
+                    editedExpected: editedExpected,
+                    ownedWork: ownedWork,
+                    operations: operations,
+                    uncancellableFlag: uncancellableFlag,
+                    failureMessage: "兼容提交后文件状态异常且自动回滚未能确认"
+                )
+            }
+            try operations.syncOriginal(
+                ownedWork.workspace,
+                replacedOriginal.nodeState.identity
+            )
+            try operations.syncParentDirectory(ownedWork.workspace)
+            let durableOriginal = try operations.snapshotOriginal(
+                ownedWork.workspace,
+                uncancellableFlag
+            )
+            guard durableOriginal.isEquivalentTransactionInput(to: editedExpected) else {
+                return rollbackExclusiveCopyFallback(
+                    commitOriginal: commitOriginal,
+                    editedExpected: editedExpected,
+                    ownedWork: ownedWork,
+                    operations: operations,
+                    uncancellableFlag: uncancellableFlag,
+                    failureMessage: "兼容提交耐久确认异常且自动回滚未能确认"
+                )
+            }
+            do {
+                try operations.validateOriginalParentPath(ownedWork.workspace)
+            } catch {
+                return .uncertain(
+                    "修改已提交，但原目录路径发生变化",
+                    recoveryURL: ownedWork.workspace.currentDirectoryURL()
+                )
+            }
+        } catch {
+            return rollbackExclusiveCopyFallback(
+                commitOriginal: commitOriginal,
+                editedExpected: editedExpected,
+                ownedWork: ownedWork,
+                operations: operations,
+                uncancellableFlag: uncancellableFlag,
+                failureMessage: "兼容提交失败且自动回滚未能确认"
+            )
+        }
+
+        guard cleanupFallbackEntries(
+            [
+                (workspace.fileName, editedExpected),
+                (workspace.recoveryFileName, recovery)
+            ],
+            workspace: workspace,
+            operations: operations
+        ) else {
+            return .uncertain(
+                "修改已提交，但私有副本无法安全清理",
+                recoveryURL: workspace.currentDirectoryURL()
+            )
+        }
+        return .committed(cleanupIdentity: nil)
+    }
+
+    private nonisolated static func restoreFallbackAfterPartialCopy(
+        expectedOriginal: SafeMetadataFileSnapshot,
+        ownedWork: OwnedWorkFile,
+        operations: SafeMetadataFileOperations,
+        uncancellableFlag: SafeMetadataCancellationFlag
+    ) -> ObservedCommitState {
+        do {
+            try operations.moveOriginalToWorkspaceEntry(
+                ownedWork.workspace,
+                ownedWork.workspace.rollbackFileName
+            )
+            do {
+                _ = try operations.copyWorkspaceEntryToOriginal(
+                    ownedWork.workspace,
+                    ownedWork.workspace.recoveryFileName,
+                    uncancellableFlag
+                )
+            } catch let error as SafeMetadataFileSystemError
+                where error.ownedNodeState != nil
+            {
+                try operations.moveOriginalToWorkspaceEntry(
+                    ownedWork.workspace,
+                    ownedWork.workspace.partialFileName
+                )
+                _ = try operations.copyWorkspaceEntryToOriginal(
+                    ownedWork.workspace,
+                    ownedWork.workspace.recoveryFileName,
+                    uncancellableFlag
+                )
+            }
+            let restored = try operations.snapshotOriginal(
+                ownedWork.workspace,
+                uncancellableFlag
+            )
+            guard restored.isEquivalentTransactionInput(to: expectedOriginal) else {
+                throw WorkValidationError.changedAfterVerification
+            }
+            try operations.syncOriginal(
+                ownedWork.workspace,
+                restored.nodeState.identity
+            )
+            try operations.syncWorkspaceDirectory(ownedWork.workspace)
+            try operations.syncParentDirectory(ownedWork.workspace)
+            let durableOriginal = try operations.snapshotOriginal(
+                ownedWork.workspace,
+                uncancellableFlag
+            )
+            guard durableOriginal.isEquivalentTransactionInput(to: expectedOriginal) else {
+                throw WorkValidationError.changedAfterVerification
+            }
+            return .uncertain(
+                "兼容复制失败，原文件已恢复，部分文件已保留",
+                recoveryURL: ownedWork.workspace.currentDirectoryURL()
+            )
+        } catch {
+            return .uncertain(
+                "兼容复制失败且自动恢复未能确认",
+                recoveryURL: ownedWork.workspace.currentDirectoryURL()
+            )
+        }
+    }
+
+    private nonisolated static func restoreFallbackOriginalBeforeCommit(
+        expectedOriginal: SafeMetadataFileSnapshot,
+        editedExpected: SafeMetadataFileSnapshot,
+        ownedWork: OwnedWorkFile,
+        operations: SafeMetadataFileOperations,
+        uncancellableFlag: SafeMetadataCancellationFlag,
+        failureMessage: String
+    ) -> ObservedCommitState {
+        do {
+            _ = try operations.copyWorkspaceEntryToOriginal(
+                ownedWork.workspace,
+                ownedWork.workspace.recoveryFileName,
+                uncancellableFlag
+            )
+            let restored = try operations.snapshotOriginal(
+                ownedWork.workspace,
+                uncancellableFlag
+            )
+            guard restored.isEquivalentTransactionInput(to: expectedOriginal) else {
+                return .uncertain(
+                    "恢复原文件后状态无法确认",
+                    recoveryURL: ownedWork.workspace.currentDirectoryURL()
+                )
+            }
+            do {
+                try operations.validateOriginalParentPath(ownedWork.workspace)
+            } catch {
+                return .uncertain(
+                    "原文件已恢复，但原目录路径发生变化",
+                    recoveryURL: ownedWork.workspace.currentDirectoryURL()
+                )
+            }
+            try operations.syncOriginal(
+                ownedWork.workspace,
+                restored.nodeState.identity
+            )
+            try operations.syncParentDirectory(ownedWork.workspace)
+            let durableOriginal = try operations.snapshotOriginal(
+                ownedWork.workspace,
+                uncancellableFlag
+            )
+            guard durableOriginal.isEquivalentTransactionInput(to: expectedOriginal) else {
+                return .uncertain(
+                    "恢复原文件后耐久状态无法确认",
+                    recoveryURL: ownedWork.workspace.currentDirectoryURL()
+                )
+            }
+            guard cleanupFallbackEntries(
+                [
+                    (ownedWork.workspace.fileName, editedExpected),
+                    (ownedWork.workspace.recoveryFileName, expectedOriginal)
+                ],
+                workspace: ownedWork.workspace,
+                operations: operations
+            ) else {
+                return .uncertain(
+                    "原文件已恢复，但私有副本无法安全清理",
+                    recoveryURL: ownedWork.workspace.currentDirectoryURL()
+                )
+            }
+            return .preSwapFailed(failureMessage)
+        } catch {
+            return .uncertain(
+                "原文件已保留，但自动恢复未能确认",
+                recoveryURL: ownedWork.workspace.currentDirectoryURL()
+            )
+        }
+    }
+
+    private nonisolated static func rollbackExclusiveCopyFallback(
+        commitOriginal: SafeMetadataFileSnapshot,
+        editedExpected: SafeMetadataFileSnapshot,
+        ownedWork: OwnedWorkFile,
+        operations: SafeMetadataFileOperations,
+        uncancellableFlag: SafeMetadataCancellationFlag,
+        failureMessage: String
+    ) -> ObservedCommitState {
+        var didPreservePartial = false
+        do {
+            try operations.moveOriginalToWorkspaceEntry(
+                ownedWork.workspace,
+                ownedWork.workspace.rollbackFileName
+            )
+            let preservedCurrent = try operations.snapshotWorkspaceEntry(
+                ownedWork.workspace,
+                ownedWork.workspace.rollbackFileName,
+                uncancellableFlag
+            )
+            do {
+                _ = try operations.copyWorkspaceEntryToOriginal(
+                    ownedWork.workspace,
+                    ownedWork.workspace.recoveryFileName,
+                    uncancellableFlag
+                )
+            } catch let error as SafeMetadataFileSystemError
+                where error.ownedNodeState != nil
+            {
+                didPreservePartial = true
+                try operations.moveOriginalToWorkspaceEntry(
+                    ownedWork.workspace,
+                    ownedWork.workspace.partialFileName
+                )
+                _ = try operations.copyWorkspaceEntryToOriginal(
+                    ownedWork.workspace,
+                    ownedWork.workspace.recoveryFileName,
+                    uncancellableFlag
+                )
+            }
+            let restored = try operations.snapshotOriginal(
+                ownedWork.workspace,
+                uncancellableFlag
+            )
+            try operations.syncOriginal(
+                ownedWork.workspace,
+                restored.nodeState.identity
+            )
+            try operations.syncWorkspaceEntry(
+                ownedWork.workspace,
+                ownedWork.workspace.rollbackFileName,
+                preservedCurrent.nodeState.identity
+            )
+            try operations.syncWorkspaceDirectory(ownedWork.workspace)
+            try operations.syncParentDirectory(ownedWork.workspace)
+            let durableOriginal = try operations.snapshotOriginal(
+                ownedWork.workspace,
+                uncancellableFlag
+            )
+            let durableCurrent = try operations.snapshotWorkspaceEntry(
+                ownedWork.workspace,
+                ownedWork.workspace.rollbackFileName,
+                uncancellableFlag
+            )
+            guard restored.isEquivalentTransactionInput(to: commitOriginal),
+                  durableOriginal.isEquivalentTransactionInput(to: commitOriginal),
+                  fallbackSnapshotMatches(
+                    durableCurrent,
+                    expected: preservedCurrent,
+                    workspace: ownedWork.workspace
+                  )
+            else {
+                return .uncertain(
+                    failureMessage,
+                    recoveryURL: ownedWork.workspace.currentDirectoryURL()
+                )
+            }
+            guard preservedCurrent.isEquivalentTransactionInput(to: editedExpected) else {
+                return .uncertain(
+                    failureMessage,
+                    recoveryURL: ownedWork.workspace.currentDirectoryURL()
+                )
+            }
+            do {
+                try operations.validateOriginalParentPath(ownedWork.workspace)
+            } catch {
+                return .uncertain(
+                    "原文件已恢复，但原目录路径发生变化",
+                    recoveryURL: ownedWork.workspace.currentDirectoryURL()
+                )
+            }
+            guard !didPreservePartial else {
+                return .uncertain(
+                    "原文件已恢复，失败的部分副本已保留",
+                    recoveryURL: ownedWork.workspace.currentDirectoryURL()
+                )
+            }
+            guard cleanupFallbackEntries(
+                [
+                    (ownedWork.workspace.fileName, editedExpected),
+                    (ownedWork.workspace.recoveryFileName, commitOriginal),
+                    (ownedWork.workspace.rollbackFileName, durableCurrent)
+                ],
+                workspace: ownedWork.workspace,
+                operations: operations
+            ) else {
+                return .uncertain(
+                    "原文件已恢复，但私有副本无法安全清理",
+                    recoveryURL: ownedWork.workspace.currentDirectoryURL()
+                )
+            }
+            return .rolledBack(cleanupIdentity: nil)
+        } catch {
+            return .uncertain(
+                failureMessage,
+                recoveryURL: ownedWork.workspace.currentDirectoryURL()
+            )
+        }
+    }
+
+    private nonisolated static func cleanupFallbackEntries(
+        _ entries: [(String, SafeMetadataFileSnapshot)],
+        workspace: SafeMetadataWorkspace,
+        operations: SafeMetadataFileOperations
+    ) -> Bool {
+        for (entryName, expectedSnapshot) in entries {
+            switch operations.removeWorkspaceEntryIfOwned(
+                workspace,
+                entryName,
+                expectedSnapshot
+            ) {
+            case .removed, .missing:
+                continue
+            case .identityMismatch, .failed:
+                return false
+            }
+        }
+        return true
+    }
+
+    private nonisolated static func isUnsupportedSwap(_ error: Error) -> Bool {
+        guard let error = error as? SafeMetadataFileSystemError,
+              error.operation == .swap else {
+            return false
+        }
+        return error.code == ENOTSUP || error.code == EOPNOTSUPP
+    }
+
+    private nonisolated static func fallbackSnapshotMatches(
+        _ actual: SafeMetadataFileSnapshot,
+        expected: SafeMetadataFileSnapshot,
+        workspace: SafeMetadataWorkspace
+    ) -> Bool {
+        if workspace.supportsStableFileIdentity {
+            return actual.matchesAfterRename(expected)
+        }
+        return actual.isEquivalentTransactionInput(to: expected)
+    }
+
     private nonisolated static func resolvePostSwapState(
         originalURL: URL,
         workURL: URL,
@@ -857,7 +1365,10 @@ public actor SafeMetadataWriter: SafeMetadataWriting {
                 uncancellableFlag
             )
         } catch {
-            return .uncertain("swap 后无法确认 original 或 recovery 的完整状态")
+            return .uncertain(
+                "swap 后无法确认 original 或 recovery 的完整状态",
+                recoveryURL: ownedWork.workspace.fileURL
+            )
         }
 
         if originalAfter.matchesAfterRename(editedExpected),
@@ -956,7 +1467,10 @@ public actor SafeMetadataWriter: SafeMetadataWriting {
             guard restoredOriginal.matchesAfterRename(expectedOriginal),
                   restoredWork.matchesAfterRename(expectedWork)
             else {
-                return .uncertain(failureMessage)
+                return .uncertain(
+                    failureMessage,
+                    recoveryURL: ownedWork.workspace.fileURL
+                )
             }
 
             try operations.syncURLFile(
@@ -981,11 +1495,17 @@ public actor SafeMetadataWriter: SafeMetadataWriting {
             guard durableOriginal.matchesAfterRename(expectedOriginal),
                   durableWork.matchesAfterRename(expectedWork)
             else {
-                return .uncertain(failureMessage)
+                return .uncertain(
+                    failureMessage,
+                    recoveryURL: ownedWork.workspace.fileURL
+                )
             }
-            return .rolledBack
+            return .rolledBack(cleanupIdentity: durableWork.nodeState.identity)
         } catch {
-            return .uncertain(failureMessage)
+            return .uncertain(
+                failureMessage,
+                recoveryURL: ownedWork.workspace.fileURL
+            )
         }
     }
 
@@ -1006,7 +1526,10 @@ public actor SafeMetadataWriter: SafeMetadataWriting {
               ),
               coordinatedWork.matchesAfterRename(work)
         else {
-            return .uncertain("原子交换报告失败且文件状态无法确认")
+            return .uncertain(
+                "原子交换报告失败且文件状态无法确认",
+                recoveryURL: ownedWork.workspace.fileURL
+            )
         }
         if original.matchesAfterRename(commitOriginal),
            work.matchesAfterRename(editedExpected)
@@ -1018,7 +1541,10 @@ public actor SafeMetadataWriter: SafeMetadataWriting {
         {
             return .committed(cleanupIdentity: work.nodeState.identity)
         }
-        return .uncertain("原子交换报告失败且文件状态不一致")
+        return .uncertain(
+            "原子交换报告失败且文件状态不一致",
+            recoveryURL: ownedWork.workspace.fileURL
+        )
     }
 
     private nonisolated static func resultAfterCoordinatorError(
@@ -1057,12 +1583,12 @@ public actor SafeMetadataWriter: SafeMetadataWriting {
                 ),
                 cleanupIdentity: cleanupIdentity
             )
-        case .rolledBack:
+        case let .rolledBack(cleanupIdentity):
             return CommitExecutionResult(
                 disposition: .rolledBack(
                     coordinatorTailWarning: coordinatorTailWarning
                 ),
-                cleanupIdentity: editedExpected.nodeState.identity
+                cleanupIdentity: cleanupIdentity
             )
         case .cancelled:
             return CommitExecutionResult(
@@ -1079,9 +1605,9 @@ public actor SafeMetadataWriter: SafeMetadataWriting {
                 ),
                 cleanupIdentity: editedExpected.nodeState.identity
             )
-        case let .uncertain(message):
+        case let .uncertain(message, recoveryURL):
             return CommitExecutionResult(
-                disposition: .uncertain(message),
+                disposition: .uncertain(message, recoveryURL: recoveryURL),
                 cleanupIdentity: nil
             )
         case .notStarted:
@@ -1276,9 +1802,9 @@ private enum ObservedCommitState: Sendable {
     case notStarted
     case cancelled
     case preSwapFailed(String)
-    case committed(cleanupIdentity: SafeMetadataFileIdentity)
-    case rolledBack
-    case uncertain(String)
+    case committed(cleanupIdentity: SafeMetadataFileIdentity?)
+    case rolledBack(cleanupIdentity: SafeMetadataFileIdentity?)
+    case uncertain(String, recoveryURL: URL)
 }
 
 private struct CommitExecutionResult: Sendable {
@@ -1291,7 +1817,7 @@ private enum CommitDisposition: Sendable {
     case rolledBack(coordinatorTailWarning: Bool)
     case cancelled(coordinatorTailWarning: Bool)
     case preSwapFailed(String, coordinatorTailWarning: Bool)
-    case uncertain(String)
+    case uncertain(String, recoveryURL: URL)
 }
 
 private struct WorkspaceCreationError: Error, Sendable {
